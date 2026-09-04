@@ -3,7 +3,7 @@
 #ifndef VKMIN_ANIM_H
 #define VKMIN_ANIM_H
 
-#include "mat4.h"
+#include "vkmin_math.h"
 #include "scene.h"
 
 enum { ANIM_MAX_JOINTS = 128 };
@@ -74,14 +74,14 @@ static inline uint32_t anim_bones(const scene *s, float time, mat4 mesh_world, m
     mat4 global[ANIM_MAX_JOINTS];
     mat4 skin_parent;
     for (int i = 0; i < 16; ++i) skin_parent.m[i] = s->header.skin_parent[i];
-    const mat4 inv_mesh = mat4_inverse(mesh_world);
+    const mat4 inv_mesh = vkmin_mat4_inverse(mesh_world);
     for (uint32_t j = 0; j < n; ++j) {
-        const mat4 local = mat4_trs(t[j], r[j], sc[j]);
+        const mat4 local = vkmin_mat4_trs(t[j], r[j], sc[j]);
         const int32_t parent = s->joints[j].parent;
-        global[j] = mat4_mul(parent >= 0 && (uint32_t)parent < j ? global[parent] : skin_parent, local);
+        global[j] = vkmin_mat4_mul(parent >= 0 && (uint32_t)parent < j ? global[parent] : skin_parent, local);
         mat4 inv_bind;
         for (int i = 0; i < 16; ++i) inv_bind.m[i] = s->joints[j].inverse_bind[i];
-        out[j] = mat4_mul(inv_mesh, mat4_mul(global[j], inv_bind));
+        out[j] = vkmin_mat4_mul(inv_mesh, vkmin_mat4_mul(global[j], inv_bind));
     }
     return n;
 }

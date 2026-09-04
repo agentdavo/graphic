@@ -103,13 +103,16 @@ typedef struct {
     const uint32_t *fs; size_t fs_bytes;     /* 0 = depth-only */
     const uint32_t *cs; size_t cs_bytes;     /* set instead of vs: a compute pipeline */
     vkmin_format color_format;               /* 0 = RGBA8_UNORM (the backbuffer); NONE for depth-only */
-    bool depth;                              /* attach D32 depth */
+    bool depth;                              /* depth test against a D32 attachment. Backbuffer pipelines
+                                              * always carry the attachment (the default pass has one). */
     bool depth_write;                        /* 0 = off (set with .depth for the usual case) */
     vkmin_compare depth_compare;             /* 0 = LESS */
     vkmin_cull cull;                         /* 0 = back faces */
     bool blend;                              /* premultiplied-alpha over */
     bool depth_bias;                         /* enable dynamic depth bias */
     const char *label;                       /* 0 = "pipeline" */
+    const char *vs_path, *fs_path, *cs_path; /* SPIR-V files to watch when cvar r_hotreload is 1;
+                                              * 0 = this pipeline never reloads */
 } vkmin_pipe_desc;
 
 typedef struct { float r, g, b, a; } vkmin_clear;
@@ -182,6 +185,7 @@ uint32_t vkmin_index(vkmin_ctx *, vkmin_image);     /* bindless index with the d
 uint32_t vkmin_register_texture(vkmin_ctx *, vkmin_image, uint32_t sampler); /* a second sampler */ // writes ctx, gpu
 vkmin_image vkmin_load_png(vkmin_ctx *, const char *path, bool srgb);        // writes ctx, gpu, io
 vkmin_image vkmin_backbuffer(const vkmin_ctx *);   /* the owned image presented each frame */ // reads ctx
+vkmin_image vkmin_default_depth(const vkmin_ctx *); /* its depth; passes on the backbuffer attach it */ // reads ctx
 vkmin_format vkmin_backbuffer_format(const vkmin_ctx *);                     // pure (always RGBA8_UNORM)
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipe_desc *);        // writes ctx, gpu
 

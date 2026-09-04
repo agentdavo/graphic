@@ -41,6 +41,7 @@
     X(r_readback, 1.0f, "copy the backbuffer for PNG capture every frame")           \
     X(r_path, 0.0f, "API path: 0 auto, 1 legacy (staging, modules), 2 modern (host copy, inline SPIR-V)") \
     X(r_vsync, 1.0f, "FIFO present mode when 1, immediate/mailbox when 0")           \
+    X(r_hotreload, 0.0f, "rebuild pipelines whose SPIR-V files changed, checked once per frame") \
     X(d_frame_step, 1.0f, "frames advanced per rendered frame (0 pauses)")
 
 typedef enum {

@@ -6,7 +6,7 @@
 #include "render.h"
 #include "cvar.h"
 #include "font.h"
-#include "mat4.h"
+#include "vkmin_math.h"
 #include "shaders.h"
 
 #include <stdio.h>
@@ -190,6 +190,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
      * One pipeline set instead of two, for a negligible cost. */
     const vkmin_pipe_desc fwd_desc = {.vs = scene_vert_spv, .vs_bytes = sizeof scene_vert_spv,
                                       .fs = scene_frag_spv, .fs_bytes = sizeof scene_frag_spv,
+                                      .vs_path = "build/scene.vert.spv", .fs_path = "build/scene.frag.spv",
                                       .color_format = VKMIN_FMT_R11G11B10_FLOAT, .depth = true, .depth_write = true,
                                       .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_BACK, .label = "vkr.forward"};
     vkmin_pipe_desc f = fwd_desc;
@@ -205,6 +206,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     const vkmin_format bb = vkmin_backbuffer_format(gpu);
     r->tonemap = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = fullscreen_vert_spv, .vs_bytes = sizeof fullscreen_vert_spv,
                                                               .fs = tonemap_frag_spv, .fs_bytes = sizeof tonemap_frag_spv,
+                                                              .fs_path = "build/tonemap.frag.spv",
                                                               .color_format = bb, .cull = VKMIN_CULL_NONE, .label = "vkr.tonemap"});
     r->overlay = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = overlay_vert_spv, .vs_bytes = sizeof overlay_vert_spv,
                                                               .fs = overlay_frag_spv, .fs_bytes = sizeof overlay_frag_spv,
@@ -293,13 +295,13 @@ static vec3 perpendicular_up(vec3 dir) {
 
 /* The eight corners of the camera frustum between two view-space depths. */
 static void frustum_slice_corners(mat4 inv_view, mat4 proj, float d0, float d1, vec3 out[8]) {
-    const mat4 inv_proj = mat4_inverse(proj);
+    const mat4 inv_proj = vkmin_mat4_inverse(proj);
     for (int k = 0; k < 8; ++k) {
         const float nx = (k & 1) ? 1.0f : -1.0f, ny = (k & 2) ? 1.0f : -1.0f;
-        const vec3 on_near = mat4_mul_point(inv_proj, (vec3){nx, ny, 0.0f});
+        const vec3 on_near = vkmin_mat4_mul_point(inv_proj, (vec3){nx, ny, 0.0f});
         const float depth = (k & 4) ? d1 : d0;
-        const vec3 view_p = vec3_scale(on_near, depth / -on_near.z);
-        out[k] = mat4_mul_point(inv_view, view_p);
+        const vec3 view_p = vkmin_vec3_scale(on_near, depth / -on_near.z);
+        out[k] = vkmin_mat4_mul_point(inv_view, view_p);
     }
 }
 
@@ -334,33 +336,33 @@ static void build_sun_cascades(view_set *vs, const vkr_frame_desc *f, const sett
     for (int i = s->cascades; i < (int)VKMIN_CASCADES; ++i) splits[i + 1] = far;
     vs->cascade_splits = (vec4){splits[1], splits[2], splits[3], splits[4]};
 
-    const mat4 inv_view = mat4_inverse(f->view);
+    const mat4 inv_view = vkmin_mat4_inverse(f->view);
     const int cell = atlas / 4; /* four cascades share quadrant 0 */
     for (int c = 0; c < s->cascades; ++c) {
         vec3 corners[8];
         frustum_slice_corners(inv_view, f->proj, splits[c], splits[c + 1], corners);
         vec3 centre = {0, 0, 0};
-        for (int k = 0; k < 8; ++k) centre = vec3_add(centre, corners[k]);
-        centre = vec3_scale(centre, 1.0f / 8.0f);
+        for (int k = 0; k < 8; ++k) centre = vkmin_vec3_add(centre, corners[k]);
+        centre = vkmin_vec3_scale(centre, 1.0f / 8.0f);
         float radius = 0.0f;
-        for (int k = 0; k < 8; ++k) radius = fmaxf(radius, vec3_length(vec3_sub(corners[k], centre)));
+        for (int k = 0; k < 8; ++k) radius = fmaxf(radius, vkmin_vec3_length(vkmin_vec3_sub(corners[k], centre)));
         /* Snap the centre to the shadow texel grid so the cascade does not
          * shimmer as the camera moves; the animation is deterministic anyway
          * but the shimmer is still ugly. */
         const float world_texel = 2.0f * radius / (float)cell;
         const vec3 eye_dir = to_sun;
-        const mat4 light_view = mat4_look_at(vec3_add(centre, vec3_scale(eye_dir, radius + scene_radius)), centre,
+        const mat4 light_view = vkmin_mat4_look_at(vkmin_vec3_add(centre, vkmin_vec3_scale(eye_dir, radius + scene_radius)), centre,
                                              perpendicular_up(eye_dir));
-        vec3 centre_ls = mat4_mul_point(light_view, centre);
+        vec3 centre_ls = vkmin_mat4_mul_point(light_view, centre);
         centre_ls.x = floorf(centre_ls.x / world_texel) * world_texel;
         centre_ls.y = floorf(centre_ls.y / world_texel) * world_texel;
-        const vec3 snapped = mat4_mul_point(mat4_inverse(light_view), centre_ls);
-        const mat4 snapped_view = mat4_look_at(vec3_add(snapped, vec3_scale(eye_dir, radius + scene_radius)), snapped,
+        const vec3 snapped = vkmin_mat4_mul_point(vkmin_mat4_inverse(light_view), centre_ls);
+        const mat4 snapped_view = vkmin_mat4_look_at(vkmin_vec3_add(snapped, vkmin_vec3_scale(eye_dir, radius + scene_radius)), snapped,
                                                perpendicular_up(eye_dir));
         const float depth_range = 2.0f * (radius + scene_radius);
-        const mat4 proj = mat4_ortho(-radius, radius, -radius, radius, 0.0f, depth_range);
+        const mat4 proj = vkmin_mat4_ortho(-radius, radius, -radius, radius, 0.0f, depth_range);
         View *v = &vs->views[vs->count++];
-        *v = (View){.view_proj = mat4_mul(proj, snapped_view), .flags = 1};
+        *v = (View){.view_proj = vkmin_mat4_mul(proj, snapped_view), .flags = 1};
         view_planes(v);
         view_set_tile(v, atlas, (c & 1) * cell, (c >> 1) * cell, cell, depth_range, 2.0f * radius, s);
     }
@@ -384,7 +386,7 @@ static view_set build_views(const vkr *r, const vkr_frame_desc *f, const setting
     /* View 0: the camera. Frozen culling keeps yesterday's planes with today's
      * matrices, which is how you see what the cull is throwing away. */
     View *cam = &vs.views[vs.count++];
-    *cam = (View){.view_proj = mat4_mul(f->proj, f->view)};
+    *cam = (View){.view_proj = vkmin_mat4_mul(f->proj, f->view)};
     View cull_from = *cam;
     if (s->freeze && r->frozen) cull_from.view_proj = r->frozen_view_proj;
     view_planes(&cull_from);
@@ -398,7 +400,7 @@ static view_set build_views(const vkr *r, const vkr_frame_desc *f, const setting
         if (lights[i].type == VKMIN_LIGHT_DIRECTIONAL && *sun_index == VKMIN_NONE) {
             *sun_index = i;
             const vec3 d = {lights[i].dir_cone.x, lights[i].dir_cone.y, lights[i].dir_cone.z};
-            to_sun = vec3_normalize(vec3_scale(d, -1.0f));
+            to_sun = vkmin_vec3_normalize(vkmin_vec3_scale(d, -1.0f));
         }
     }
     *to_sun_out = to_sun;
@@ -418,7 +420,7 @@ static view_set build_views(const vkr *r, const vkr_frame_desc *f, const setting
     for (uint32_t i = 0; i < light_count; ++i) {
         if (lights[i].type == VKMIN_LIGHT_DIRECTIONAL) continue;
         const vec3 p = {lights[i].pos_radius.x, lights[i].pos_radius.y, lights[i].pos_radius.z};
-        const float dist = fmaxf(vec3_length(vec3_sub(p, cam_pos)) - lights[i].pos_radius.w, 0.1f);
+        const float dist = fmaxf(vkmin_vec3_length(vkmin_vec3_sub(p, cam_pos)) - lights[i].pos_radius.w, 0.1f);
         ranks[rank_count++] = (light_rank){.importance = lights[i].pos_radius.w / dist, .index = i};
     }
     if (rank_count > 1) qsort(ranks, rank_count, sizeof ranks[0], rank_compare);
@@ -443,15 +445,15 @@ static view_set build_views(const vkr *r, const vkr_frame_desc *f, const setting
                 up = ups[face];
                 fovy = 3.14159265f * 0.5f;
             } else {
-                dir = vec3_normalize((vec3){l->dir_cone.x, l->dir_cone.y, l->dir_cone.z});
+                dir = vkmin_vec3_normalize((vec3){l->dir_cone.x, l->dir_cone.y, l->dir_cone.z});
                 up = perpendicular_up(dir);
                 fovy = 2.0f * acosf(fminf(fmaxf(l->dir_cone.w, -1.0f), 1.0f)) + 0.1f;
                 if (fovy > 3.0f) fovy = 3.0f;
             }
-            const mat4 view = mat4_look_at(pos, vec3_add(pos, dir), up);
-            const mat4 proj = mat4_perspective(fovy, 1.0f, near, radius);
+            const mat4 view = vkmin_mat4_look_at(pos, vkmin_vec3_add(pos, dir), up);
+            const mat4 proj = vkmin_mat4_perspective(fovy, 1.0f, near, radius);
             View *v = &vs.views[vs.count++];
-            *v = (View){.view_proj = mat4_mul(proj, view), .flags = 1};
+            *v = (View){.view_proj = vkmin_mat4_mul(proj, view), .flags = 1};
             view_planes(v);
             const int t = next_tile++;
             const int quadrant = 1 + t / 16, kx = (t % 16) % 4, ky = (t % 16) / 4;
@@ -582,7 +584,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const vkmin_stats gs = vkmin_stats_get(gpu);
 
     if (s.freeze && !r->frozen) {
-        r->frozen_view_proj = mat4_mul(f->proj, f->view);
+        r->frozen_view_proj = vkmin_mat4_mul(f->proj, f->view);
         r->frozen = true;
     }
     if (!s.freeze) r->frozen = false;
@@ -630,8 +632,8 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     *frame = (Frame){
         .view = f->view,
         .proj = f->proj,
-        .view_proj = mat4_mul(f->proj, f->view),
-        .inv_view_proj = mat4_inverse(mat4_mul(f->proj, f->view)),
+        .view_proj = vkmin_mat4_mul(f->proj, f->view),
+        .inv_view_proj = vkmin_mat4_inverse(vkmin_mat4_mul(f->proj, f->view)),
         .camera_pos = {f->camera_pos.x, f->camera_pos.y, f->camera_pos.z, (float)f->frame_index},
         .cascade_splits = vs.cascade_splits,
         .cluster_params = {(float)VKMIN_CLUSTER_Z / log_ratio, -(float)VKMIN_CLUSTER_Z * logf(f->near) / log_ratio, f->near, cluster_far},
@@ -751,7 +753,8 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* --- 7. tonemap, 8. overlay ------------------------------------------- */
     const vkmin_transition to_sampled_hdr[] = {{r->hdr, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_hdr, .image_count = 1});
-    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .clear_color = true, .label = "tonemap"});
+    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .depth = vkmin_default_depth(gpu),
+                                             .clear_color = true, .label = "tonemap"});
     Push tm = base_push;
     tm.param = r->hdr_tex;
     /* Debug views are diagnostic colours, not radiance: pass them through. */

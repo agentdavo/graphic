@@ -98,6 +98,17 @@ cat "$OUT/probe.txt" | sed 's/^/  /'
 MODERN=0
 grep -q "hostImageCopy=1 maintenance5=1" "$OUT/probe.txt" && MODERN=1
 
+begin "== the examples are the tests: each renders frame 60 at 256x256 =="
+for ex in 01_clear 02_triangle 03_buffer 04_texture 05_compute 06_cube; do
+    checks=$((checks + 1))
+    if ./$BUILD/ex_$ex --headless --size 256 256 --frame 60 --out "$OUT/ex_$ex.png" >/dev/null 2>"$OUT/ex_$ex.log"; then
+        checks=$((checks - 1))
+        compare "ex_$ex"
+    else
+        fail "example $ex"; sed -n '1,8p' "$OUT/ex_$ex.log"
+    fi
+done
+
 begin "== The Corridor: golden frames on the legacy path (each frame in its own process) =="
 for f in $FRAMES; do
     render "corridor_$f" --frame "$f" --path=legacy

@@ -15,7 +15,7 @@
 #include "anim.h"
 #include "cvar.h"
 #include "ktx2.h"
-#include "mat4.h"
+#include "vkmin_math.h"
 #include "pack.h"
 #include "render.h"
 #include "scene.h"
@@ -93,11 +93,11 @@ static void build_cube(mesh_builder *b) {
     for (int f = 0; f < 6; ++f) {
         const vec3 n = normals[f];
         const vec3 up = fabsf(n.y) > 0.5f ? (vec3){0, 0, 1} : (vec3){0, 1, 0};
-        const vec3 t = vec3_cross(up, n); /* right-handed frame: t x up = n */
+        const vec3 t = vkmin_vec3_cross(up, n); /* right-handed frame: t x up = n */
         const uint32_t base = b->vn;
         for (int k = 0; k < 4; ++k) {
             const float su = (k & 1) ? 1.0f : -1.0f, sv = (k & 2) ? 1.0f : -1.0f;
-            const vec3 p = vec3_add(n, vec3_add(vec3_scale(t, su), vec3_scale(up, sv)));
+            const vec3 p = vkmin_vec3_add(n, vkmin_vec3_add(vkmin_vec3_scale(t, su), vkmin_vec3_scale(up, sv)));
             mb_vertex(b, p, n, t, su * 0.5f + 0.5f, sv * 0.5f + 0.5f);
         }
         mb_tri(b, base, base + 1, base + 3);
@@ -166,15 +166,15 @@ static void add_instance(world *w, Instance inst) {
 }
 
 static vec4 world_bounds(mat4 transform, vec4 local) {
-    const vec3 c = mat4_mul_point(transform, (vec3){local.x, local.y, local.z});
-    const float sx = vec3_length((vec3){transform.m[0], transform.m[1], transform.m[2]});
-    const float sy = vec3_length((vec3){transform.m[4], transform.m[5], transform.m[6]});
-    const float sz = vec3_length((vec3){transform.m[8], transform.m[9], transform.m[10]});
+    const vec3 c = vkmin_mat4_mul_point(transform, (vec3){local.x, local.y, local.z});
+    const float sx = vkmin_vec3_length((vec3){transform.m[0], transform.m[1], transform.m[2]});
+    const float sy = vkmin_vec3_length((vec3){transform.m[4], transform.m[5], transform.m[6]});
+    const float sz = vkmin_vec3_length((vec3){transform.m[8], transform.m[9], transform.m[10]});
     return (vec4){c.x, c.y, c.z, local.w * fmaxf(sx, fmaxf(sy, sz))};
 }
 
 static mat4 mat4_from_array(const float *a) {
-    mat4 m = mat4_identity();
+    mat4 m = vkmin_mat4_identity();
     memcpy(m.m, a, sizeof m.m);
     return m;
 }
@@ -235,7 +235,7 @@ static void world_build(world *w, vkr *r, vkmin_ctx *gpu, const options *opt) {
     w->pane_first = w->instance_count;
     const vec3 pane_pos[2] = {{-2.0f, 1.6f, 4.9f}, {3.0f, 1.6f, -4.9f}};
     for (int i = 0; i < 2; ++i) {
-        const mat4 t = mat4_mul(mat4_translate(pane_pos[i]), mat4_scale((vec3){1.4f, 1.2f, 1.0f}));
+        const mat4 t = vkmin_mat4_mul(vkmin_mat4_translate(pane_pos[i]), vkmin_mat4_scale((vec3){1.4f, 1.2f, 1.0f}));
         add_instance(w, (Instance){.transform = t, .bounds = world_bounds(t, meshes[2].bounds), .mesh = w->quad_mesh,
                                    .material = w->glass_mat, .bone_offset = VKMIN_NONE});
     }
@@ -246,9 +246,9 @@ static void world_build(world *w, vkr *r, vkmin_ctx *gpu, const options *opt) {
     w->char_index = w->instance_count;
     const vkm_node *cn = &w->character.nodes[0];
     w->char_node_world = mat4_from_array(cn->transform);
-    const mat4 placement = mat4_mul(mat4_translate((vec3){0.5f, 0.0f, 1.5f}),
-                                    mat4_mul(mat4_rotate_y(-0.6f), mat4_scale((vec3){1.6f, 1.6f, 1.6f})));
-    const mat4 t = mat4_mul(placement, w->char_node_world);
+    const mat4 placement = vkmin_mat4_mul(vkmin_mat4_translate((vec3){0.5f, 0.0f, 1.5f}),
+                                    vkmin_mat4_mul(vkmin_mat4_rotate_y(-0.6f), vkmin_mat4_scale((vec3){1.6f, 1.6f, 1.6f})));
+    const mat4 t = vkmin_mat4_mul(placement, w->char_node_world);
     add_instance(w, (Instance){.transform = t, .bounds = world_bounds(t, w->character.meshes[cn->mesh].bounds),
                                .mesh = w->char_mesh0 + cn->mesh, .material = w->char_mat0 + cn->material,
                                .bone_offset = 0, .flags = cn->skinned ? VKMIN_INST_SKINNED : 0u});
@@ -267,9 +267,9 @@ static void world_animate(world *w, int frame) {
         const float rx = 6.5f - 1.0f * (float)ring, rz = 1.6f - 0.3f * (float)ring;
         const float y = 1.8f + 2.2f * (float)ring + 0.4f * sinf(angle * 3.0f + time);
         const float scale = 0.10f + 0.04f * (float)((k * 7) % 5);
-        const mat4 rot = mat4_mul(mat4_rotate_y(time * 0.7f + (float)i), mat4_rotate_x(time * 0.4f));
-        inst->transform = mat4_mul(mat4_translate((vec3){rx * cosf(angle), y, rz * sinf(angle)}),
-                                   mat4_mul(rot, mat4_scale((vec3){scale, scale, scale})));
+        const mat4 rot = vkmin_mat4_mul(vkmin_mat4_rotate_y(time * 0.7f + (float)i), vkmin_mat4_rotate_x(time * 0.4f));
+        inst->transform = vkmin_mat4_mul(vkmin_mat4_translate((vec3){rx * cosf(angle), y, rz * sinf(angle)}),
+                                   vkmin_mat4_mul(rot, vkmin_mat4_scale((vec3){scale, scale, scale})));
         inst->mesh = (k % 4 == 0) ? w->cube_mesh : w->sphere_mesh;
         inst->material = w->prop_mat0 + (uint32_t)(k % 3);
         inst->bounds = world_bounds(inst->transform, (vec4){0, 0, 0, inst->mesh == w->cube_mesh ? 1.75f : 1.0f});
@@ -277,7 +277,7 @@ static void world_animate(world *w, int frame) {
 
     /* Sixty-four point lights on two counter-rotating ellipses. */
     const float sun_intensity = cvar_get(CV_r_sun_intensity);
-    const vec3 sun_dir = vec3_normalize((vec3){0.35f, -1.0f, 0.25f});
+    const vec3 sun_dir = vkmin_vec3_normalize((vec3){0.35f, -1.0f, 0.25f});
     w->lights[0] = (Light){.pos_radius = {0, 0, 0, 1e9f}, .color = {sun_intensity, sun_intensity * 0.96f, sun_intensity * 0.88f, 0},
                            .dir_cone = {sun_dir.x, sun_dir.y, sun_dir.z, 0}, .type = VKMIN_LIGHT_DIRECTIONAL,
                            .shadow_view = VKMIN_NONE};
@@ -333,8 +333,8 @@ static void camera_at(int frame, int width, int height, mat4 *view, mat4 *proj, 
     const float u = (float)(frame % LOOP_FRAMES) / (float)LOOP_FRAMES;
     const vec3 eye = spline_eval(camera_points, 8, u);
     const vec3 target = spline_eval(target_points, 8, u);
-    *view = mat4_look_at(eye, target, (vec3){0, 1, 0});
-    *proj = mat4_perspective(60.0f * PI / 180.0f, (float)width / (float)height, near, far);
+    *view = vkmin_mat4_look_at(eye, target, (vec3){0, 1, 0});
+    *proj = vkmin_mat4_perspective(60.0f * PI / 180.0f, (float)width / (float)height, near, far);
     *pos = (vec4){eye.x, eye.y, eye.z, 1.0f};
 }
 

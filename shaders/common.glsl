@@ -30,7 +30,9 @@ layout(buffer_reference, scalar) readonly buffer OverlayRef { OverlayQuad q[]; }
 layout(set = 0, binding = 0) uniform sampler2D textures[];
 layout(set = 0, binding = 0) uniform sampler2DShadow shadow_textures[];
 
+#ifndef VKMIN_OWN_PUSH
 layout(push_constant, scalar) uniform PushBlock { Push push; };
+#endif
 
 #define TEX(i) textures[nonuniformEXT(i)]
 #define SHADOW_TEX(i) shadow_textures[nonuniformEXT(i)]

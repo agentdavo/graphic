@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/stat.h>
 #include <vulkan/vulkan.h>
 
 /* ---------------------------------------------------------------- errors -- */
@@ -121,6 +122,11 @@ typedef struct {
     VkPipeline pipe;
     VkPipelineBindPoint bind_point;
     char label[VKMIN_LABEL];
+    /* For hot reload: the desc to rebuild from, the files' last mtimes, and
+     * the blobs read from disk (owned here once a reload has happened). */
+    vkmin_pipe_desc desc;
+    long mtime[3];
+    uint32_t *loaded[3];
 } pipe_slot;
 
 typedef struct {
@@ -1453,6 +1459,7 @@ void vkmin_shutdown(vkmin_ctx *c) {
     VK_CHECK(vkDeviceWaitIdle(c->dev));
     for (uint32_t i = 0; i < VKMIN_MAX_PIPES; ++i) {
         if (c->pipes[i].used) vkDestroyPipeline(c->dev, c->pipes[i].pipe, NULL);
+        for (int k = 0; k < 3; ++k) free(c->pipes[i].loaded[k]);
     }
     for (uint32_t i = 0; i < VKMIN_MAX_IMAGES; ++i) {
         if (!c->images[i].used || c->images[i].external) continue;
@@ -1738,11 +1745,14 @@ vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c) {
     return VKMIN_FMT_RGBA8_UNORM;
 }
 
+vkmin_image vkmin_default_depth(const vkmin_ctx *c) { return c->default_depth; }
+
 vkmin_image vkmin_backbuffer(const vkmin_ctx *c) {
     return (vkmin_image){handle_make(VKMIN_BACKBUFFER_SLOT, c->images[VKMIN_BACKBUFFER_SLOT].gen)};
 }
 
 /* ------------------------------------------------------------ pipelines --- */
+static long file_mtime(const char *path);
 
 /* Seam 3 of 3: a shader stage. The legacy path creates a transient module
  * and destroys it once the pipeline exists; the modern path (maintenance5)
@@ -1817,12 +1827,12 @@ static VkCompareOp compare_lookup(vkmin_compare cmp) {
     VKMIN_FAIL("bad compare %d", (int)cmp);
 }
 
-static vkmin_pipe make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label);
+static vkmin_pipe make_compute(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label);
 
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     VKMIN_ASSERT(c && desc && (desc->vs || desc->cs), "vkmin_make_pipeline: needs .vs or .cs");
     const char *label = desc->label ? desc->label : "pipeline";
-    if (desc->cs) return make_compute(c, desc->cs, desc->cs_bytes, label);
+    if (desc->cs) return make_compute(c, desc, label);
     shader_stage vs = {0}, fs = {0};
     make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs, desc->vs_bytes, label);
     if (desc->fs) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs, desc->fs_bytes, label);
@@ -1848,6 +1858,9 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     const VkPipelineMultisampleStateCreateInfo multisample = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    /* Backbuffer passes always have the default depth attached, so pipelines
+     * that render there must declare it whether or not they test against it. */
+    const bool depth_attachment = desc->depth || desc->color_format == VKMIN_FMT_RGBA8_UNORM;
     const VkPipelineDepthStencilStateCreateInfo depth = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = desc->depth,
@@ -1882,7 +1895,7 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = has_color ? 1u : 0u,
         .pColorAttachmentFormats = &color_vk,
-        .depthAttachmentFormat = desc->depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED,
+        .depthAttachmentFormat = depth_attachment ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED,
     };
     VkPipelineRobustnessCreateInfoEXT robust;
     const VkGraphicsPipelineCreateInfo info = {
@@ -1905,6 +1918,10 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     pipe_slot *s = &c->pipes[index];
     s->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     snprintf(s->label, sizeof s->label, "%s", label);
+    s->desc = *desc;
+    s->mtime[0] = file_mtime(desc->vs_path);
+    s->mtime[1] = file_mtime(desc->fs_path);
+    s->mtime[2] = file_mtime(desc->cs_path);
     VK_CHECK(vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &info, NULL, &s->pipe));
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label);
     if (vs.module) vkDestroyShaderModule(c->dev, vs.module, NULL);
@@ -1912,9 +1929,9 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     return (vkmin_pipe){handle_make(index, s->gen)};
 }
 
-static vkmin_pipe make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label) {
+static vkmin_pipe make_compute(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label) {
     shader_stage cs = {0};
-    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, spv, bytes, label);
+    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, desc->cs, desc->cs_bytes, label);
     VkPipelineRobustnessCreateInfoEXT robust;
     const VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -1927,10 +1944,75 @@ static vkmin_pipe make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, 
     pipe_slot *s = &c->pipes[index];
     s->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
     snprintf(s->label, sizeof s->label, "%s", label);
+    s->desc = *desc;
+    s->mtime[2] = file_mtime(desc->cs_path);
     VK_CHECK(vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &info, NULL, &s->pipe));
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label);
     if (cs.module) vkDestroyShaderModule(c->dev, cs.module, NULL);
     return (vkmin_pipe){handle_make(index, s->gen)};
+}
+
+/* ------------------------------------------------------------ hot reload -- */
+
+static long file_mtime(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 ? (long)st.st_mtime : -1;
+}
+
+static uint32_t *read_spirv_file(const char *path, size_t *bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint32_t *blob = size > 0 ? malloc((size_t)size) : NULL;
+    if (!blob || fread(blob, 1, (size_t)size, f) != (size_t)size) { free(blob); fclose(f); return NULL; }
+    fclose(f);
+    *bytes = (size_t)size;
+    return blob;
+}
+
+/* One unconditional check per frame, at one fixed point: usually it stats a
+ * few files and does nothing. When a SPIR-V file has changed, the pipeline is
+ * rebuilt into the same slot, so every handle to it keeps working. */
+static void hot_reload_check(vkmin_ctx *c) {
+    for (uint32_t i = 0; i < VKMIN_MAX_PIPES; ++i) {
+        pipe_slot *s = &c->pipes[i];
+        const char *paths[3] = {s->desc.vs_path, s->desc.fs_path, s->desc.cs_path};
+        if (!s->used || (!paths[0] && !paths[1] && !paths[2])) continue;
+        bool changed = false;
+        for (int k = 0; k < 3; ++k) {
+            const long m = file_mtime(paths[k]);
+            if (paths[k] && m != s->mtime[k]) { changed = s->mtime[k] != 0; s->mtime[k] = m; }
+        }
+        if (!changed) continue;
+        vkmin_pipe_desc d = s->desc;
+        const uint32_t **blobs[3] = {&d.vs, &d.fs, &d.cs};
+        size_t *sizes[3] = {&d.vs_bytes, &d.fs_bytes, &d.cs_bytes};
+        bool ok = true;
+        uint32_t *fresh[3] = {0};
+        for (int k = 0; k < 3 && ok; ++k) {
+            if (!paths[k]) continue;
+            fresh[k] = read_spirv_file(paths[k], sizes[k]);
+            if (!fresh[k]) ok = false; else *blobs[k] = fresh[k];
+        }
+        if (!ok) { /* half-written file: try again next frame */
+            for (int k = 0; k < 3; ++k) free(fresh[k]);
+            for (int k = 0; k < 3; ++k) s->mtime[k] = 0;
+            continue;
+        }
+        VK_CHECK(vkDeviceWaitIdle(c->dev));
+        vkDestroyPipeline(c->dev, s->pipe, NULL);
+        const uint16_t gen = s->gen;
+        const char label[VKMIN_LABEL];
+        memcpy((void *)label, s->label, sizeof label);
+        s->used = false;                       /* let make_pipeline take this very slot */
+        const vkmin_pipe p = vkmin_make_pipeline(c, &d);
+        VKMIN_ASSERT(handle_index(p.id) == i, "hot reload landed in a different slot");
+        s->gen = gen;                          /* same handle as before */
+        for (int k = 0; k < 3; ++k) { free(s->loaded[k]); s->loaded[k] = fresh[k]; }
+        fprintf(stderr, "vkmin: reloaded pipeline '%s'\n", label);
+    }
 }
 
 /* ---------------------------------------------------------------- frame --- */
@@ -1963,6 +2045,7 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     }
     c->draws = 0;
     c->dispatches = 0;
+    if (cvar_get_bool(CV_r_hotreload)) hot_reload_check(c);
 
     if (c->fence_pending[c->slot]) {
         VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->slot], VK_TRUE, UINT64_MAX));

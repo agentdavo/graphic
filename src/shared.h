@@ -216,6 +216,26 @@ VKMIN_STRUCT(Push) {
     U32 param3;
 };
 
+/* The examples' push block and vertex. A program defines its own like this:
+ * a struct in shared.h, seen identically by C and GLSL, with resources as
+ * numbers -- a device address for the vertices, a bindless index for the
+ * texture -- and whatever else the draw needs. */
+VKMIN_STRUCT(ExVertex) {
+    F32 px, py, pz;
+    U32 color;      /* rgba8 */
+    F32 u, v;
+    F32 pad0, pad1;
+};
+
+VKMIN_STRUCT(ExPush) {
+    mat4 mvp;
+    ADDR vertices;
+    U32 texture;
+    U32 frame;
+    F32 time;
+    F32 pad;
+};
+
 /* Overlay text: one quad per glyph, written by the CPU into the ring buffer. */
 VKMIN_STRUCT(OverlayQuad) {
     vec4 rect;          /* x0, y0, x1, y1 in pixels */
@@ -247,6 +267,8 @@ _Static_assert(sizeof(Frame) == 496 && offsetof(Frame, camera_pos) == 256 &&
                "Frame");
 _Static_assert(sizeof(Push) == 32 && offsetof(Push, view) == 16, "Push");
 _Static_assert(sizeof(OverlayQuad) == 48, "OverlayQuad");
+_Static_assert(sizeof(ExVertex) == 32, "ExVertex");
+_Static_assert(sizeof(ExPush) == 88 && offsetof(ExPush, vertices) == 64, "ExPush");
 #endif
 
 #endif /* VKMIN_SHARED_H */

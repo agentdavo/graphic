@@ -1,7 +1,7 @@
 /* mat4_test -- the demo's maths is pure, so testing it is build inputs, check
  * outputs, and needs no GPU. Written because this is exactly the finicky code
  * that silently produces a plausible-looking wrong picture. */
-#include "mat4.h"
+#include "vkmin_math.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -34,20 +34,20 @@ static vec3 project(mat4 m, vec3 p) {
 }
 
 int main(void) {
-    const mat4 id = mat4_identity();
-    const mat4 rot = mat4_rotate_y(0.7f);
-    const mat4 through_identity = mat4_mul(rot, id);
+    const mat4 id = vkmin_mat4_identity();
+    const mat4 rot = vkmin_mat4_rotate_y(0.7f);
+    const mat4 through_identity = vkmin_mat4_mul(rot, id);
     for (int i = 0; i < 16; ++i) {
         check(close_enough(through_identity.m[i], rot.m[i]), "multiplying by identity changes a matrix");
     }
 
     /* Rotating a point 90 degrees about Y must send +X to -Z. */
-    const vec3 spun = project(mat4_rotate_y(3.14159265f * 0.5f), (vec3){1.0f, 0.0f, 0.0f});
+    const vec3 spun = project(vkmin_mat4_rotate_y(3.14159265f * 0.5f), (vec3){1.0f, 0.0f, 0.0f});
     check(close_enough(spun.x, 0.0f) && close_enough(spun.y, 0.0f) && close_enough(spun.z, -1.0f),
           "rotate_y(90 degrees) does not send +X to -Z");
 
     /* The camera transform must put the eye at the origin looking down -Z. */
-    const mat4 view = mat4_look_at((vec3){0.0f, 0.0f, 4.0f}, (vec3){0.0f, 0.0f, 0.0f},
+    const mat4 view = vkmin_mat4_look_at((vec3){0.0f, 0.0f, 4.0f}, (vec3){0.0f, 0.0f, 0.0f},
                                    (vec3){0.0f, 1.0f, 0.0f});
     const vec3 eye_in_view = project(view, (vec3){0.0f, 0.0f, 4.0f});
     check(close_enough(eye_in_view.x, 0.0f) && close_enough(eye_in_view.y, 0.0f) &&
@@ -59,7 +59,7 @@ int main(void) {
     /* Vulkan depth runs 0 at the near plane to 1 at the far plane, and the
      * projection carries the Y flip, so +Y in view space must come out below
      * the centre of the framebuffer. */
-    const mat4 proj = mat4_perspective(1.0f, 1.0f, 0.5f, 10.0f);
+    const mat4 proj = vkmin_mat4_perspective(1.0f, 1.0f, 0.5f, 10.0f);
     const vec3 near_point = project(proj, (vec3){0.0f, 0.0f, -0.5f});
     const vec3 far_point = project(proj, (vec3){0.0f, 0.0f, -10.0f});
     check(close_enough(near_point.z, 0.0f), "near plane does not map to depth 0");

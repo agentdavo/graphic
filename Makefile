@@ -35,7 +35,9 @@ GLSL_FLAGS := -V --target-env vulkan1.3 -Isrc -Ishaders -P"\#extension GL_GOOGLE
 CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD)/cvar.o $(BUILD)/ktx2.o $(BUILD)/scene.o $(BUILD)/render.o
 
 .PHONY: all clean test golden texture analyze tools
-all: tools $(BUILD)/smoke $(BUILD)/corridor
+EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
+
+all: tools $(BUILD)/smoke $(BUILD)/corridor $(EXAMPLES)
 tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles
 
 $(BUILD):
@@ -59,7 +61,7 @@ $(BUILD)/shaders.h: $(SPV) $(BUILD)/bin2c
 	@printf '#endif\n' >> $@
 
 # --- objects
-$(BUILD)/%.o: src/%.c src/vkmin.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h src/render.h src/mat4.h src/font.h $(BUILD)/shaders.h | $(BUILD)
+$(BUILD)/%.o: src/%.c src/vkmin.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h src/render.h src/vkmin_math.h src/font.h $(BUILD)/shaders.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
@@ -71,7 +73,12 @@ $(BUILD)/smoke: tests/smoke.c $(BUILD)/shaders.h $(CORE_OBJS)
 $(BUILD)/handles: tests/handles.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
-$(BUILD)/corridor: demo/corridor.c demo/anim.h src/render.h src/scene.h src/mat4.h $(CORE_OBJS)
+# The examples are the tutorial and the tests: each builds alone against the
+# header, and each produces a golden image in make test.
+$(BUILD)/ex_%: examples/%.c examples/cube_data.h src/vkmin.h src/vkmin_math.h $(BUILD)/shaders.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/corridor: demo/corridor.c demo/anim.h src/render.h src/scene.h src/vkmin_math.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/imgdiff: tools/imgdiff.c $(BUILD)/stb_bridge.o | $(BUILD)
@@ -80,7 +87,7 @@ $(BUILD)/imgdiff: tools/imgdiff.c $(BUILD)/stb_bridge.o | $(BUILD)
 $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-$(BUILD)/mat4_test: tests/mat4_test.c src/mat4.h | $(BUILD)
+$(BUILD)/mat4_test: tests/mat4_test.c src/vkmin_math.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(BUILD)/mkfont: tools/mkfont.c | $(BUILD)
@@ -104,8 +111,16 @@ texture: $(BUILD)/mktex
 
 # Static analysis is part of the test run, not a target someone remembers:
 # a finding fails the build.
-test: all analyze
+test: all analyze $(BUILD)/amalg_check
 	./tests/run_tests.sh
+
+# The single-header form is generated, never edited, and must compile alone.
+.PHONY: amalgamate
+amalgamate: $(BUILD)/vkmin_single.h
+$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/vkmin_math.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
+	./tools/amalgamate.sh > $@
+$(BUILD)/amalg_check: $(BUILD)/vkmin_single.h tests/amalg_check.c
+	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function -I$(BUILD) -Ithird_party -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
 
 golden: all
 	VKMIN_WRITE_GOLDEN=1 ./tests/run_tests.sh
