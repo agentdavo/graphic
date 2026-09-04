@@ -173,11 +173,11 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
 
     /* Nine pipelines for the whole engine, all created here, all against the
      * one layout. */
-    r->cull = vkmin_make_compute(gpu, cull_comp_spv, sizeof cull_comp_spv, "vkr.cull");
-    r->cluster = vkmin_make_compute(gpu, cluster_comp_spv, sizeof cluster_comp_spv, "vkr.cluster");
+    r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cull_comp_spv, .cs_bytes = sizeof cull_comp_spv, .label = "vkr.cull"});
+    r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cluster_comp_spv, .cs_bytes = sizeof cluster_comp_spv, .label = "vkr.cluster"});
     const vkmin_pipe_desc depth_desc = {.vs = depth_vert_spv, .vs_bytes = sizeof depth_vert_spv,
                                         .fs = depth_frag_spv, .fs_bytes = sizeof depth_frag_spv,
-                                        .depth = true, .depth_write = true, .depth_compare = VKMIN_CMP_LESS,
+                                        .color_format = VKMIN_FMT_NONE, .depth = true, .depth_write = true, .depth_compare = VKMIN_CMP_LESS,
                                         .depth_bias = true, .cull = VKMIN_CULL_BACK, .label = "vkr.depth"};
     vkmin_pipe_desc d = depth_desc;
     r->depth_cull = vkmin_make_pipeline(gpu, &d);
@@ -556,15 +556,18 @@ static void draw_lists(vkr *r, uint32_t view, vkmin_pipe culled, vkmin_pipe doub
     Push push = *base;
     push.view = view;
     for (uint32_t list = 0; list < 2; ++list) {
-        vkmin_bind_pipeline(r->gpu, list == 0 ? culled : double_sided);
-        vkmin_push(r->gpu, &push);
+        vkmin_indirect_desc d = {.indices = r->indices};
         if (gpu_cull) {
-            const size_t cmd_offset = (size_t)(view * 2 + list) * VKMIN_MAX_DRAWS * sizeof(DrawCmd);
-            vkmin_draw_indexed_indirect_count(r->gpu, r->draw_cmds, cmd_offset, r->draw_counts,
-                                              (size_t)(view * 2 + list) * sizeof(uint32_t), VKMIN_MAX_DRAWS);
+            d.cmds = r->draw_cmds;
+            d.cmd_offset = (size_t)(view * 2 + list) * VKMIN_MAX_DRAWS * sizeof(DrawCmd);
+            d.counts = r->draw_counts;
+            d.count_offset = (size_t)(view * 2 + list) * sizeof(uint32_t);
+            d.max_draws = VKMIN_MAX_DRAWS;
         } else {
-            vkmin_draw_indexed_indirect_host(r->gpu, host_cmds[view * 2 + list], host_counts[view * 2 + list]);
+            d.host_cmds = host_cmds[view * 2 + list];
+            d.host_count = host_counts[view * 2 + list];
         }
+        vkmin_draw_indirect(r->gpu, list == 0 ? culled : double_sided, &push, sizeof push, &d);
     }
 }
 
@@ -574,6 +577,9 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     VKR_ASSERT(f->light_count <= VKMIN_MAX_LIGHTS, "too many lights");
     vkmin_ctx *gpu = r->gpu;
     const settings s = read_settings();
+    /* The caller has begun the frame; stats from the frame that last used this
+     * slot are complete now. */
+    const vkmin_stats gs = vkmin_stats_get(gpu);
 
     if (s.freeze && !r->frozen) {
         r->frozen_view_proj = mat4_mul(f->proj, f->view);
@@ -588,14 +594,9 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const int rw = win_w < r->desc.width ? win_w : r->desc.width;
     const int rh = win_h < r->desc.height ? win_h : r->desc.height;
 
-    vkmin_frame_begin(gpu);
     const uint32_t slot = vkmin_frame_slot(gpu);
-
-    /* Stats from the frame that last used this slot: its fence is waited. */
-    double ts[VKR_TIMESTAMPS];
-    const int ts_n = vkmin_timestamps_read(gpu, ts, VKR_TIMESTAMPS);
-    for (int i = 0; i + 1 < ts_n && i < 8; ++i) r->stats.pass_ms[i] = ts[i + 1] - ts[i];
-    if (ts_n == VKR_TIMESTAMPS) r->stats.frame_ms = ts[VKR_TIMESTAMPS - 1] - ts[0];
+    for (int i = 0; i + 1 < gs.timestamps && i < 8; ++i) r->stats.pass_ms[i] = gs.gpu_ms[i + 1] - gs.gpu_ms[i];
+    if (gs.timestamps == VKR_TIMESTAMPS) r->stats.frame_ms = gs.gpu_ms[VKR_TIMESTAMPS - 1] - gs.gpu_ms[0];
     if (r->counts_valid[slot]) {
         r->stats.draws_camera = r->counts_host[slot][0] + r->counts_host[slot][1];
         r->stats.draws_shadow = 0;
@@ -603,7 +604,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
             r->stats.draws_shadow += r->counts_host[slot][v * 2] + r->counts_host[slot][v * 2 + 1];
         }
     }
-    vkmin_memory_stats(gpu, &r->stats.device_used, &r->stats.device_cap, &r->stats.ring_used, &r->stats.ring_cap);
+    r->stats.device_used = gs.device_used;
+    r->stats.device_cap = gs.device_cap;
+    r->stats.ring_used = gs.ring_used;
+    r->stats.ring_cap = gs.ring_cap;
 
     /* --- per-frame data into the ring ------------------------------------ */
     uint64_t lights_addr = 0, views_addr = 0, inst_addr = 0, bones_addr = 0, frame_addr = 0;
@@ -644,17 +648,17 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         .sun_light = sun_index,
         .instance_count = f->instance_count,
         .shadow_atlas_tex = r->atlas_shadow_tex,
-        .vertices = vkmin_buffer_addr(gpu, r->vertices),
-        .skin_vertices = vkmin_buffer_addr(gpu, r->skin_vertices),
-        .meshes = vkmin_buffer_addr(gpu, r->meshes),
-        .materials = vkmin_buffer_addr(gpu, r->materials),
+        .vertices = vkmin_address(gpu, r->vertices),
+        .skin_vertices = vkmin_address(gpu, r->skin_vertices),
+        .meshes = vkmin_address(gpu, r->meshes),
+        .materials = vkmin_address(gpu, r->materials),
         .instances = inst_addr,
         .lights = lights_addr,
         .views = views_addr,
         .bones = bones_addr,
-        .draw_cmds = vkmin_buffer_addr(gpu, r->draw_cmds),
-        .draw_counts = vkmin_buffer_addr(gpu, r->draw_counts),
-        .cluster_lights = vkmin_buffer_addr(gpu, r->cluster_lights),
+        .draw_cmds = vkmin_address(gpu, r->draw_cmds),
+        .draw_counts = vkmin_address(gpu, r->draw_counts),
+        .cluster_lights = vkmin_address(gpu, r->cluster_lights),
     };
     const Push base_push = {.frame = frame_addr};
 
@@ -693,11 +697,9 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_fill_buffer(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), s.compact ? 0u : f->instance_count);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.transfer_to_compute = true});
     if (s.gpu_cull && f->instance_count) {
-        vkmin_bind_pipeline(gpu, r->cull);
         Push push = base_push;
         push.param = s.compact ? 1u : 0u;
-        vkmin_push(gpu, &push);
-        vkmin_dispatch(gpu, (f->instance_count + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
+        vkmin_dispatch(gpu, r->cull, &push, sizeof push, (f->instance_count + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
     }
     vkmin_timestamp(gpu, 1);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.compute_to_indirect_draw = true, .compute_to_transfer = true});
@@ -705,7 +707,6 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
 
     /* --- 2. shadow atlas -------------------------------------------------- */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.depth = r->atlas, .clear_depth = true, .label = "shadows"});
-    vkmin_bind_index_buffer(gpu, r->indices, 0);
     for (uint32_t v = 1; v < vs.count; ++v) {
         const View *sv = &vs.views[v];
         const int atlas = r->desc.shadow_atlas;
@@ -720,7 +721,6 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* --- 3. depth prepass ------------------------------------------------- */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.depth = r->depth, .clear_depth = true, .w = rw, .h = rh, .label = "prepass"});
     if (s.prepass) {
-        vkmin_bind_index_buffer(gpu, r->indices, 0);
         vkmin_set_depth_bias(gpu, 0.0f, 0.0f);
         draw_lists(r, 0, r->depth_cull, r->depth_nocull, &base_push, s.gpu_cull, host_cmds, host_counts);
     }
@@ -728,9 +728,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_timestamp(gpu, 3);
 
     /* --- 4. light clusters ------------------------------------------------ */
-    vkmin_bind_pipeline(gpu, r->cluster);
-    vkmin_push(gpu, &base_push);
-    vkmin_dispatch(gpu, (VKMIN_CLUSTER_COUNT + VKMIN_CLUSTER_GROUP - 1) / VKMIN_CLUSTER_GROUP, 1, 1);
+    vkmin_dispatch(gpu, r->cluster, &base_push, sizeof base_push, (VKMIN_CLUSTER_COUNT + VKMIN_CLUSTER_GROUP - 1) / VKMIN_CLUSTER_GROUP, 1, 1);
     vkmin_timestamp(gpu, 4);
     const vkmin_transition to_sampled_atlas[] = {{r->atlas, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_atlas, .image_count = 1, .compute_to_fragment = true});
@@ -739,15 +737,13 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* The clear is the sky: there is no skybox, and Sponza's courtyard is open. */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = r->hdr, .depth = r->depth, .clear_color = true,
                                              .clear = {0.30f * 2.5f, 0.50f * 2.5f, 0.95f * 2.5f, 1.0f}, .w = rw, .h = rh, .label = "forward"});
-    vkmin_bind_index_buffer(gpu, r->indices, 0);
     const bool overdraw = s.debug == VKMIN_DEBUG_OVERDRAW;
     draw_lists(r, 0, overdraw ? r->fwd_blend : r->fwd_cull, overdraw ? r->fwd_blend : r->fwd_nocull, &base_push,
                s.gpu_cull, host_cmds, host_counts);
     vkmin_timestamp(gpu, 5);
     if (transparent_count) {
-        vkmin_bind_pipeline(gpu, r->fwd_blend);
-        vkmin_push(gpu, &base_push);
-        vkmin_draw_indexed_indirect_host(gpu, transparent_addr, transparent_count);
+        vkmin_draw_indirect(gpu, r->fwd_blend, &base_push, sizeof base_push,
+                            &(vkmin_indirect_desc){.indices = r->indices, .host_cmds = transparent_addr, .host_count = transparent_count});
     }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 6);
@@ -756,26 +752,21 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const vkmin_transition to_sampled_hdr[] = {{r->hdr, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_hdr, .image_count = 1});
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .clear_color = true, .label = "tonemap"});
-    vkmin_bind_pipeline(gpu, r->tonemap);
     Push tm = base_push;
     tm.param = r->hdr_tex;
     /* Debug views are diagnostic colours, not radiance: pass them through. */
     tm.param2 = s.debug != 0 ? 0u : (uint32_t)s.tonemap;
     tm.param3 = r->atlas_raw_tex;
-    vkmin_push(gpu, &tm);
-    vkmin_draw(gpu, 3, 1);
+    vkmin_draw(gpu, r->tonemap, &tm, sizeof tm, 3, 1);
     vkmin_timestamp(gpu, 7);
     if (quad_count) {
-        vkmin_bind_pipeline(gpu, r->overlay);
         Push ov = base_push;
         ov.aux = quads_addr;
         ov.param = r->font_tex;
-        vkmin_push(gpu, &ov);
-        vkmin_draw(gpu, quad_count * 6, 1);
+        vkmin_draw(gpu, r->overlay, &ov, sizeof ov, quad_count * 6, 1);
     }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 8);
-    vkmin_frame_end(gpu);
 
     r->stats.shadow_views = vs.shadow_draw_views;
     r->stats.lights_shadowed = vs.lights_shadowed;

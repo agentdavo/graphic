@@ -117,7 +117,7 @@ analyze:
 	cppcheck --std=c11 --enable=warning,style,performance,portability \
 	    --inline-suppr --error-exitcode=1 --quiet \
 	    --suppress=missingIncludeSystem --suppress=missingInclude \
-	    -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c \
+	    -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c -UVKMIN_NO_PLATFORM \
 	    src demo tools tests
 
 clean:

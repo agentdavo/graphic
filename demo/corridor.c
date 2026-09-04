@@ -29,13 +29,12 @@
 #define LOOP_FRAMES 720          /* twelve seconds at the fixed 60 Hz timestep */
 #define FRAME_DT (1.0f / 60.0f)
 
-enum { MAX_INSTANCES = 1024, MAX_FRAMES_ARG = 32, PROP_COUNT = 300, POINT_LIGHTS = 64, MAX_BONES = 128 };
+enum { MAX_INSTANCES = 1024, PROP_COUNT = 300, POINT_LIGHTS = 64, MAX_BONES = 128 };
 
 typedef struct {
-    bool headless, sync_naive, list_cvars, probe;
-    int width, height, device, exit_after;
-    int frames[MAX_FRAMES_ARG], frame_count;
-    const char *out, *out_dir, *scene_path, *character_path, *profile;
+    bool headless, probe;
+    int device;
+    const char *scene_path, *character_path, *profile;
 } options;
 
 /* ------------------------------------------------------- generated meshes -- */
@@ -363,59 +362,29 @@ static void compose_overlay(char *buf, size_t cap, const vkr_stats *st, int fram
 
 static const char *usage_text =
     "usage: corridor [options] [cvar=value ...]\n"
-    "  --headless              render offscreen\n"
-    "  --frame N               render exactly frame N and exit (implies --headless)\n"
-    "  --frames a,b,c          render each of these frames (implies --headless)\n"
-    "  --out PATH              PNG path for a single frame\n"
-    "  --out-dir DIR           PNG directory for a frame list\n"
-    "  --size W H              render size (default r_width x r_height)\n"
-    "  --profile lavapipe      320x180, 8 lights, 1024 atlas, 1 cascade, no transparents, no overlay\n"
     "  --scene PATH            cooked scene (default assets/sponza/scene.vkm)\n"
     "  --character PATH        cooked skinned character (default assets/cesium/scene.vkm)\n"
-    "  --sync-naive            one frame in flight and wait idle per submit\n"
-    "  --no-readback           skip the per-frame capture copy (PNG saving then fails)\n"
-    "  --exit-after N          windowed: stop after N frames (and save --out, if given)\n"
-    "  --device N              physical device index\n"
-    "  --path=legacy|modern    force the API path (default: modern when the device can)\n"
+    "  --profile lavapipe      320x180, 8 lights, 1024 atlas, 1 cascade, no transparents, no overlay\n"
     "  --probe                 print what the device offers and which path would be chosen\n"
-    "  --cvars                 list every cvar and exit\n"
+    "  plus every vkmin flag: --headless --frame N --frames a,b --out P --out-dir D --exit-after N\n"
+    "  --size W H --path=legacy|modern --sync-naive --no-readback --device N --verbose --cvars\n"
     "  windowed: F1 cycles debug views, Space pauses, F12 saves a PNG, Escape quits\n";
-
-static void parse_frames(options *o, const char *list) {
-    const char *p = list;
-    while (*p && o->frame_count < MAX_FRAMES_ARG) {
-        char *end = NULL;
-        const long v = strtol(p, &end, 10);
-        if (end == p) break;
-        o->frames[o->frame_count++] = (int)v;
-        p = *end == ',' ? end + 1 : end;
-    }
-}
 
 int main(int argc, char **argv) {
     options opt = {.scene_path = "assets/sponza/scene.vkm", .character_path = "assets/cesium/scene.vkm"};
+    /* The demo reads only its own flags; vkmin_init reads the rest. The one
+     * thing both need to know is whether the run is headless. */
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         const bool next = i + 1 < argc;
-        if (strcmp(a, "--headless") == 0) opt.headless = true;
-        else if (strcmp(a, "--sync-naive") == 0) opt.sync_naive = true;
-        else if (strcmp(a, "--no-readback") == 0) cvar_set(CV_r_readback, 0.0f);
-        else if (strcmp(a, "--cvars") == 0) opt.list_cvars = true;
-        else if (strcmp(a, "--probe") == 0) opt.probe = true;
-        else if (strcmp(a, "--path=legacy") == 0) cvar_set(CV_r_path, 1.0f);
-        else if (strcmp(a, "--path=modern") == 0) cvar_set(CV_r_path, 2.0f);
-        else if (strcmp(a, "--frame") == 0 && next) { opt.headless = true; opt.frame_count = 1; opt.frames[0] = atoi(argv[++i]); }
-        else if (strcmp(a, "--frames") == 0 && next) { opt.headless = true; parse_frames(&opt, argv[++i]); }
-        else if (strcmp(a, "--out") == 0 && next) opt.out = argv[++i];
-        else if (strcmp(a, "--out-dir") == 0 && next) opt.out_dir = argv[++i];
-        else if (strcmp(a, "--scene") == 0 && next) opt.scene_path = argv[++i];
-        else if (strcmp(a, "--character") == 0 && next) opt.character_path = argv[++i];
-        else if (strcmp(a, "--profile") == 0 && next) opt.profile = argv[++i];
-        else if (strcmp(a, "--device") == 0 && next) opt.device = atoi(argv[++i]);
-        else if (strcmp(a, "--exit-after") == 0 && next) opt.exit_after = atoi(argv[++i]);
-        else if (strcmp(a, "--size") == 0 && i + 2 < argc) { opt.width = atoi(argv[++i]); opt.height = atoi(argv[++i]); }
-        else if (strchr(a, '=')) { if (!cvar_parse_assignment(a)) return 2; }
-        else { fprintf(stderr, "%s", usage_text); return strcmp(a, "--help") == 0 ? 0 : 2; }
+        if (!strcmp(a, "--headless") || !strcmp(a, "--frame") || !strcmp(a, "--frames")) opt.headless = true;
+        else if (!strcmp(a, "--probe")) opt.probe = true;
+        else if (!strcmp(a, "--scene") && next) opt.scene_path = argv[++i];
+        else if (!strcmp(a, "--character") && next) opt.character_path = argv[++i];
+        else if (!strcmp(a, "--profile") && next) opt.profile = argv[++i];
+        else if (!strcmp(a, "--device") && next) opt.device = atoi(argv[++i]);
+        else if (!strcmp(a, "--help")) { fprintf(stderr, "%s", usage_text); return 0; }
+        else if (a[0] != '-' && strchr(a, '=')) { if (!cvar_parse_assignment(a)) return 2; }
     }
     if (opt.profile) {
         if (strcmp(opt.profile, "lavapipe") != 0) { fprintf(stderr, "corridor: unknown profile '%s'\n", opt.profile); return 2; }
@@ -429,7 +398,6 @@ int main(int argc, char **argv) {
             if (!cvar_was_set(profile[k].id)) cvar_set(profile[k].id, profile[k].v);
         }
     }
-    if (opt.list_cvars) { cvar_print_all(); return 0; }
     if (opt.probe) {
         const vkmin_report r = vkmin_probe(opt.device);
         printf("device: %s (Vulkan %u.%u)\nhostImageCopy=%d maintenance5=%d pushDescriptor=%d pipelineRobustness=%d "
@@ -440,16 +408,10 @@ int main(int argc, char **argv) {
                r.would_choose == VKMIN_PATH_MODERN ? "modern" : "legacy", r.reason ? r.reason : "");
         return r.vulkan_1_3 ? 0 : 1;
     }
-    if (opt.width <= 0 || opt.height <= 0) { opt.width = cvar_get_int(CV_r_width); opt.height = cvar_get_int(CV_r_height); }
-    if (opt.headless && opt.frame_count == 0) { opt.frame_count = 1; opt.frames[0] = 0; }
-    if (opt.sync_naive) cvar_set(CV_r_sync_naive, 1.0f);
-
-    vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.headless = opt.headless, .sync_naive = cvar_get_bool(CV_r_sync_naive),
-                                              .path = (vkmin_path)cvar_get_int(CV_r_path),
-                                              .no_readback = !cvar_get_bool(CV_r_readback),
-                                              .vsync = cvar_get_bool(CV_r_vsync), .width = opt.width, .height = opt.height,
-                                              .device_index = opt.device, .title = "vkmin -- The Corridor"});
-    vkr *r = vkr_init(gpu, &(vkr_desc){.width = opt.width, .height = opt.height, .shadow_atlas = cvar_get_int(CV_r_shadow_atlas),
+    vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "corridor", .device_index = opt.device});
+    int width = 0, height = 0;
+    vkmin_size(gpu, &width, &height);
+    vkr *r = vkr_init(gpu, &(vkr_desc){.width = width, .height = height, .shadow_atlas = cvar_get_int(CV_r_shadow_atlas),
                                        .max_vertices = 400000, .max_indices = 1200000, .max_skin_vertices = 8192,
                                        .max_meshes = 256, .max_materials = 64, .max_instances = MAX_INSTANCES});
     world *w = calloc(1, sizeof *w);
@@ -459,55 +421,32 @@ int main(int argc, char **argv) {
 
     char overlay[2048];
     const float near = 0.1f, far = 120.0f;
-    int status = 0;
-
-    if (opt.headless) {
-        for (int i = 0; i < opt.frame_count; ++i) {
-            const int frame = opt.frames[i];
-            world_animate(w, frame);
-            vkr_frame_desc fd = {.instances = w->instances, .instance_count = w->instance_count, .lights = w->lights,
-                                 .light_count = POINT_LIGHTS + 1, .bones = w->bones, .bone_count = w->bone_count,
-                                 .near = near, .far = far, .frame_index = (uint32_t)frame};
-            camera_at(frame, opt.width, opt.height, &fd.view, &fd.proj, &fd.camera_pos, near, far);
-            /* Headless overlays omit timings so the image is reproducible. */
-            const vkr_stats st = vkr_get_stats(r);
-            compose_overlay(overlay, sizeof overlay, &st, frame, POINT_LIGHTS + 1, false);
-            fd.overlay_text = overlay;
-            vkr_frame(r, &fd);
-            char path[1024];
-            if (opt.out && opt.frame_count == 1) snprintf(path, sizeof path, "%s", opt.out);
-            else snprintf(path, sizeof path, "%s/corridor_%04d.png", opt.out_dir ? opt.out_dir : ".", frame);
-            if (!vkmin_save_png(gpu, path)) status = 1;
-            else printf("wrote %s\n", path);
+    int shot = 0;
+    while (vkmin_frame_begin(gpu, NULL)) {
+        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+        if (vkmin_key_hit(gpu, VKMIN_KEY_SPACE)) cvar_set(CV_d_frame_step, cvar_get(CV_d_frame_step) > 0 ? 0.0f : 1.0f);
+        if (vkmin_key_hit(gpu, VKMIN_KEY_F1)) cvar_set(CV_r_debug, (float)((cvar_get_int(CV_r_debug) + 1) % 7));
+        const int frame = (int)vkmin_frame_index(gpu);
+        int ww = 0, wh = 0;
+        vkmin_size(gpu, &ww, &wh);
+        world_animate(w, frame);
+        vkr_frame_desc fd = {.instances = w->instances, .instance_count = w->instance_count, .lights = w->lights,
+                             .light_count = POINT_LIGHTS + 1, .bones = w->bones, .bone_count = w->bone_count,
+                             .near = near, .far = far, .frame_index = (uint32_t)frame};
+        camera_at(frame, ww, wh, &fd.view, &fd.proj, &fd.camera_pos, near, far);
+        /* Headless overlays omit timings so the image is reproducible. */
+        const vkr_stats st = vkr_get_stats(r);
+        compose_overlay(overlay, sizeof overlay, &st, frame, POINT_LIGHTS + 1, !opt.headless);
+        fd.overlay_text = overlay;
+        vkr_frame(r, &fd);
+        vkmin_frame_end(gpu);
+        if (vkmin_key_hit(gpu, VKMIN_KEY_F12)) {
+            char path[64];
+            snprintf(path, sizeof path, "shot_%04d.png", shot++);
+            if (vkmin_save_png(gpu, path)) printf("wrote %s\n", path);
         }
-    } else {
-        int frame = 0, rendered = 0, shot = 0;
-        while (!vkmin_should_close(gpu)) {
-            if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) break;
-            if (vkmin_key_hit(gpu, VKMIN_KEY_SPACE)) cvar_set(CV_d_frame_step, cvar_get(CV_d_frame_step) > 0 ? 0.0f : 1.0f);
-            if (vkmin_key_hit(gpu, VKMIN_KEY_F1)) cvar_set(CV_r_debug, (float)((cvar_get_int(CV_r_debug) + 1) % 7));
-            int ww = 0, wh = 0;
-            vkmin_size(gpu, &ww, &wh);
-            world_animate(w, frame);
-            vkr_frame_desc fd = {.instances = w->instances, .instance_count = w->instance_count, .lights = w->lights,
-                                 .light_count = POINT_LIGHTS + 1, .bones = w->bones, .bone_count = w->bone_count,
-                                 .near = near, .far = far, .frame_index = (uint32_t)frame};
-            camera_at(frame, ww, wh, &fd.view, &fd.proj, &fd.camera_pos, near, far);
-            const vkr_stats st = vkr_get_stats(r);
-            compose_overlay(overlay, sizeof overlay, &st, frame, POINT_LIGHTS + 1, true);
-            fd.overlay_text = overlay;
-            vkr_frame(r, &fd);
-            if (vkmin_key_hit(gpu, VKMIN_KEY_F12)) {
-                char path[64];
-                snprintf(path, sizeof path, "shot_%04d.png", shot++);
-                if (vkmin_save_png(gpu, path)) printf("wrote %s\n", path);
-            }
-            frame += cvar_get_int(CV_d_frame_step);
-            ++rendered;
-            if (opt.exit_after > 0 && rendered >= opt.exit_after) break;
-        }
-        if (opt.out && rendered > 0 && !vkmin_save_png(gpu, opt.out)) status = 1;
     }
+    const int status = 0;
 
     vkr_shutdown(r);
     vkmin_shutdown(gpu);

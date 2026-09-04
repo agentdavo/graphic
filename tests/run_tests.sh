@@ -76,10 +76,13 @@ checks=$((checks + 1))
 
 begin "== --no-readback on the legacy path: the copy is skipped and save_png says so =="
 checks=$((checks + 1))
-if $CORRIDOR --frame 0 --path=legacy --no-readback --out "$OUT/noreadback.png" >/dev/null 2>"$OUT/noreadback.log"; then
-    fail "--no-readback should make the PNG save fail"
+$CORRIDOR --frame 0 --path=legacy --no-readback --out "$OUT/noreadback.png" >/dev/null 2>"$OUT/noreadback.log"
+if [ -f "$OUT/noreadback.png" ]; then
+    fail "--no-readback still wrote a PNG"
+elif grep -q "readback is disabled" "$OUT/noreadback.log"; then
+    note "refused, with the reason"
 else
-    grep -q "readback is disabled" "$OUT/noreadback.log" && note "refused, with the reason" || fail "wrong failure for --no-readback"
+    fail "--no-readback: no PNG but no reason given either"
 fi
 
 begin "== GPU layer smoke test: compute, device addresses, bindless, timestamps =="

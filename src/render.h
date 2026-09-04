@@ -8,6 +8,9 @@
  * hands over every frame; static geometry and materials are uploaded once.
  * Textures are bindless slots the caller obtained from vkmin. The renderer
  * never allocates after init and never reads a cvar in a loop.
+ *
+ * The caller owns the frame: vkr_frame records between the caller's
+ * vkmin_frame_begin(ctx, NULL) and vkmin_frame_end(ctx).
  */
 #ifndef VKMIN_RENDER_H
 #define VKMIN_RENDER_H

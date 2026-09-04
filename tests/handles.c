@@ -30,14 +30,14 @@ int main(void) {
     /* Same slot, different id: the generation moved. */
     if ((b0.id & 0xfffff) != (b1.id & 0xfffff) || b0.id == b1.id) { puts("handles: FAIL buffer slot/gen"); return 1; }
     if ((i0.id & 0xfffff) != (i1.id & 0xfffff) || i0.id == i1.id) { puts("handles: FAIL image slot/gen"); return 1; }
-    (void)vkmin_buffer_addr(c, b1); /* the live handle works */
+    (void)vkmin_address(c, b1); /* the live handle works */
 
     /* The stale handle must abort. */
     fflush(stdout);
     const pid_t pid = fork();
     if (pid == 0) {
         if (!freopen("/dev/null", "w", stderr)) _exit(2);
-        (void)vkmin_buffer_addr(c, b0);
+        (void)vkmin_address(c, b0);
         _exit(0); /* reached only if the stale handle was accepted */
     }
     int status = 0;
