@@ -1,0 +1,58 @@
+#version 450
+#include "common.glsl"
+#include "lib/outdoor.glsl"
+layout(local_size_x=64) in;
+void main() {
+    Frame f = FrameRef(push.frame).frame;
+    uint copyIndex = gl_GlobalInvocationID.x;
+    if (push.view == VKMIN_NONE) {
+        if (copyIndex < push.param3) InstanceWrite(f.instances).i[copyIndex] = InstanceRef(push.aux).i[copyIndex];
+        return;
+    }
+    Outdoor o = OutdoorRef(f.outdoor).o;
+    Scatter s = ScatterRef(push.aux).s[push.view];
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= s.grid.x*s.grid.y) return;
+    uvec2 cell = uvec2(k%s.grid.x, k/s.grid.x);
+    vec2 origin = s.origin_cell.xz;
+    uvec2 key = uvec2(ivec2(floor(origin/s.origin_cell.w))+ivec2(cell));
+    uint h = outdoor_hash(key, s.data.w);
+    vec2 p = origin+(vec2(cell)+vec2(hash_unit(h),hash_unit(h*1597334677u)))*s.origin_cell.w;
+    vec2 uv = terrain_uv(o,p);
+    float density = textureLod(TEX(s.data.z), uv, 0).r*s.scale.z;
+    float size = mix(s.scale.x,s.scale.y,hash_unit(h*3812015801u));
+    float angle = hash_unit(h*958282777u)*6.2831853, c = cos(angle)*size, a = sin(angle)*size;
+    bool visible = all(greaterThanEqual(uv,vec2(0))) && all(lessThanEqual(uv,vec2(1))) && hash_unit(h*1103515245u) < density;
+    float dist = distance(p,f.camera_pos.xz);
+    visible = visible && dist < s.scale.w;
+    vec3 root = vec3(p.x,terrain_height(o,p),p.y);
+    if ((s.grid.z & VKMIN_INST_GRASS) != 0u) visible = visible && hash_unit(h*69069u) < grass_fade(f,root);
+    bool tree = s.foliage.w > 0u;
+    float impostorFade = smoothstep(s.scale.w*0.5,s.scale.w*0.6,dist);
+    uint count = tree ? 2u : 1u;
+    for (uint part=0u; part<count; ++part) {
+        Instance inst;
+        inst.transform = mat4(vec4(c,0,-a,0),vec4(0,size,0,0),vec4(a,0,c,0),vec4(root,1));
+        inst.prev_transform = inst.transform;
+        inst.mesh = part == 0u ? s.data.x : s.foliage.x;
+        inst.material = part == 0u ? s.data.y : s.foliage.y;
+        vec4 bounds = MeshRef(f.meshes).m[inst.mesh].bounds;
+        inst.bounds = vec4((inst.transform*vec4(bounds.xyz,1)).xyz,bounds.w*size+2.0*o.weather.y);
+        inst.bone_offset = VKMIN_NONE;
+        inst.flags = s.grid.z | (part == 1u ? VKMIN_INST_LEAF : 0u) | (!visible ? VKMIN_INST_HIDDEN : 0u) | (tree ? VKMIN_INST_TREE : 0u);
+        inst.id = h | 1u; inst.pad0 = h; inst.pad1 = floatBitsToUint(tree ? impostorFade : 0.0); inst.pad2 = 0u;
+        InstanceWrite(f.instances).i[s.grid.w+k*count+part] = inst;
+    }
+    if (tree) {
+        Quad q;
+        q.pos = vec4(root+vec3(0,4.5*size,0),0);
+        float viewAngle = atan(f.camera_pos.z-root.z,f.camera_pos.x-root.x)+angle;
+        float tile = floor(fract(viewAngle/6.2831853)*float(s.foliage.w));
+        q.size_uv0 = vec4(8*size,9*size,tile/float(s.foliage.w),0);
+        if (!visible || impostorFade <= 0.0) q.size_uv0.xy = vec2(0);
+        q.uv1 = vec4((tile+1)/float(s.foliage.w),1,0,impostorFade);
+        q.color = 0xffffffffu; q.texture = s.foliage.z;
+        q.flags = VKMIN_QUAD_BILLBOARD | VKMIN_QUAD_MASKED; q.pad0 = 0u;
+        QuadWrite(f.quads).q[push.param+k] = q;
+    }
+}

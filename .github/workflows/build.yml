@@ -1,0 +1,96 @@
+# Build the CMake tree and render one frame under lavapipe on a GPU-less
+# runner. This replaces the two make-based workflows, whose targets (the test
+# suite, the goldens, the package consumers) are no longer in the tree.
+#
+# Warnings are errors and GCC's analyser runs in the normal build, so a clean
+# build here is the check. It is not a substitute for the suite that was
+# removed: nothing below compares a recorded frame against a replayed one.
+name: build
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan, lavapipe, glslang and a platform backend
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libvulkan-dev glslang-tools spirv-tools \
+            mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+      - name: Build
+        run: cmake --build build
+      - name: Validate every SPIR-V module
+        run: cmake --build build --target validate-shaders
+      - name: Render a frame under lavapipe
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frame300
+          path: frame300.png
+          if-no-files-found: warn
+
+  # The other three backends are parallel implementations; they earn their keep
+  # only if they keep compiling.
+  backends:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sdl2, glfw]
+        include:
+          - backend: sdl2
+            packages: libsdl2-dev
+          - backend: glfw
+            packages: libglfw3-dev
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libvulkan-dev glslang-tools ${{ matrix.packages }}
+      - run: cmake -S . -B build -G Ninja -DVKMIN_PLATFORM=${{ matrix.backend }}
+      - run: cmake --build build
+
+  headless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libvulkan-dev glslang-tools
+      - name: No window system and no sound card
+        run: |
+          cmake -S . -B build -G Ninja -DVKMIN_HEADLESS=ON
+          cmake --build build
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-glslang
+            mingw-w64-ucrt-x86_64-SDL3
+      - shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja
+          cmake --build build

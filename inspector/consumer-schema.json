@@ -1,0 +1,12 @@
+{
+  "sample texture": [
+    {"name":"computed_gain_address","offset":0,"type":"u64"},
+    {"name":"texture_index","offset":8,"type":"u32"},
+    {"name":"gain","offset":12,"type":"u32"}
+  ],
+  "write gain": [
+    {"name":"computed_gain_address","offset":0,"type":"u64"},
+    {"name":"texture_index","offset":8,"type":"u32"},
+    {"name":"gain","offset":12,"type":"u32"}
+  ]
+}

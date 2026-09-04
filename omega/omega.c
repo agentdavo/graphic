@@ -1,0 +1,674 @@
+/* OMEGA / THROUGH THE BLUE. Blender-authored hull, native gate and original audio.
+ * 30-second loop: ignition, opening, emergence, short-short-long fire, collapse.
+ * Space pause; R restart; M mute; A/D orbit; W/S elevation; F12 capture.
+ * --headless --frame 915 --out omega.png --audio-out omega.wav
+ * --audio-only --audio-out omega.wav renders the complete 30-second score.
+ */
+#include "vkmin.h"
+#include "vkmin_cvar.h"
+#include "vkmin_math.h"
+#include "sndmin.h"
+#include "omega_shared.h"
+#include "omega_score.h"
+#include "omega_model.h"
+#include "omega_surface.h"
+#include "shaders.h"
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <threads.h>
+#endif
+
+enum { OMEGA_CAPACITY=750000, OMEGA_TICKS=OMEGA_SEQUENCE_TICKS, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1620 };
+typedef struct { OmegaVertex *v; uint32_t count; uint32_t part; } omega_mesh;
+typedef struct {
+    sndmin_sound drone, gate, closing, cannon, cannon_long, particle, tick;
+    sndmin_voice engine, gate_voice;
+    omega_score score;
+} omega_audio;
+typedef struct { uint32_t age, duration; } omega_pulse;
+static const float omega_pi=3.14159265359f;
+static const vec4 armor={.30f,.32f,.34f,1}, dark={.12f,.14f,.16f,1};
+static const vec4 steel={.43f,.44f,.42f,1}, red={.32f,.065f,.042f,1};
+
+// OmegaVertex packing. Pure: value in, value out. The shader's unpack is the
+// exact inverse -- GLSL unpackHalf2x16 and unpackSnorm2x16 -- so these three
+// are the only place the layout is written down on the C side.
+static uint32_t omega_half(float value) {
+    uint32_t bits; memcpy(&bits,&value,sizeof bits);
+    const uint32_t sign=(bits>>16)&0x8000u;
+    const int32_t exponent=(int32_t)((bits>>23)&0xffu)-127+15;
+    const uint32_t mantissa=bits&0x7fffffu;
+    if(exponent<=0) return sign;          // no colour here is denormal; flush to zero
+    if(exponent>=31) return sign|0x7c00u; // nor infinite, but do not wrap if one is
+    uint32_t half=sign|((uint32_t)exponent<<10)|(mantissa>>13);
+    const uint32_t dropped=mantissa&0x1fffu; // round to nearest, ties to even
+    if(dropped>0x1000u || (dropped==0x1000u && (half&1u))) ++half;
+    return half;
+}
+static uint32_t omega_pack_half2(float low,float high) { return omega_half(low)|(omega_half(high)<<16); }
+static uint32_t omega_pack_normal(vec3 n) {
+    const float scale=fabsf(n.x)+fabsf(n.y)+fabsf(n.z);
+    float u=scale>0?n.x/scale:0,v=scale>0?n.y/scale:0;
+    if(n.z<0) { // fold the lower hemisphere onto the octahedron's corners
+        const float folded=(1.f-fabsf(v))*(u>=0?1.f:-1.f);
+        v=(1.f-fabsf(u))*(v>=0?1.f:-1.f); u=folded;
+    }
+    const long iu=lrintf(fmaxf(-1.f,fminf(1.f,u))*32767.f),iv=lrintf(fmaxf(-1.f,fminf(1.f,v))*32767.f);
+    return ((uint32_t)iu&0xffffu)|(((uint32_t)iv&0xffffu)<<16);
+}
+// The decode, for the one builder that transforms vertices it already wrote.
+// It must stay the inverse of omega_pack_normal above and of omegaOctDecode in
+// omega.glsl; all three change together or none of them does.
+static float omega_snorm16(uint32_t bits) {
+    const int32_t raw=(int32_t)(bits&0xffffu);
+    return (float)(raw>=32768?raw-65536:raw)/32767.f;
+}
+static vec3 omega_unpack_normal(uint32_t packed) {
+    const float u=omega_snorm16(packed),v=omega_snorm16(packed>>16);
+    vec3 n={u,v,1.f-fabsf(u)-fabsf(v)};
+    const float fold=n.z<0?-n.z:0.f;
+    n.x+=n.x>=0?-fold:fold; n.y+=n.y>=0?-fold:fold;
+    return vkmin_vec3_normalize(n);
+}
+static uint32_t omega_codes(uint32_t material,uint32_t part) { return material|(part<<8); }
+static OmegaVertex omega_vertex(vec3 p,vec3 n,vec4 color,uint32_t material,uint32_t part) {
+    return (OmegaVertex){.x=p.x,.y=p.y,.z=p.z,.normal=omega_pack_normal(n),
+        .color_rg=omega_pack_half2(color.x,color.y),
+        .color_b_codes=omega_half(color.z)|(omega_codes(material,part)<<16)};
+}
+static void triangle(omega_mesh *m, vec3 a, vec3 b, vec3 c, vec4 color, int material) {
+    VKMIN_ASSERT(m->count+3<=OMEGA_CAPACITY,"omega vertex capacity");
+    const vec3 n=vkmin_vec3_normalize(vkmin_vec3_cross(vkmin_vec3_sub(b,a),vkmin_vec3_sub(c,a)));
+    const vec3 points[3]={a,b,c};
+    for(int i=0;i<3;++i) m->v[m->count++]=omega_vertex(points[i],n,color,(uint32_t)material,m->part);
+}
+static void quad(omega_mesh *m,vec3 a,vec3 b,vec3 c,vec3 d,vec4 color,int material) {
+    triangle(m,a,b,c,color,material); triangle(m,a,c,d,color,material);
+}
+/* Chamfered octagonal extrusion. Flat faces keep the armor silhouette crisp. */
+static void hull(omega_mesh *m,vec3 p,vec3 size,float bevel,vec4 color,int material) {
+    const float x=size.x*.5f,y=size.y*.5f,z=size.z*.5f;
+    const vec2 rim[8]={{-x+bevel,-y},{x-bevel,-y},{x,-y+bevel},{x,y-bevel},
+        {x-bevel,y},{-x+bevel,y},{-x,y-bevel},{-x,-y+bevel}};
+    for(int i=0;i<8;++i) {
+        const int j=(i+1)%8;
+        const vec3 a={p.x+rim[i].x,p.y+rim[i].y,p.z-z};
+        const vec3 b={p.x+rim[j].x,p.y+rim[j].y,p.z-z};
+        const vec3 c={b.x,b.y,p.z+z},d={a.x,a.y,p.z+z};
+        quad(m,a,b,c,d,color,material);
+        triangle(m,(vec3){p.x,p.y,p.z-z},b,a,color,material);
+        triangle(m,(vec3){p.x,p.y,p.z+z},d,c,color,material);
+    }
+}
+static void tube(omega_mesh *m,vec3 a,vec3 b,float ra,float rb,vec4 color,int material,int segments) {
+    const vec3 axis=vkmin_vec3_normalize(vkmin_vec3_sub(b,a));
+    const vec3 u=vkmin_vec3_normalize(vkmin_vec3_cross(axis,fabsf(axis.y)>.9f?(vec3){1,0,0}:(vec3){0,1,0}));
+    const vec3 v=vkmin_vec3_cross(axis,u);
+    for(int k=0;k<segments;++k) {
+        const float t=2*omega_pi*(float)k/(float)segments,s=2*omega_pi*(float)(k+1)/(float)segments;
+        const vec3 n=vkmin_vec3_add(vkmin_vec3_scale(u,cosf(t)),vkmin_vec3_scale(v,sinf(t)));
+        const vec3 nn=vkmin_vec3_add(vkmin_vec3_scale(u,cosf(s)),vkmin_vec3_scale(v,sinf(s)));
+        const vec3 p=vkmin_vec3_add(a,vkmin_vec3_scale(n,ra)),q=vkmin_vec3_add(a,vkmin_vec3_scale(nn,ra));
+        const vec3 r=vkmin_vec3_add(b,vkmin_vec3_scale(nn,rb)),ss=vkmin_vec3_add(b,vkmin_vec3_scale(n,rb));
+        quad(m,p,q,r,ss,color,material); triangle(m,a,q,p,color,material); triangle(m,b,ss,r,color,material);
+    }
+}
+/* Tapered flat blade from root to tip. chord is the width direction; the
+ * thickness direction follows from it, so root and tip stay parallel. */
+static void blade(omega_mesh *m,vec3 root,vec3 tip,vec3 chord,float root_len,float tip_len,
+                  float root_thick,float tip_thick,vec4 color,int material) {
+    const vec3 axis=vkmin_vec3_normalize(vkmin_vec3_sub(tip,root));
+    const vec3 c=vkmin_vec3_normalize(chord);
+    const vec3 t=vkmin_vec3_normalize(vkmin_vec3_cross(axis,c));
+    vec3 corner[2][4];
+    for(int end=0;end<2;++end) {
+        const vec3 centre=end?tip:root;
+        const float half_len=(end?tip_len:root_len)*.5f,half_thick=(end?tip_thick:root_thick)*.5f;
+        for(int k=0;k<4;++k) {
+            const float sc=(k==0||k==3)?-half_len:half_len,st=k<2?-half_thick:half_thick;
+            corner[end][k]=vkmin_vec3_add(centre,vkmin_vec3_add(vkmin_vec3_scale(c,sc),vkmin_vec3_scale(t,st)));
+        }
+    }
+    for(int k=0;k<4;++k) {
+        const int j=(k+1)%4;
+        quad(m,corner[0][k],corner[0][j],corner[1][j],corner[1][k],color,material);
+    }
+    quad(m,corner[0][3],corner[0][2],corner[0][1],corner[0][0],color,material);
+    quad(m,corner[1][0],corner[1][1],corner[1][2],corner[1][3],color,material);
+}
+static omega_mesh make_ship(void) {
+    omega_mesh m={.v=calloc(OMEGA_CAPACITY,sizeof(OmegaVertex))};
+    VKMIN_ASSERT(m.v,"omega mesh allocation");
+    VKMIN_ASSERT(OMEGA_MODEL_COUNT*4+18000<OMEGA_CAPACITY,"omega authored mesh capacity");
+    for(size_t i=0;i<OMEGA_MODEL_COUNT;++i) {
+        const OmegaPackedVertex v=omega_model[i];
+        m.v[m.count++]=omega_vertex((vec3){(float)v.x*.001f,(float)v.y*.001f,(float)v.z*.001f},
+            (vec3){(float)v.nx/32767.f,(float)v.ny/32767.f,(float)v.nz/32767.f},
+            (vec4){(float)v.r/255.f,(float)v.g/255.f,(float)v.b/255.f,1},v.material,v.part);
+    }
+    // Three formation hulls, each with fixed and independently rotating parts.
+    // Only the part code changes, so the copy edits the code field in place
+    // rather than re-packing a position and normal that are already correct.
+    for(uint32_t ship=0;ship<3;++ship) for(size_t i=0;i<OMEGA_MODEL_COUNT;++i) {
+        OmegaVertex v=m.v[i];
+        const uint32_t codes=v.color_b_codes>>16;
+        v.color_b_codes=(v.color_b_codes&0xffffu)|((codes+((4u+2u*ship)<<8))<<16);
+        m.v[m.count++]=v;
+    }
+    // Broadside turrets on the fixed forward/aft machinery of each opponent.
+    for(unsigned ship=0;ship<3;++ship) for(unsigned battery=0;battery<2;++battery) {
+        m.part=4u+2u*ship;
+        const float z=battery?10.f:-10.f;
+        hull(&m,(vec3){-1.8f,.7f,z},(vec3){1.f,.65f,1.2f},.18f,armor,0);
+        tube(&m,(vec3){-2.f,.7f,z},(vec3){-2.8f,.7f,z},.20f,.12f,steel,0,8);
+        for(unsigned shot=0;shot<3;++shot) {
+            m.part=10u+ship*6u+battery*3u+shot;
+            tube(&m,(vec3){0,0,0},(vec3){0,0,1},.16f,.07f,(vec4){.2f,.8f,1,1},8,8);
+        }
+    }
+    m.part=0;
+    for(int side=-1;side<=1;side+=2) {
+        const float x=(float)side*OMEGA_MUZZLE_X;
+        tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z},(vec3){x,.4f,-100.f},.09f,.075f,red,5,12);
+    }
+    // Small four-wing escorts establish the capital ship's scale.
+    m.part=2;
+    const vec3 escorts[3]={{-6.2f,-3.8f,-12.f},{6.5f,4.2f,-3.f},{-4.6f,5.6f,9.f}};
+    for(int i=0;i<3;++i) {
+        const vec3 e=escorts[i];
+        hull(&m,e,(vec3){.30f,.34f,.8f},.1f,dark,0);
+        hull(&m,(vec3){e.x,e.y+.12f,e.z-.3f},(vec3){.18f,.15f,.28f},.045f,(vec4){.1f,.5f,.8f,1},3);
+        for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2) {
+            const vec3 tip={e.x+(float)sx*.9f,e.y+(float)sy*.65f,e.z+.15f};
+            tube(&m,e,tip,.085f,.04f,steel,0,5);
+            hull(&m,tip,(vec3){.17f,.21f,.70f},.05f,armor,0);
+            tube(&m,(vec3){tip.x,tip.y,tip.z+.36f},(vec3){tip.x,tip.y,tip.z+.55f},.067f,.018f,(vec4){.5f,.7f,1,1},3,8);
+        }
+    }
+    // Four containment pylons run from the mouth back toward the camera, so
+    // the vortex forms at their far tips and the emerging hull passes between
+    // them. Each is an open box truss of four rails with a cross frame, a
+    // yellow window bay and a pair of long tangential blade fins per station.
+    m.part=3;
+    for(int station=0;station<4;++station) {
+        const uint32_t first=m.count;
+        const vec4 rail={.36f,.21f,.12f,1}, frame={.30f,.29f,.27f,1}, fin={.50f,.56f,.66f,1};
+        const vec4 window={.30f,.70f,1.6f,1};
+        const float front=OMEGA_GATE_PYLON_Z,back=OMEGA_GATE_PYLON_BACK_Z,radial=OMEGA_GATE_PYLON_RADIAL;
+        const float hw=1.0f,hh=.8f;
+        for(int sx=-1;sx<=1;sx+=2) {
+            for(int sy=-1;sy<=1;sy+=2) {
+                tube(&m,(vec3){(float)sx*hw,radial+(float)sy*hh,back},
+                     (vec3){(float)sx*hw,radial+(float)sy*hh,front-1},.17f,.17f,rail,0,6);
+            }
+        }
+        hull(&m,(vec3){0,radial,back-.4f},(vec3){2*hw+.4f,2*hh+.4f,.8f},.2f,dark,0);
+        hull(&m,(vec3){0,radial,front-.5f},(vec3){2*hw-.2f,2*hh-.2f,1.0f},.25f,frame,0);
+        for(int k=0;k<OMEGA_PYLON_STATIONS;++k) {
+            const float z=back+2+(float)k*OMEGA_PYLON_STATION_SPACING;
+            hull(&m,(vec3){0,radial,z},(vec3){2*hw+.5f,2*hh+.5f,.6f},.18f,frame,0);
+            for(int sx=-1;sx<=1;sx+=2) {
+                const float x=(float)sx;
+                hull(&m,(vec3){x*(hw-.12f),radial,z+3.f},(vec3){.08f,.38f,2.2f},.02f,window,4);
+                blade(&m,(vec3){x*hw,radial,z},(vec3){x*(hw+6.4f),radial,z+1.3f},
+                    (vec3){0,0,1},1.5f,.45f,.34f,.10f,fin,0);
+            }
+        }
+        // A broad inward emitter at the far cap injects energy into the mouth.
+        tube(&m,(vec3){0,radial-.7f,front-.5f},(vec3){0,radial-1.5f,front-.2f},.42f,.27f,frame,0,16);
+        tube(&m,(vec3){0,radial-1.5f,front-.2f},(vec3){0,radial-1.65f,front-.05f},.23f,.23f,(vec4){.5f,.8f,1,1},6,16);
+        // Splay the pylon outward about its far cap, then rotate the complete
+        // local assembly around the mouth, including normals.
+        const float splay_c=cosf(OMEGA_PYLON_SPLAY),splay_s=sinf(OMEGA_PYLON_SPLAY);
+        const float angle=(float)station*omega_pi*.5f;
+        const float cs=cosf(angle),sn=sinf(angle);
+        for(uint32_t i=first;i<m.count;++i) {
+            const vec3 p={m.v[i].x,m.v[i].y,m.v[i].z},n=omega_unpack_normal(m.v[i].normal);
+            const float dy=p.y-radial,dz=p.z-front;
+            const vec3 sp={p.x,radial+dy*splay_c-dz*splay_s,front+dy*splay_s+dz*splay_c};
+            const vec3 sn3={n.x,n.y*splay_c-n.z*splay_s,n.y*splay_s+n.z*splay_c};
+            m.v[i].x=cs*sp.x-sn*sp.y; m.v[i].y=sn*sp.x+cs*sp.y; m.v[i].z=sp.z;
+            m.v[i].normal=omega_pack_normal((vec3){cs*sn3.x-sn*sn3.y,sn*sn3.x+cs*sn3.y,sn3.z});
+        }
+    }
+    return m;
+}
+
+static float clamp01(float x) { return fmaxf(0,fminf(1,x)); }
+static float smooth(float a,float b,float t) { const float s=clamp01((t-a)/(b-a)); return s*s*(3-2*s); }
+/* Full-sized ship cruises through a very deep tunnel, decelerates through the
+ * mouth to a steady 22 units/second and flies on past the camera, as in the
+ * footage. Position and speed are continuous; the hull centre crosses the
+ * mouth at 10.25 seconds (tick 615). */
+static float ship_position(float t) {
+    const float start=OMEGA_GATE_ENTRANCE_Z-20.f,speed=220.f,brake=70.f,cruise=22.f,rate=3.7f;
+    const float travel=fmaxf(0,t-4.5f),brake_time=(start-brake)/speed;
+    if(travel<brake_time) return start-speed*travel;
+    const float dt=travel-brake_time;
+    return brake-cruise*dt-(speed-cruise)/rate*(1-expf(-rate*dt));
+}
+/* Shared audiovisual rhythm: two 14-tick taps, then a 78-tick sustained beam.
+ * At tick 615 the hull center reaches the mouth: half the ship is out. */
+static omega_pulse cannon_pulse(uint32_t tick) {
+    if(tick<OMEGA_FIRST_SHOT || tick>=OMEGA_LAST_SHOT) return (omega_pulse){0};
+    const uint32_t phase=(tick-OMEGA_FIRST_SHOT)%216;
+    const uint32_t start=phase>=66?66:(phase>=33?33:0);
+    const uint32_t duration=start==66?78:14;
+    return phase-start<duration?(omega_pulse){phase-start,duration}:(omega_pulse){0};
+}
+static float cannon_flash(uint32_t tick) {
+    const omega_pulse pulse=cannon_pulse(tick);
+    if(!pulse.duration) return 0;
+    const float age=(float)pulse.age/60.f,duration=(float)pulse.duration/60.f;
+    return (1-smooth(duration-.07f,duration,age))*(.90f+.10f*cosf(age*80));
+}
+/* Same integer schedule as GLSL: three staggered pulses per battery. */
+static int particle_age(uint32_t tick,unsigned ship,unsigned shot) {
+    const int elapsed=(int)tick-OMEGA_PARTICLE_START-(int)ship*OMEGA_PARTICLE_STAGGER;
+    if(elapsed<0) return -1;
+    const int age=elapsed%OMEGA_PARTICLE_PERIOD-(int)shot*OMEGA_PARTICLE_SHOT_SPACING;
+    return (int)tick-age<OMEGA_PARTICLE_END?age:-1;
+}
+/* Screen position of a hull-space point in UV, or a negative w when behind the
+ * camera. Column-major, as vkmin_math builds its matrices. */
+static vec3 project_uv(mat4 m,vec3 p) {
+    const float x=m.m[0]*p.x+m.m[4]*p.y+m.m[8]*p.z+m.m[12];
+    const float y=m.m[1]*p.x+m.m[5]*p.y+m.m[9]*p.z+m.m[13];
+    const float w=m.m[3]*p.x+m.m[7]*p.y+m.m[11]*p.z+m.m[15];
+    return (vec3){w>0?x/w*.5f+.5f:0,w>0?y/w*.5f+.5f:0,w};
+}
+/* Which fin station the activation flare has reached; -1 before it starts. */
+static int activation_station(float t) {
+    if(t<.25f) return -1;
+    const float along=.30f+.62f*smooth(.25f,1.75f,t);
+    return (int)floorf(along*OMEGA_PYLON_STATIONS);
+}
+static double seconds_now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter,frequency;
+    QueryPerformanceCounter(&counter); QueryPerformanceFrequency(&frequency);
+    return (double)counter.QuadPart/(double)frequency.QuadPart;
+#else
+    struct timespec ts; timespec_get(&ts,TIME_UTC);
+    return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9;
+#endif
+}
+static void idle_millisecond(void) {
+#ifdef _WIN32
+    Sleep(1);
+#else
+    const struct timespec delay={0,1000000}; thrd_sleep(&delay,NULL);
+#endif
+}
+static float thunder_roll(float t,float onset,float decay) {
+    const float age=fmaxf(0,t-onset);
+    return smooth(onset,onset+.045f,t)*expf(-age*decay);
+}
+/* Original PCM: filtered reactor noise, lightning/thunder, falling FM cannon.
+ * Generated once; all mixing, spatialization, playback and WAV output use sndmin. */
+static sndmin_sound sound_make(sndmin_ctx *audio,int kind) {
+    const uint32_t count=SNDMIN_RATE*4u;
+    float *pcm=calloc(count,sizeof(float)); if(!pcm) return (sndmin_sound){0};
+    uint32_t seed=71431; float low=0,phase=0,thunder=0,body=0,air=0;
+    for(uint32_t i=0;i<count;++i) {
+        const float t=(float)i/(float)SNDMIN_RATE;
+        seed=seed*1664525u+1013904223u;
+        const float noise=(float)(seed>>8)*(2.f/16777216.f)-1;
+        low+=(noise-low)*(kind>=2?.12f:.025f);
+        float sample;
+        if(kind==0) sample=.12f*sinf(2*omega_pi*37*t)+.065f*sinf(2*omega_pi*55*t)+low*.27f;
+        else if(kind==1 || kind==4) {
+            // One lightning snap, then delayed thunder fronts merge into a
+            // soft rolling tail. Two low-pass stages keep the bass turbulent
+            // without the persistent high-frequency crackle of the old cue.
+            const bool closing=kind==4;
+            const float strike=closing?.08f:.7f;
+            const float age=fmaxf(0,t-strike);
+            const float tail=closing?1.6f:.85f;
+            air+=(noise-air)*.16f;
+            body+=(noise-body)*.045f;
+            thunder+=(body-thunder)*.018f;
+            const float snap=smooth(strike,strike+.0015f,t)*expf(-age*85);
+            const float fronts=thunder_roll(t,strike+.035f,tail)
+                +.65f*thunder_roll(t,strike+.26f,tail*1.2f)
+                +.48f*thunder_roll(t,strike+.63f,tail*1.3f)
+                +.30f*thunder_roll(t,strike+1.05f,tail*1.5f);
+            const float rolling=.75f+.16f*sinf(t*9.3f)+.09f*sinf(t*17.1f+.8f);
+            const float boom=thunder_roll(t,strike+.055f,tail*1.4f);
+            const float sub=sinf(2*omega_pi*(29*age+7*(1-expf(-age*3))));
+            const float charge=closing?0.f:smooth(0,.6f,t)*(1-smooth(.7f,1.1f,t));
+            const float envelope=smooth(0,.015f,t)*(1-smooth(closing?1.6f:3.1f,closing?2.45f:4.f,t));
+            sample=envelope*(air*snap*.9f+(thunder*3.4f+body*.45f)*fronts*rolling
+                +sub*boom*.48f+thunder*charge*.8f)*(closing?.75f:1.f);
+        } else if(kind==5) {
+            // Activation tick: a short bright ping as the flare passes a station.
+            const float attack=smooth(0,.002f,t),tail=expf(-t*26);
+            sample=attack*tail*(sinf(2*omega_pi*1480*t+1.8f*sinf(2*omega_pi*2220*t))*.42f+low*.15f);
+        } else if(kind==6) {
+            // Short ionized crack with a falling, bright metallic body.
+            const float attack=smooth(0,.002f,t);
+            sample=attack*(sinf(2*omega_pi*(1350*t+140*(1-expf(-t*8))))*.3f*expf(-t*20)
+                +(noise-low)*.45f*expf(-t*35)+low*.4f*expf(-t*9));
+        } else {
+            phase+=2*omega_pi*(48+720*expf(-t*8))/(float)SNDMIN_RATE;
+            const float attack=smooth(0,.005f,t),tail=expf(-t*3.5f);
+            sample=attack*(sinf(phase+3.2f*sinf(phase*1.43f))*tail*.44f+low*expf(-t*5)*.6f
+                +sinf(2*omega_pi*42*t)*expf(-t*2.8f)*.22f);
+            if(kind==3) {
+                const float sustain=attack*(1-smooth(1.23f,1.48f,t));
+                sample+=sustain*(sinf(phase+2.4f*sinf(phase*1.43f))*.23f+low*.32f);
+            } else sample*=1-smooth(.23f,.43f,t);
+        }
+        // Seamless engine loop, exact periodic tones and a short noise crossfade.
+        if(kind==0) sample*=.92f+.08f*cosf(2*omega_pi*t/4);
+        pcm[i]=sample;
+    }
+    if(kind==0) for(uint32_t i=0;i<800;++i) {
+        const float mix=(float)i/800.f;
+        pcm[count-800+i]=pcm[count-800+i]*(1-mix)+pcm[i]*mix;
+    }
+    const sndmin_sound s=sndmin_make_sound(audio,(sndmin_bytes){pcm,(size_t)count*sizeof(float)},1,SNDMIN_RATE);
+    free(pcm); return s;
+}
+static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32_t tick,bool paused,bool muted,bool restart) {
+    const float t=(float)tick/60.f;
+    const vec3 listener=t<11.f?(vec3){-10,5,-15}:(vec3){-45,12,ship_position(t)-85.f};
+    sndmin_frame(audio,&(sndmin_frame_desc){.index=absolute,.listener=listener,.forward={.4f,-.1f,1},.up={0,1,0},
+        .delay_seconds=.30f,.delay_feedback=.28f});
+    if(!sndmin_bus_set(audio,SNDMIN_MASTER,paused||muted?0.f:.40f)) return false;
+    if(!sndmin_bus_set(audio,SNDMIN_MUSIC,1.5f*(1-smooth(28.3f,29.9f,t)))) return false;
+    if(absolute==0) {
+        a->engine=sndmin_play(audio,&(sndmin_play_desc){.sound=a->drone,.loop=true,.voice={.gain=.35f}});
+        if(!a->engine.id) return false;
+    }
+    if(restart || (!paused && tick==0)) {
+        omega_score_stop(audio,&a->score);
+        if(a->gate_voice.id) sndmin_stop(audio,a->gate_voice,.025f);
+    }
+    if(!paused && (tick==60 || tick==1050)) {
+        a->gate_voice=sndmin_play(audio,&(sndmin_play_desc){.sound=tick==60?a->gate:a->closing,.voice={.gain=.8f}});
+        if(!a->gate_voice.id) return false;
+    }
+    if(!paused && !omega_score_tick(audio,&a->score,tick)) return false;
+    // The activation flares pass a fin station: a rising ping for each, in
+    // step with the lights.
+    if(!paused && tick>0) {
+        const int station=activation_station((float)tick/60),before=activation_station((float)(tick-1)/60);
+        if(station!=before && before>=0) {
+            const sndmin_voice ping=sndmin_play(audio,&(sndmin_play_desc){.sound=a->tick,
+                .voice={.gain=.55f,.pitch=powf(2.f,(float)station/6.f)}});
+            if(!ping.id) return false;
+        }
+    }
+    const omega_pulse pulse=cannon_pulse(tick);
+    if(!paused && pulse.duration && pulse.age==0) {
+        for(int side=-1;side<=1;side+=2) {
+            const vec3 muzzle={(float)side*OMEGA_MUZZLE_X,.4f,OMEGA_MUZZLE_Z+ship_position((float)tick/60)};
+            const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){
+                .sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
+                .voice={.gain=.85f,.position=muzzle,.min_radius=50,.max_radius=420}});
+            if(!shot.id) return false;
+        }
+    }
+    if(!paused) for(unsigned ship=0;ship<3;++ship) for(unsigned shot=0;shot<3;++shot) {
+        const int age=particle_age(tick,ship,shot);
+        if(age!=0 && age!=OMEGA_PARTICLE_FLIGHT) continue;
+        const vec3 source=age==0?(vec3){ship==1?45.f:(ship==2?75.f:0.f),ship==1?38.f:(ship==2?-26.f:0.f),
+            ship_position(t)-OMEGA_BATTLE_SEPARATION+(ship==1?-50.f:(ship==2?45.f:0.f))}:(vec3){-2,0,ship_position(t)};
+        const sndmin_voice report=sndmin_play(audio,&(sndmin_play_desc){.sound=a->particle,.spatial=true,
+            .voice={.position=source,.gain=age==0?.46f:.28f,.pitch=age==0?1.f:.55f,.min_radius=60,.max_radius=450}});
+        if(!report.id) return false;
+    }
+    return sndmin_ok(audio);
+}
+
+int main(int argc,char **argv) {
+    const char *wav=NULL; bool offline=false,audio_only=false,score_only=false;
+    for(int k=1;k<argc;++k) {
+        if(!strcmp(argv[k],"--audio-out") && k+1<argc) { wav=argv[++k]; offline=true; }
+        else if(!strcmp(argv[k],"--headless") || !strcmp(argv[k],"--frame") || !strcmp(argv[k],"--frames")) offline=true;
+        else if(!strcmp(argv[k],"--audio-only")) { audio_only=true; offline=true; }
+        else if(!strcmp(argv[k],"--score-only")) { score_only=true; audio_only=true; offline=true; }
+    }
+#ifdef VKMIN_NO_PLATFORM
+    const bool headless_build=true;
+#else
+    const bool headless_build=false;
+#endif
+    offline=offline || headless_build;
+    if(headless_build && argc==1) {
+        fprintf(stderr,"omega: this is the headless renderer. Build without VKMIN_HEADLESS for the live window and sound.\n");
+        return 0;
+    }
+    sndmin_ctx *audio=sndmin_init(&(sndmin_desc){.offline=offline});
+    if(!audio) return 1;
+    omega_audio a={.drone=sound_make(audio,0),.gate=sound_make(audio,1),.closing=sound_make(audio,4),
+        .cannon=sound_make(audio,2),.cannon_long=sound_make(audio,3),.particle=sound_make(audio,6),.tick=sound_make(audio,5),.score=omega_score_init(audio)};
+    if(!a.drone.id || !a.gate.id || !a.closing.id || !a.cannon.id || !a.cannon_long.id || !a.particle.id || !omega_score_ready(a.score)) {
+        sndmin_shutdown(audio); return 1;
+    }
+    if(audio_only) {
+        bool ok=true;
+        for(uint32_t tick=0;tick<OMEGA_TICKS && ok;++tick) {
+            if(score_only) {
+                sndmin_frame(audio,&(sndmin_frame_desc){.index=tick,.delay_seconds=.30f,.delay_feedback=.28f});
+                ok=sndmin_bus_set(audio,SNDMIN_MASTER,.40f)
+                    && sndmin_bus_set(audio,SNDMIN_MUSIC,1.5f*(1-smooth(28.3f,29.9f,(float)tick/60.f)))
+                    && omega_score_tick(audio,&a.score,tick);
+            } else ok=audio_tick(audio,&a,tick,tick,false,false,false);
+        }
+        if(ok) ok=sndmin_render(audio,OMEGA_TICKS,wav?wav:"omega.wav",NULL);
+        sndmin_shutdown(audio); return ok?0:1;
+    }
+    // vkmin reserves its arenas once and never grows them, so the defaults
+    // (256 MB per arena, 64 MB ring) are what a program actually costs on the
+    // device whether or not it uses them. Omega's high water is 14 MB of mesh
+    // and 38 MB of render targets. 24 MB of buffer covers the whole of
+    // OMEGA_CAPACITY at 24 bytes a vertex, so the mesh cannot outgrow it before
+    // the assert in triangle() fires; 64 MB of image covers the 2048 shadow map
+    // with room, and the ring takes the mesh upload in one chunk. Exhausting an
+    // arena is a hard failure naming the size it wanted, not corruption, and
+    // --metrics reports arena_high_water against these. r_arena_mb,
+    // r_image_arena_mb and r_ring_mb override all three from the command line;
+    // raising r_omega_shadow past 2048 wants r_image_arena_mb raised with it.
+    cvar_state config; cvar_init(&config);
+    cvar_set(&config,CV_r_default_depth,0); // every pass here attaches omega's own depth
+    vkmin_ctx *gpu=vkmin_init(&(vkmin_desc){.argc=argc,.argv=argv,.title="OMEGA - Through the Blue",
+        .width=1280,.height=720,.vsync=true,.headless=headless_build,.config=&config,
+        .device_arena_bytes=24u<<20,.image_arena_bytes=64u<<20,.host_ring_bytes=16u<<20});
+    omega_mesh mesh=make_ship();
+    fprintf(stderr,"omega: %u triangles; 30-second sequence; Iron Across the Blue 120 BPM, gate and cannons\n",mesh.count/3);
+    const vkmin_buffer geometry=vkmin_make_buffer(gpu,&(vkmin_buffer_desc){
+        .data={mesh.v,(size_t)mesh.count*sizeof(OmegaVertex)},.label="omega procedural destroyer"});
+    free(mesh.v);
+    uint8_t *surface_pixels=malloc(256*256*4);
+    VKMIN_ASSERT(surface_pixels,"omega surface allocation");
+    for(size_t i=0;i<256*256;++i) {
+        surface_pixels[i*4]=surface_pixels[i*4+1]=surface_pixels[i*4+2]=omega_surface[i];
+        surface_pixels[i*4+3]=255;
+    }
+    const vkmin_image surface=vkmin_make_image(gpu,&(vkmin_image_desc){.width=256,.height=256,
+        .pixels={surface_pixels,256*256*4},.label="Blender weathered armor atlas"});
+    free(surface_pixels);
+    int width,height; vkmin_size(gpu,&width,&height);
+    // Every HDR target and every pipeline that writes one takes its format from
+    // here, so the two cannot drift apart. R11G11B10 halves the bytes of the
+    // three colour targets; the shaders write 1.0 alpha at every exit and
+    // nothing reads it back, so the missing channel costs nothing.
+    const cvar_state *const cfg=vkmin_frame_config(gpu);
+    const vkmin_format hdr_format=cvar_get_bool(cfg,CV_r_hdr_packed)?VKMIN_FMT_R11G11B10_FLOAT:VKMIN_FMT_RGBA16_FLOAT;
+    const int shadow_size=cvar_get_int(cfg,CV_r_omega_shadow);
+    const vkmin_image hdr=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
+        .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega HDR"});
+    const vkmin_image gate_layer=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
+        .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega gate veil"});
+    const vkmin_image glow=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width/4>0?width/4:1,.height=height/4>0?height/4:1,
+        .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega bloom"});
+    const vkmin_image depth=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
+        .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH,.label="omega depth"});
+    const vkmin_image shadow=vkmin_make_image(gpu,&(vkmin_image_desc){.width=shadow_size,.height=shadow_size,
+        .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega key shadow"});
+    const uint32_t shadow_index=vkmin_index(gpu,shadow),hdr_index=vkmin_index(gpu,hdr),glow_index=vkmin_index(gpu,glow);
+    const vkmin_pipeline shadow_pipe=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_vert_spv),
+        .fs=VKMIN_BYTES(omega_shadow_frag_spv),.push_size=sizeof(OmegaPush),.color_format=VKMIN_FMT_NONE,
+        .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.label="omega key shadow"});
+    const vkmin_pipeline ship=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_vert_spv),
+        .fs=VKMIN_BYTES(omega_hull_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.label="omega armor and plasma"});
+    const vkmin_pipeline gate=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
+        .fs=VKMIN_BYTES(omega_gate_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .cull=VKMIN_CULL_NONE,.label="omega procedural jump gate"});
+    const vkmin_pipeline background=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .depth=true,.depth_write=false,.cull=VKMIN_CULL_NONE,.label="omega gate composite"});
+    const vkmin_pipeline bloom=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .cull=VKMIN_CULL_NONE,.label="omega bloom extraction"});
+    const vkmin_pipeline post=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
+    OmegaPush p={.vertices=vkmin_address(gpu,geometry),.gate_id=vkmin_index(gpu,gate_layer)};
+    bool paused=false,muted=false,ok=true; uint32_t absolute=0,phase=0; float orbit=0,elevation=0;
+    mat4 previous_vp={{0}}; float previous_ship=0; uint32_t previous_visual=0; bool have_previous=false;
+    const double start=seconds_now();
+    while(ok && vkmin_running(gpu)) {
+        const vkmin_frame f=vkmin_frame_begin(gpu,NULL);
+        if(!offline) while(seconds_now()<start+(double)absolute/60.) idle_millisecond();
+        const uint32_t target=offline?f.index:(uint32_t)((seconds_now()-start)*60.);
+        if(vkmin_key_pressed(&f.input,32)) paused=!paused;
+        if(vkmin_key_pressed(&f.input,'M')) muted=!muted;
+        const bool restart=vkmin_key_pressed(&f.input,'R')!=0;
+        if(restart) phase=0;
+        // Preserve every audio tick even when rendering isolated frames or a slow GPU.
+        while(absolute<=target && ok) {
+            ok=audio_tick(audio,&a,absolute,phase,paused,muted,restart && absolute==target);
+            if(!paused) phase=(phase+1)%OMEGA_TICKS;
+            ++absolute;
+        }
+        const uint32_t visual=paused?phase:(phase+OMEGA_TICKS-1)%OMEGA_TICKS;
+        const float t=(float)visual/60.f;
+        orbit+=.012f*((float)vkmin_key_down(&f.input,'D')-(float)vkmin_key_down(&f.input,'A'));
+        elevation=fmaxf(-6,fminf(10,elevation+.18f*((float)vkmin_key_down(&f.input,'W')-(float)vkmin_key_down(&f.input,'S'))));
+        // Begin the pan during approach, before the hull reaches the mouth.
+        const float reveal=smooth(6.f,11.f,t);
+        // Stay inside the mouth's viewing angle so the far throat remains
+        // visible throughout the pan, even with the much deeper corridor.
+        // Off-axis and above, far enough back that the pylons reach toward
+        // the camera and the vortex opens at their midpoint. The reveal
+        // dollies in and swings to a three-quarter view; the camera then
+        // follows the hull as it flies past and pans back for the closing.
+        // A slow drift from the first frame, a gentle orbit, dolly-in and
+        // rise, so the reveal continues motion already under way rather than
+        // starting from rest.
+        const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
+        const float angle=-.22f-.004f*t-.26f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float radius=86.f-fminf(t,6.f)-18.f*reveal;
+        vec3 eye={sinf(angle)*radius,5.f+.17f*fminf(t,6.f)+6.f*reveal+elevation,cosf(angle)*-radius};
+        const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
+        const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
+        vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
+        // ISN-style broadside three-quarter two-shot: cut after emergence,
+        // then track both ships at a fixed separation through the volleys.
+        if(t>=11.f) {
+            const float battle_z=fminf(ship_position(t),-30.f)-OMEGA_BATTLE_SEPARATION*.5f;
+            eye=(vec3){-260.f*cosf(orbit),32.f+elevation,battle_z+58.f+260.f*sinf(orbit)};
+            aim=(vec3){15,3,battle_z-10.f};
+            if(t>=16.f && t<21.f) {
+                // Low stern-quarter shot: engines in the foreground, fleet beyond.
+                eye=(vec3){-32.f+2.f*(t-16.f)+orbit*50.f,8.f+elevation,ship_position(t)+48.f};
+                aim=(vec3){5,3,ship_position(t)-95.f};
+            } else if(t>=21.f && t<26.f) {
+                // Reverse along the lead Omega's broadside, toward the attacker.
+                eye=(vec3){-42.f+orbit*50.f,9.f+elevation,battle_z-OMEGA_BATTLE_SEPARATION*.5f-42.f};
+                aim=(vec3){8,2,battle_z+5.f};
+            } else if(t>=26.f) {
+                // High, slowly widening fleet tableau for the final salvo/tail.
+                eye=(vec3){-240.f-7.f*(t-26.f)+orbit*70.f,100.f+elevation,battle_z+85.f};
+                aim=(vec3){20,3,battle_z-10.f};
+            }
+        }
+        const mat4 vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
+        // The hull's screen motion since the last frame drives a shutter smear;
+        // Use consecutive simulation ticks only; sparse captures are not motion.
+        // A small cap preserves the lattice and gate filaments.
+        const vec3 now=project_uv(vp,(vec3){0,0,ship_position(t)});
+        const vec3 before=have_previous?project_uv(previous_vp,(vec3){0,0,previous_ship}):now;
+        vec2 motion={now.x-before.x,now.y-before.y};
+        if(!have_previous || visual!=previous_visual+1 || visual==660 || visual==960 || visual==1260 || visual==1560 || now.z<=0 || before.z<=0) motion=(vec2){0,0};
+        const float extent=sqrtf(motion.x*motion.x+motion.y*motion.y);
+        if(extent>.004f) { motion.x*=.004f/extent; motion.y*=.004f/extent; }
+        previous_vp=vp; previous_ship=ship_position(t); previous_visual=visual; have_previous=true;
+        // One per-frame block; the journal relocates its ring address on replay.
+        OmegaScene *scene=vkmin_ring_alloc(gpu,sizeof *scene,&p.frame);
+        *scene=(OmegaScene){
+            .vp=vp,
+            .eye={eye.x,eye.y,eye.z,0},
+            .scene={t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))},
+            .flash=cannon_flash(visual),
+            .hull_texture=vkmin_index(gpu,surface),
+            .blur={motion.x,motion.y,.6f,0}};
+        vkmin_timestamp(gpu,0);
+        p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.depth=shadow,.clear_depth=true,.label="omega shadow map"});
+        vkmin_draw(gpu,shadow_pipe,&p,mesh.count,1); vkmin_pass_end(gpu);
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{shadow,VKMIN_USE_SAMPLED}},.image_count=1});
+        vkmin_timestamp(gpu,1);
+        p.pass=OMEGA_PASS_SCENE;
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_COLOR_TARGET}},.image_count=1});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=gate_layer,.clear_color=true,.label="omega gate energy"});
+        vkmin_draw(gpu,gate,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,2);
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED},{hdr,VKMIN_USE_COLOR_TARGET},{depth,VKMIN_USE_DEPTH_TARGET}},
+            .image_count=3});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=hdr,.depth=depth,.clear_color=true,.clear_depth=true,
+            .clear={0,0,0,1},.label="omega HDR scene"});
+        p.pass=OMEGA_PASS_BACKDROP; p.texture_id=p.gate_id; vkmin_draw(gpu,background,&p,3,1);
+        p.pass=OMEGA_PASS_SCENE; p.texture_id=shadow_index; vkmin_draw(gpu,ship,&p,mesh.count,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,3);
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{hdr,VKMIN_USE_SAMPLED},{glow,VKMIN_USE_COLOR_TARGET}},.image_count=2});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=glow,.clear_color=true,.label="omega glow"});
+        p.pass=OMEGA_PASS_BLOOM; p.texture_id=hdr_index; vkmin_draw(gpu,bloom,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,4);
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{glow,VKMIN_USE_SAMPLED},{vkmin_backbuffer(gpu),VKMIN_USE_COLOR_TARGET}},
+            .image_count=2});
+        // Pipelines that render at the backbuffer's format always declare a
+        // depth attachment (vkmin.c, make_pipeline), so this pass must supply
+        // one even though the grade is a fullscreen triangle that never tests
+        // depth. Lending it the scene's own depth buffer, which the next frame
+        // clears anyway, is what lets r_default_depth=0 drop vkmin's separate
+        // full-resolution copy. Supplying none instead is a dynamic-rendering
+        // format mismatch: it does not fail, it quietly renders differently.
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),.depth=depth,
+            .clear_color=true,.clear_depth=true,.label="omega presentation"});
+        p.pass=OMEGA_PASS_GRADE; p.texture_id=hdr_index; p.bloom_id=glow_index; vkmin_draw(gpu,post,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,5);
+        vkmin_frame_end(gpu);
+        if(vkmin_key_pressed(&f.input,301)) ok=vkmin_save_png(gpu,"omega-capture.png") && ok;
+    }
+    // GPU cost of the last collected frame, so shader changes are measured
+    // rather than guessed. Timestamps 0..5 bracket the five passes; results
+    // are read when a frame slot is reused, so a run needs three frames or
+    // more (for example --frames 238,239,240) to report anything.
+    const vkmin_stats stats=vkmin_stats_get(gpu);
+    if(offline && stats.timestamps>=6) {
+        static const char *const names[5]={"shadow","gate","scene","bloom","grade"};
+        fprintf(stderr,"omega: gpu ms");
+        for(int k=0;k<5;++k) fprintf(stderr," %s=%.2f",names[k],stats.gpu_ms[k+1]-stats.gpu_ms[k]);
+        fprintf(stderr," total=%.2f\n",stats.gpu_ms[5]);
+    }
+    vkmin_shutdown(gpu);
+    if(ok && wav) ok=sndmin_render(audio,absolute+120,wav,NULL);
+    sndmin_shutdown(audio);
+    return ok?0:1;
+}

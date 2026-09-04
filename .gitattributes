@@ -1,0 +1,39 @@
+# Line endings. The repository stores LF; core.autocrlf on Windows checkouts was
+# previously the only thing deciding what landed in the working tree, which left
+# tools/amalgamate.sh with mixed endings and two other scripts with CRLF. Shell
+# scripts and Makefiles must be LF in the working tree or the recipes that run
+# them break in ways that look like build bugs.
+* text=auto
+
+*.c     text eol=lf
+*.h     text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+*.awk   text eol=lf
+*.inc   text eol=lf
+*.glsl  text eol=lf
+*.vert  text eol=lf
+*.frag  text eol=lf
+*.comp  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.cfg   text eol=lf
+Makefile        text eol=lf
+Makefile.*      text eol=lf
+.editorconfig   text eol=lf
+.gitattributes  text eol=lf
+
+# .cmd is run by cmd.exe, which wants CRLF.
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Never touched: byte-for-byte assets and goldens. A normalising checkout would
+# corrupt these and silently break image comparison.
+*.png   binary
+*.ktx2  binary
+*.wav   binary
+*.mp4   binary
+*.gz    binary
+*.spv   binary
+*.vkd   binary
+*.vkm   binary
