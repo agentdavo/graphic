@@ -32,11 +32,11 @@ SHADER_SRC := $(wildcard shaders/*.vert shaders/*.frag shaders/*.comp)
 SPV        := $(patsubst shaders/%,$(BUILD)/%.spv,$(SHADER_SRC))
 GLSL_FLAGS := -V --target-env vulkan1.3 -Isrc -Ishaders -P"\#extension GL_GOOGLE_include_directive : require"
 
-CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD)/cvar.o
+CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD)/cvar.o $(BUILD)/ktx2.o $(BUILD)/scene.o
 
 .PHONY: all clean test golden texture analyze tools
 all: tools $(BUILD)/smoke
-tools: $(BUILD)/imgdiff $(BUILD)/pngsolid $(BUILD)/mktex $(BUILD)/mat4_test
+tools: $(BUILD)/imgdiff $(BUILD)/pngsolid $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -59,7 +59,7 @@ $(BUILD)/shaders.h: $(SPV) $(BUILD)/bin2c
 	@printf '#endif\n' >> $@
 
 # --- objects
-$(BUILD)/%.o: src/%.c src/vkmin.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h | $(BUILD)
+$(BUILD)/%.o: src/%.c src/vkmin.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
@@ -79,6 +79,12 @@ $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
 
 $(BUILD)/mat4_test: tests/mat4_test.c demo/mat4.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lm
+
+$(BUILD)/cook_image.o: tools/cook_image.c tools/cook_image.h | $(BUILD)
+	$(CC) $(THIRD_PARTY_CFLAGS) -Itools -c -o $@ $<
+
+$(BUILD)/cook: tools/cook.c tools/cook_image.h src/vkm_format.h src/shared.h $(BUILD)/cook_image.o | $(BUILD)
+	$(CC) $(CFLAGS) -Itools -Wno-unused-function -o $@ $< $(BUILD)/cook_image.o -lm
 
 texture: $(BUILD)/mktex
 	./$(BUILD)/mktex tests/assets/grid.png

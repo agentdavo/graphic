@@ -4,6 +4,7 @@
  * and the PNG readback. If this is right, the renderer is built on a floor
  * that has been stood on. */
 #include "vkmin.h"
+#include "ktx2.h"
 #include "shaders.h"
 
 #include <stdio.h>
@@ -15,7 +16,9 @@ int main(int argc, char **argv) {
                                             .device_arena_bytes = 16u << 20,
                                             .host_ring_bytes = 4u << 20});
 
-    const vkmin_image grid = vkmin_load_png(c, "tests/assets/grid.png", false);
+    /* A second argument names a KTX2 to sample instead of the PNG, which is
+     * how the cooker's BCn encoders get looked at through a real sampler. */
+    const vkmin_image grid = argc > 2 ? ktx2_load(c, argv[2]) : vkmin_load_png(c, "tests/assets/grid.png", false);
     const uint32_t grid_tex = vkmin_register_texture(c, grid, VKMIN_SAMPLER_LINEAR_CLAMP);
     const vkmin_buffer verts = vkmin_make_buffer(c, &(vkmin_buffer_desc){.size = 3 * sizeof(Vertex), .label = "smoke.verts"});
     const vkmin_pipe fill = vkmin_make_compute(c, smoke_comp_spv, sizeof smoke_comp_spv, "smoke.fill");
