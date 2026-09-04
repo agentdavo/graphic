@@ -69,7 +69,7 @@ typedef struct {
     int argc; char **argv;        /* command line: cvars as name=value or +name value, plus
                                    * --headless --frame N --frames a,b --out P --out-dir D --exit-after N
                                    * --size W H --path=legacy|modern --sync-naive --no-readback --device N
-                                   * --verbose --cvars; unknown arguments are left for the program */
+                                   * --verbose --cvars --record FILE --replay FILE; unknown ones are the program's */
     const char *title;            /* window title and PNG prefix; 0 = "vkmin" */
     int width, height;            /* 0 = cvars r_width x r_height */
     bool headless;                /* also set by --headless, --frame, --frames */
@@ -204,6 +204,15 @@ void vkmin_draw_indirect(vkmin_ctx *, vkmin_pipe, const void *push, uint32_t pus
 void vkmin_dispatch(vkmin_ctx *, vkmin_pipe, const void *push, uint32_t push_bytes,
                     uint32_t x, uint32_t y, uint32_t z);                     // gpu
 void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, read via stats */ // gpu
+
+/* ---- the journal ------------------------------------------------------------ */
+/* --record FILE writes every call after init -- function, arguments, data --
+ * to an append-only file. vkmin_replay reads it back and issues the same
+ * calls; the render path reads no clock, so the frames are identical. A bug
+ * report is a file; a regression is a journal and a frame number. Device
+ * addresses inside pushed data are relocated by exact match against the
+ * addresses vkmin issued, so a journal replays across runs and paths. */
+bool vkmin_replay(vkmin_ctx *, const char *path);                            // writes ctx, gpu, io
 
 /* ---- output and introspection ----------------------------------------------- */
 bool vkmin_save_png(vkmin_ctx *, const char *path);  /* last completed frame */   // io

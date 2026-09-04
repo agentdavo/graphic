@@ -109,6 +109,32 @@ for ex in 01_clear 02_triangle 03_buffer 04_texture 05_compute 06_cube; do
     fi
 done
 
+begin "== the journal: record 06_cube, replay it without the program, same pixels =="
+checks=$((checks + 1))
+./$BUILD/ex_06_cube --headless --size 256 256 --frame 60 --record "$OUT/cube.vkj" >/dev/null 2>"$OUT/record.log" || { fail "record"; sed -n '1,6p' "$OUT/record.log"; }
+checks=$((checks + 1))
+if ./$BUILD/ex_07_replay --replay "$OUT/cube.vkj" --frame 60 --out "$OUT/ex_07_replay.png" >/dev/null 2>"$OUT/replay.log"; then
+    same ex_06_cube ex_07_replay 0 "replayed journal == the recording program's frame"
+else
+    fail "replay"; sed -n '1,8p' "$OUT/replay.log"
+fi
+if [ "$MODERN" = "1" ]; then
+    checks=$((checks + 1))
+    if ./$BUILD/ex_07_replay --replay "$OUT/cube.vkj" --frame 60 --path=legacy --out "$OUT/ex_07_legacy.png" >/dev/null 2>"$OUT/replay2.log"; then
+        same ex_06_cube ex_07_legacy 0 "journal recorded on the modern path replays on the legacy path"
+    else
+        fail "replay on legacy"; sed -n '1,8p' "$OUT/replay2.log"
+    fi
+fi
+checks=$((checks + 1))
+./$BUILD/corridor --profile lavapipe --headless --frame 240 --record "$OUT/corridor.vkj" --out "$OUT/rec_240.png" >/dev/null 2>&1 || fail "record corridor"
+checks=$((checks + 1))
+if ./$BUILD/ex_07_replay --replay "$OUT/corridor.vkj" --frame 240 --out "$OUT/replay_240.png" >/dev/null 2>"$OUT/replay3.log"; then
+    same rec_240 replay_240 0 "The Corridor frame 240 replays from its journal"
+else
+    fail "replay corridor"; sed -n '1,8p' "$OUT/replay3.log"
+fi
+
 begin "== The Corridor: golden frames on the legacy path (each frame in its own process) =="
 for f in $FRAMES; do
     render "corridor_$f" --frame "$f" --path=legacy
