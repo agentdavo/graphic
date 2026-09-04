@@ -36,7 +36,7 @@ CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD
 
 .PHONY: all clean test golden texture analyze tools
 all: tools $(BUILD)/smoke $(BUILD)/corridor
-tools: $(BUILD)/imgdiff $(BUILD)/pngsolid $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook
+tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -72,9 +72,6 @@ $(BUILD)/corridor: demo/corridor.c demo/anim.h src/render.h src/scene.h src/mat4
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/imgdiff: tools/imgdiff.c $(BUILD)/stb_bridge.o | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $^ -lm
-
-$(BUILD)/pngsolid: tools/pngsolid.c $(BUILD)/stb_bridge.o | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
