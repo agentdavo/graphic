@@ -32,7 +32,7 @@
 enum { MAX_INSTANCES = 1024, MAX_FRAMES_ARG = 32, PROP_COUNT = 300, POINT_LIGHTS = 64, MAX_BONES = 128 };
 
 typedef struct {
-    bool headless, sync_naive, list_cvars;
+    bool headless, sync_naive, list_cvars, probe;
     int width, height, device, exit_after;
     int frames[MAX_FRAMES_ARG], frame_count;
     const char *out, *out_dir, *scene_path, *character_path, *profile;
@@ -376,6 +376,8 @@ static const char *usage_text =
     "  --no-readback           skip the per-frame capture copy (PNG saving then fails)\n"
     "  --exit-after N          windowed: stop after N frames (and save --out, if given)\n"
     "  --device N              physical device index\n"
+    "  --path=legacy|modern    force the API path (default: modern when the device can)\n"
+    "  --probe                 print what the device offers and which path would be chosen\n"
     "  --cvars                 list every cvar and exit\n"
     "  windowed: F1 cycles debug views, Space pauses, F12 saves a PNG, Escape quits\n";
 
@@ -399,6 +401,9 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--sync-naive") == 0) opt.sync_naive = true;
         else if (strcmp(a, "--no-readback") == 0) cvar_set(CV_r_readback, 0.0f);
         else if (strcmp(a, "--cvars") == 0) opt.list_cvars = true;
+        else if (strcmp(a, "--probe") == 0) opt.probe = true;
+        else if (strcmp(a, "--path=legacy") == 0) cvar_set(CV_r_path, 1.0f);
+        else if (strcmp(a, "--path=modern") == 0) cvar_set(CV_r_path, 2.0f);
         else if (strcmp(a, "--frame") == 0 && next) { opt.headless = true; opt.frame_count = 1; opt.frames[0] = atoi(argv[++i]); }
         else if (strcmp(a, "--frames") == 0 && next) { opt.headless = true; parse_frames(&opt, argv[++i]); }
         else if (strcmp(a, "--out") == 0 && next) opt.out = argv[++i];
@@ -425,11 +430,22 @@ int main(int argc, char **argv) {
         }
     }
     if (opt.list_cvars) { cvar_print_all(); return 0; }
+    if (opt.probe) {
+        const vkmin_report r = vkmin_probe(opt.device);
+        printf("device: %s (Vulkan %u.%u)\nhostImageCopy=%d maintenance5=%d pushDescriptor=%d pipelineRobustness=%d "
+               "robustBufferAccess2=%d\nscalarBlockLayout=%d bufferDeviceAddress=%d descriptorIndexing=%d "
+               "drawIndirectCount=%d\npath: %s (%s)\n", r.device_name, r.api_major, r.api_minor, r.host_image_copy,
+               r.maintenance5, r.push_descriptor, r.pipeline_robustness, r.robust_buffer_access2, r.scalar_block_layout,
+               r.buffer_device_address, r.descriptor_indexing, r.draw_indirect_count,
+               r.would_choose == VKMIN_PATH_MODERN ? "modern" : "legacy", r.reason ? r.reason : "");
+        return r.vulkan_1_3 ? 0 : 1;
+    }
     if (opt.width <= 0 || opt.height <= 0) { opt.width = cvar_get_int(CV_r_width); opt.height = cvar_get_int(CV_r_height); }
     if (opt.headless && opt.frame_count == 0) { opt.frame_count = 1; opt.frames[0] = 0; }
     if (opt.sync_naive) cvar_set(CV_r_sync_naive, 1.0f);
 
     vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.headless = opt.headless, .sync_naive = cvar_get_bool(CV_r_sync_naive),
+                                              .path = (vkmin_path)cvar_get_int(CV_r_path),
                                               .no_readback = !cvar_get_bool(CV_r_readback),
                                               .vsync = cvar_get_bool(CV_r_vsync), .width = opt.width, .height = opt.height,
                                               .device_index = opt.device, .title = "vkmin -- The Corridor"});

@@ -98,6 +98,12 @@ rendering reuses the indirect draw path with the depth-only pipelines. 3×3 PCF
 through the compare sampler, normal-offset plus slope-scaled bias. `r_debug=6`
 shows the raw atlas, `r_debug=3` colours by cascade.
 
+**Resource destruction.** `vkmin_free_buffer` / `vkmin_free_image` wait
+idle, release the slot and bump its 12-bit generation; `tests/handles.c` frees
+a resource, re-creates one in the same slot, and proves the stale handle
+aborts while the new one works. Arena memory is not reclaimed (bump
+allocators); a free-list suballocator is a later parallel implementation.
+
 **8. Skinning.** Four joints per vertex in a parallel `SkinVertex` buffer, bone
 matrices in the ring, applied in the shared vertex fetch when the instance says
 so. CesiumMan runs its walk loop. The TODO for compute pre-skinning is in
@@ -113,6 +119,55 @@ overlay shows them per frame together with draw counts (read back one frame
 late through the ring), view and light counts, memory use, and every cvar that
 differs from its default. The font is baked at build time from a system TTF
 and committed as `src/font.h`, so the binary has nothing to fail to find.
+
+## v0.2: the Vulkan 1.4 baseline, with 1.3 kept alive
+
+The three operations where 1.3 and 1.4 differ are implemented twice, as two
+complete functions each, and the path is chosen **once at init** into
+`ctx->path` from the features the device reports — a 1.3 device exposing the
+promoted extensions is "modern" — then never consulted again except at those
+three call sites. `--path=legacy|modern` forces it; a forced path the device
+cannot do fails at init naming the missing feature. `--probe` prints what a
+device offers and what would be chosen, creating nothing else.
+
+| seam | legacy (staging, 1.3) | modern (1.4 promotions) |
+| --- | --- | --- |
+| readback | per-frame copy into a mapped buffer, read after the fence | `vkCopyImageToMemory` from the host after the fence; no command, no staging |
+| upload | ring staging + `vkCmdCopyBufferToImage` in an immediate submit | `vkCopyMemoryToImage` with host-side layout transitions; no command buffer |
+| shader stages | transient `VkShaderModule`s destroyed after pipeline creation | SPIR-V chained into the stage (`maintenance5`); no module object |
+
+On both paths the backbuffer is now an image we own; windowed frames blit it to
+the swapchain image. Nothing is ever captured from a swapchain image and the
+BGRA swizzle is gone. Push descriptors are **not** implemented: the tree was
+already at the bindless end state the v0.2 brief names as the goal, so that
+seam would have been dead on arrival. Debug builds create every pipeline with
+`robustBufferAccess2` where the device has it (the init report says whether it
+does). `scalarBlockLayout` is required on both paths.
+
+`tools/pathlines.sh` counts the marked regions of `src/vkmin.c`: **2375 lines
+total, 108 legacy-only, 74 modern-only.** The modern side is smaller, which is
+what the version bump was for. `make test` renders every golden frame on both
+paths and requires bit-identical output; on a device with one path the other
+is reported as skipped by name.
+
+## Test coverage, in numbers
+
+`make test` runs **28 checks**: a pure-function unit test, the handle-
+generation test, the `--no-readback` refusal, the GPU-layer smoke test (plus
+its BC1 variant), **9 golden images** compared at **2/255 per channel** with a
+diff image written on failure (four Corridor frames, two debug views, the
+overlay, two smoke renders), the same four frames on the modern path at
+tolerance 0, one frame under naive sync at tolerance 0, one frame rendered
+twice at tolerance 0, four reference-vs-fast agreements (GPU/CPU cull,
+compact/stable cull, clustered/brute-force lighting, naive/pipelined sync),
+six debug-view renders, and two windowed runs under Xvfb (one per path)
+compared to the offscreen render at tolerance 0. cppcheck is a prerequisite
+of the target and fails it. From clean on this machine the whole run takes
+**~95 s**, of which the build is about 20.
+
+`.github/workflows/test.yml` runs it on a GPU-less runner under lavapipe. It
+was written here, where GitHub Actions cannot execute; its first real run is
+the check of the file itself.
 
 ## Validation is fatal, and it earned its keep
 

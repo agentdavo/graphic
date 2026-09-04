@@ -39,6 +39,7 @@
     X(r_sun_intensity, 5.0f, "sun radiance multiplier")                              \
     X(r_sync_naive, 0.0f, "one frame in flight and wait idle per submit")            \
     X(r_readback, 1.0f, "copy the backbuffer for PNG capture every frame")           \
+    X(r_path, 0.0f, "API path: 0 auto, 1 legacy (staging, modules), 2 modern (host copy, inline SPIR-V)") \
     X(r_vsync, 1.0f, "FIFO present mode when 1, immediate/mailbox when 0")           \
     X(d_frame_step, 1.0f, "frames advanced per rendered frame (0 pauses)")
 

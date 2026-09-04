@@ -115,9 +115,21 @@ typedef struct {
     uint32_t type;
 } arena;
 
+/* The features that decide the path, plus the two that only affect debug
+ * builds. Filled once; read at init and at the three seams. */
+typedef struct {
+    bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
+} path_caps;
+
 struct vkmin_ctx {
     vkmin_desc desc;
     bool debug;
+    vkmin_path path;
+    path_caps caps;
+    /* Host image copy entry points (modern path only). */
+    PFN_vkCopyMemoryToImageEXT fp_copy_memory_to_image;
+    PFN_vkCopyImageToMemoryEXT fp_copy_image_to_memory;
+    PFN_vkTransitionImageLayoutEXT fp_transition_image_layout;
 
     VkInstance instance;
     VkDebugUtilsMessengerEXT messenger;
@@ -178,14 +190,16 @@ struct vkmin_ctx {
 
     VkExtent2D extent;
     VkFormat backbuffer_format;
-    VkImage offscreen_img;          /* headless backbuffer */
+    VkImage offscreen_img;          /* the backbuffer on both paths and in both modes; windowed
+                                     * frames blit it to the swapchain image at frame end */
     VkImageView offscreen_view;
 
     VkSurfaceKHR surface;
+    VkFormat swap_format;
+    VkExtent2D swap_extent;
     VkSwapchainKHR swapchain;
     uint32_t swap_count;
     VkImage swap_img[VKMIN_MAX_SWAP];
-    VkImageView swap_view[VKMIN_MAX_SWAP];
     VkSemaphore rendered[VKMIN_MAX_SWAP];
     uint32_t swap_index;
     bool need_recreate;
@@ -389,6 +403,90 @@ static void create_instance(vkmin_ctx *c) {
     }
 }
 
+static path_caps query_caps(VkPhysicalDevice phys) {
+    uint32_t n = 0;
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL));
+    VkExtensionProperties *ext = calloc(n ? n : 1, sizeof *ext);
+    VKMIN_ASSERT(ext != NULL, "out of memory");
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(phys, NULL, &n, ext));
+    bool has_hic = false, has_m5 = false, has_pd = false, has_pr = false, has_r2 = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!strcmp(ext[i].extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) has_hic = true;
+        if (!strcmp(ext[i].extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) has_m5 = true;
+        if (!strcmp(ext[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) has_pd = true;
+        if (!strcmp(ext[i].extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) has_pr = true;
+        if (!strcmp(ext[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) has_r2 = true;
+    }
+    free(ext);
+    /* An extension that is present but whose feature bit is off is absent. */
+    VkPhysicalDeviceHostImageCopyFeaturesEXT hic = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &hic};
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT pr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT, .pNext = &m5};
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &pr};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &r2};
+    vkGetPhysicalDeviceFeatures2(phys, &f2);
+    return (path_caps){
+        .host_image_copy = has_hic && hic.hostImageCopy,
+        .maintenance5 = has_m5 && m5.maintenance5,
+        .push_descriptor = has_pd,
+        .pipeline_robustness = has_pr && pr.pipelineRobustness,
+        .robust_buffer_access2 = has_r2 && r2.robustBufferAccess2,
+    };
+}
+
+/* The one place the path is decided. Version number is not the test. */
+static vkmin_path choose_path(path_caps k, vkmin_path want, const char **reason) {
+    const bool can_modern = k.host_image_copy && k.maintenance5;
+    if (want == VKMIN_PATH_LEGACY) { *reason = "legacy requested"; return VKMIN_PATH_LEGACY; }
+    if (want == VKMIN_PATH_MODERN) {
+        if (!k.host_image_copy) VKMIN_FATAL("--path=modern requested but the device lacks hostImageCopy");
+        if (!k.maintenance5) VKMIN_FATAL("--path=modern requested but the device lacks maintenance5");
+        *reason = "modern requested";
+        return VKMIN_PATH_MODERN;
+    }
+    if (can_modern) { *reason = "hostImageCopy and maintenance5 present"; return VKMIN_PATH_MODERN; }
+    *reason = !k.host_image_copy ? "no hostImageCopy" : "no maintenance5";
+    return VKMIN_PATH_LEGACY;
+}
+
+vkmin_report vkmin_probe(int device_index) {
+    vkmin_report r = {0};
+    const VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
+    const VkInstanceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&info, NULL, &inst) != VK_SUCCESS) { r.reason = "no Vulkan instance"; return r; }
+    uint32_t n = 0;
+    VK_CHECK(vkEnumeratePhysicalDevices(inst, &n, NULL));
+    VkPhysicalDevice devices[16];
+    if (n > 16) n = 16;
+    VK_CHECK(vkEnumeratePhysicalDevices(inst, &n, devices));
+    if ((uint32_t)device_index >= n) { vkDestroyInstance(inst, NULL); r.reason = "no such device"; return r; }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(devices[device_index], &props);
+    snprintf(r.device_name, sizeof r.device_name, "%s", props.deviceName);
+    r.api_major = VK_VERSION_MAJOR(props.apiVersion);
+    r.api_minor = VK_VERSION_MINOR(props.apiVersion);
+    r.vulkan_1_3 = props.apiVersion >= VK_API_VERSION_1_3;
+    const path_caps k = query_caps(devices[device_index]);
+    r.host_image_copy = k.host_image_copy;
+    r.maintenance5 = k.maintenance5;
+    r.push_descriptor = k.push_descriptor;
+    r.pipeline_robustness = k.pipeline_robustness;
+    r.robust_buffer_access2 = k.robust_buffer_access2;
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
+    vkGetPhysicalDeviceFeatures2(devices[device_index], &f2);
+    r.scalar_block_layout = f12.scalarBlockLayout;
+    r.buffer_device_address = f12.bufferDeviceAddress;
+    r.descriptor_indexing = f12.descriptorIndexing;
+    r.draw_indirect_count = f12.drawIndirectCount;
+    r.would_choose = choose_path(k, VKMIN_PATH_AUTO, &r.reason);
+    vkDestroyInstance(inst, NULL);
+    return r;
+}
+
+vkmin_path vkmin_path_used(const vkmin_ctx *c) { return c->path; }
+
 static void pick_physical_device(vkmin_ctx *c) {
     uint32_t n = 0;
     VK_CHECK(vkEnumeratePhysicalDevices(c->instance, &n, NULL));
@@ -458,8 +556,21 @@ static void pick_physical_device(vkmin_ctx *c) {
         }
     }
     VKMIN_ASSERT(c->queue_family != UINT32_MAX, "no graphics+compute+transfer queue with timestamps");
+
+    /* The init report: every feature checked, and the path chosen and why. */
+    c->caps = query_caps(c->phys);
+    const char *reason = "";
+    c->path = choose_path(c->caps, c->desc.path, &reason);
     fprintf(stderr, "vkmin: device[%u] %s (Vulkan %u.%u)\n", want, props.deviceName,
             VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
+    fprintf(stderr, "vkmin: hostImageCopy=%d maintenance5=%d pushDescriptor=%d pipelineRobustness=%d "
+                    "robustBufferAccess2=%d\n", c->caps.host_image_copy, c->caps.maintenance5,
+            c->caps.push_descriptor, c->caps.pipeline_robustness, c->caps.robust_buffer_access2);
+    fprintf(stderr, "vkmin: path = %s (%s)%s\n", c->path == VKMIN_PATH_MODERN ? "modern" : "legacy", reason,
+            c->debug ? (c->caps.pipeline_robustness && c->caps.robust_buffer_access2
+                            ? "; debug pipelines use robustBufferAccess2"
+                            : "; robustBufferAccess2 absent, debug pipelines without it")
+                     : "");
 }
 
 static void create_device(vkmin_ctx *c) {
@@ -488,7 +599,7 @@ static void create_device(vkmin_ctx *c) {
         .synchronization2 = VK_TRUE,
         .dynamicRendering = VK_TRUE,
     };
-    const VkPhysicalDeviceFeatures2 f2 = {
+    VkPhysicalDeviceFeatures2 f2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext = &f13,
         .features = {.multiDrawIndirect = VK_TRUE,
@@ -499,17 +610,48 @@ static void create_device(vkmin_ctx *c) {
                      .shaderInt64 = VK_TRUE,
                      .fragmentStoresAndAtomics = VK_TRUE},
     };
-    const char *extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    /* Modern-path features chain in only when that path was chosen; the
+     * robustness features chain in for debug builds on either path. On a
+     * 1.4 driver these are all core and the extension names are accepted
+     * aliases. */
+    VkPhysicalDeviceHostImageCopyFeaturesEXT hic = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, .hostImageCopy = VK_TRUE};
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &hic, .maintenance5 = VK_TRUE};
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT pr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT, .pipelineRobustness = VK_TRUE};
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &pr, .robustBufferAccess2 = VK_TRUE};
+    const char *extensions[8];
+    uint32_t ext_count = 0;
+    if (!c->desc.headless) extensions[ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    const void *chain = &f2;
+    if (c->path == VKMIN_PATH_MODERN) {
+        extensions[ext_count++] = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
+        extensions[ext_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+        f12.pNext = &m5;
+    }
+    const bool robust = c->debug && c->caps.pipeline_robustness && c->caps.robust_buffer_access2;
+    if (robust) {
+        f2.features.robustBufferAccess = VK_TRUE; /* robustBufferAccess2 requires the base feature too */
+        extensions[ext_count++] = VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME;
+        extensions[ext_count++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+        hic.pNext = c->path == VKMIN_PATH_MODERN ? (void *)&r2 : NULL;
+        if (c->path != VKMIN_PATH_MODERN) f12.pNext = &r2;
+    }
     const VkDeviceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &f2,
+        .pNext = chain,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qinfo,
-        .enabledExtensionCount = c->desc.headless ? 0u : 1u,
+        .enabledExtensionCount = ext_count,
         .ppEnabledExtensionNames = extensions,
     };
     VK_CHECK(vkCreateDevice(c->phys, &info, NULL, &c->dev));
     vkGetDeviceQueue(c->dev, c->queue_family, 0, &c->queue);
+    if (c->path == VKMIN_PATH_MODERN) {
+        c->fp_copy_memory_to_image = (PFN_vkCopyMemoryToImageEXT)vkGetDeviceProcAddr(c->dev, "vkCopyMemoryToImageEXT");
+        c->fp_copy_image_to_memory = (PFN_vkCopyImageToMemoryEXT)vkGetDeviceProcAddr(c->dev, "vkCopyImageToMemoryEXT");
+        c->fp_transition_image_layout = (PFN_vkTransitionImageLayoutEXT)vkGetDeviceProcAddr(c->dev, "vkTransitionImageLayoutEXT");
+        VKMIN_ASSERT(c->fp_copy_memory_to_image && c->fp_copy_image_to_memory && c->fp_transition_image_layout,
+                     "host image copy entry points missing");
+    }
     if (c->debug) {
         c->fp_set_name = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
             c->dev, "vkSetDebugUtilsObjectNameEXT");
@@ -738,11 +880,13 @@ static use_info use_lookup(vkmin_use use, VkImageAspectFlags aspect) {
     switch (use) {
     case VKMIN_USE_UNDEFINED:
         return (use_info){VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0};
+    /* ALL_TRANSFER, not COPY: the backbuffer is read by a copy on one path
+     * and a blit on the other, and both are transfers. */
     case VKMIN_USE_TRANSFER_DST:
-        return (use_info){VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+        return (use_info){VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                           VK_ACCESS_2_TRANSFER_WRITE_BIT};
     case VKMIN_USE_TRANSFER_SRC:
-        return (use_info){VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+        return (use_info){VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                           VK_ACCESS_2_TRANSFER_READ_BIT};
     case VKMIN_USE_SAMPLED:
         return (use_info){VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -944,6 +1088,9 @@ static void create_backbuffer_view(vkmin_ctx *c, VkImage img, VkFormat fmt, VkIm
     set_name(c, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)*view, "%s.view", label);
 }
 
+/* The backbuffer is always an image we own, in both modes and on both paths.
+ * Windowed frames blit it to the swapchain image, so nothing is ever captured
+ * from a swapchain image and there is no BGRA special case anywhere. */
 static void create_offscreen(vkmin_ctx *c) {
     c->backbuffer_format = VK_FORMAT_R8G8B8A8_UNORM;
     const VkImageCreateInfo info = {
@@ -955,7 +1102,8 @@ static void create_offscreen(vkmin_ctx *c) {
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 (c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u),
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     VK_CHECK(vkCreateImage(c->dev, &info, NULL, &c->offscreen_img));
@@ -969,8 +1117,10 @@ static void create_offscreen(vkmin_ctx *c) {
                            "vkmin.offscreen");
 }
 
+/* --- legacy-only: staging readback --------------------------------------- */
 static void create_readback_buffers(vkmin_ctx *c) {
     c->readback_size = (VkDeviceSize)c->extent.width * c->extent.height * 4u;
+    if (c->path != VKMIN_PATH_LEGACY) return;
     for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) {
         create_backing_buffer(c, c->readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -992,14 +1142,12 @@ static void destroy_readback_buffers(vkmin_ctx *c) {
         c->readback_mapped[i] = NULL;
     }
 }
+/* --- end legacy-only ------------------------------------------------------ */
 
 /* ------------------------------------------------------------ swapchain --- */
 
 static void destroy_swapchain(vkmin_ctx *c) {
-    for (uint32_t i = 0; i < c->swap_count; ++i) {
-        vkDestroyImageView(c->dev, c->swap_view[i], NULL);
-        vkDestroySemaphore(c->dev, c->rendered[i], NULL);
-    }
+    for (uint32_t i = 0; i < c->swap_count; ++i) vkDestroySemaphore(c->dev, c->rendered[i], NULL);
     c->swap_count = 0;
     if (c->swapchain) {
         vkDestroySwapchainKHR(c->dev, c->swapchain, NULL);
@@ -1010,18 +1158,18 @@ static void destroy_swapchain(vkmin_ctx *c) {
 static void create_swapchain(vkmin_ctx *c) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->phys, c->surface, &caps));
-    VKMIN_ASSERT(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                 "surface does not allow TRANSFER_SRC on swapchain images");
+    VKMIN_ASSERT(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                 "surface does not allow TRANSFER_DST on swapchain images; vkmin blits into them");
 
     int fb_w = 0, fb_h = 0;
     plat_framebuffer_size(&fb_w, &fb_h);
-    c->extent = caps.currentExtent.width != UINT32_MAX
-                    ? caps.currentExtent
-                    : (VkExtent2D){(uint32_t)fb_w, (uint32_t)fb_h};
-    if (c->extent.width < caps.minImageExtent.width) c->extent.width = caps.minImageExtent.width;
-    if (c->extent.height < caps.minImageExtent.height) c->extent.height = caps.minImageExtent.height;
-    if (c->extent.width > caps.maxImageExtent.width) c->extent.width = caps.maxImageExtent.width;
-    if (c->extent.height > caps.maxImageExtent.height) c->extent.height = caps.maxImageExtent.height;
+    VkExtent2D e = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
+                                                          : (VkExtent2D){(uint32_t)fb_w, (uint32_t)fb_h};
+    if (e.width < caps.minImageExtent.width) e.width = caps.minImageExtent.width;
+    if (e.height < caps.minImageExtent.height) e.height = caps.minImageExtent.height;
+    if (e.width > caps.maxImageExtent.width) e.width = caps.maxImageExtent.width;
+    if (e.height > caps.maxImageExtent.height) e.height = caps.maxImageExtent.height;
+    c->swap_extent = e;
 
     uint32_t fn = 0;
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, c->surface, &fn, NULL));
@@ -1037,10 +1185,7 @@ static void create_swapchain(vkmin_ctx *c) {
             break;
         }
     }
-    VKMIN_ASSERT(c->backbuffer_format == VK_FORMAT_UNDEFINED || c->backbuffer_format == chosen.format,
-                 "swapchain format changed across a recreate (%d -> %d)", (int)c->backbuffer_format,
-                 (int)chosen.format);
-    c->backbuffer_format = chosen.format;
+    c->swap_format = chosen.format;
 
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     if (!c->desc.vsync) {
@@ -1065,9 +1210,9 @@ static void create_swapchain(vkmin_ctx *c) {
         .minImageCount = images,
         .imageFormat = chosen.format,
         .imageColorSpace = chosen.colorSpace,
-        .imageExtent = c->extent,
+        .imageExtent = c->swap_extent,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1083,13 +1228,12 @@ static void create_swapchain(vkmin_ctx *c) {
     VK_CHECK(vkGetSwapchainImagesKHR(c->dev, c->swapchain, &c->swap_count, c->swap_img));
     for (uint32_t i = 0; i < c->swap_count; ++i) {
         set_name(c, VK_OBJECT_TYPE_IMAGE, (uint64_t)c->swap_img[i], "vkmin.swap[%u]", i);
-        create_backbuffer_view(c, c->swap_img[i], chosen.format, &c->swap_view[i], "vkmin.swap");
         const VkSemaphoreCreateInfo sinfo = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(c->dev, &sinfo, NULL, &c->rendered[i]));
         set_name(c, VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)c->rendered[i], "vkmin.rendered[%u]", i);
     }
     fprintf(stderr, "vkmin: swapchain %ux%u, %u images, format %d, present mode %d\n",
-            c->extent.width, c->extent.height, c->swap_count, (int)chosen.format, (int)mode);
+            c->swap_extent.width, c->swap_extent.height, c->swap_count, (int)chosen.format, (int)mode);
 }
 
 /* The single recreate site. Everything else only raises need_recreate. Note
@@ -1104,10 +1248,10 @@ static void recreate_swapchain(vkmin_ctx *c) {
     }
     VK_CHECK(vkDeviceWaitIdle(c->dev));
     destroy_swapchain(c);
-    destroy_readback_buffers(c);
     create_swapchain(c);
-    create_readback_buffers(c);
-    c->have_submitted = false;
+    /* The owned backbuffer keeps its size; the blit scales into the new
+     * swapchain extent. c->extent stays the render size. */
+    c->extent = (VkExtent2D){(uint32_t)c->desc.width, (uint32_t)c->desc.height};
     c->need_recreate = false;
 }
 
@@ -1184,11 +1328,8 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
 
     create_memory(c);
     create_bindless(c);
-    if (desc->headless) {
-        create_offscreen(c);
-    } else {
-        create_swapchain(c);
-    }
+    create_offscreen(c);
+    if (!desc->headless) create_swapchain(c);
     create_readback_buffers(c);
 
     /* Slot 0 is the backbuffer: an external image whose VkImage changes every
@@ -1350,7 +1491,11 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     s->external = false;
 
     VkImageUsageFlags usage = 0;
-    if (desc->usage & VKMIN_IMAGE_SAMPLED) usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (desc->usage & VKMIN_IMAGE_SAMPLED) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    /* Only images that get uploaded need a transfer destination: sampled ones
+     * that are not attachments. On the modern path that is a host transfer. */
+    const bool uploadable = (desc->usage & VKMIN_IMAGE_SAMPLED) && !(desc->usage & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH));
+    if (uploadable) usage |= c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (desc->usage & VKMIN_IMAGE_COLOR) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (desc->usage & VKMIN_IMAGE_DEPTH) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (desc->usage & VKMIN_IMAGE_TRANSFER_SRC) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -1391,6 +1536,66 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     return (vkmin_image){handle_make(index, s->gen)};
 }
 
+/* --- legacy-only: upload through the ring and a command buffer ----------- */
+static void legacy_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint32_t mw, uint32_t mh,
+                                const void *data, size_t bytes) {
+    VKMIN_ASSERT(bytes <= c->ring_cap, "single mip larger than the host ring");
+    upload_prepare(c);
+    memcpy(c->ring_mapped, data, bytes);
+    VkCommandBuffer cmd = imm_begin(c);
+    /* Uniform path: each mip lands, then the whole image goes back to SAMPLED.
+     * Redundant per mip, correct in every order, and only ever at init. */
+    cmd_transition(cmd, s, VKMIN_USE_TRANSFER_DST, false);
+    const VkBufferImageCopy copy = {
+        .imageSubresource = {.aspectMask = s->aspect, .mipLevel = mip, .layerCount = 1},
+        .imageExtent = {mw, mh, 1},
+    };
+    vkCmdCopyBufferToImage(cmd, c->ring_buf, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    cmd_transition(cmd, s, VKMIN_USE_SAMPLED, false);
+    imm_end(c);
+}
+/* --- end legacy-only ------------------------------------------------------ */
+
+/* --- modern-only: host image copy straight into the image ---------------- */
+static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint32_t mw, uint32_t mh,
+                                const void *data, size_t bytes) {
+    (void)bytes;
+    upload_prepare(c);
+    /* Layout transitions happen on the host too: no command buffer anywhere. */
+    const VkHostImageLayoutTransitionInfoEXT to_general = {
+        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+        .image = s->img,
+        .oldLayout = use_lookup(s->use, s->aspect).layout,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
+    };
+    VK_CHECK(c->fp_transition_image_layout(c->dev, 1, &to_general));
+    const VkMemoryToImageCopyEXT region = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+        .pHostPointer = data,
+        .imageSubresource = {.aspectMask = s->aspect, .mipLevel = mip, .layerCount = 1},
+        .imageExtent = {mw, mh, 1},
+    };
+    const VkCopyMemoryToImageInfoEXT info = {
+        .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+        .dstImage = s->img,
+        .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .regionCount = 1,
+        .pRegions = &region,
+    };
+    VK_CHECK(c->fp_copy_memory_to_image(c->dev, &info));
+    const VkHostImageLayoutTransitionInfoEXT to_sampled = {
+        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+        .image = s->img,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
+    };
+    VK_CHECK(c->fp_transition_image_layout(c->dev, 1, &to_sampled));
+    s->use = VKMIN_USE_SAMPLED;
+}
+/* --- end modern-only ------------------------------------------------------ */
+
 void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data, size_t bytes) {
     VKMIN_ASSERT(c && data, "vkmin_image_upload: null argument");
     image_slot *s = NULL;
@@ -1407,21 +1612,9 @@ void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data
     }
     VKMIN_ASSERT(bytes == mip_bytes(fi, mw, mh), "mip %d of a %ux%u image needs %zu bytes, got %zu",
                  mip, mw, mh, mip_bytes(fi, mw, mh), bytes);
-    VKMIN_ASSERT(bytes <= c->ring_cap, "single mip larger than the host ring");
-
-    upload_prepare(c);
-    memcpy(c->ring_mapped, data, bytes);
-    VkCommandBuffer cmd = imm_begin(c);
-    /* Uniform path: each mip lands, then the whole image goes back to SAMPLED.
-     * Redundant per mip, correct in every order, and only ever at init. */
-    cmd_transition(cmd, s, VKMIN_USE_TRANSFER_DST, false);
-    const VkBufferImageCopy copy = {
-        .imageSubresource = {.aspectMask = s->aspect, .mipLevel = (uint32_t)mip, .layerCount = 1},
-        .imageExtent = {mw, mh, 1},
-    };
-    vkCmdCopyBufferToImage(cmd, c->ring_buf, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    cmd_transition(cmd, s, VKMIN_USE_SAMPLED, false);
-    imm_end(c);
+    /* Seam 1 of 3, write side. */
+    if (c->path == VKMIN_PATH_LEGACY) legacy_image_upload(c, s, (uint32_t)mip, mw, mh, data, bytes);
+    else modern_image_upload(c, s, (uint32_t)mip, mw, mh, data, bytes);
 }
 
 vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb) {
@@ -1439,12 +1632,8 @@ vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb) {
 }
 
 vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c) {
-    switch (c->backbuffer_format) {
-    case VK_FORMAT_R8G8B8A8_UNORM: return VKMIN_FMT_RGBA8_UNORM;
-    case VK_FORMAT_B8G8R8A8_UNORM: return VKMIN_FMT_BGRA8_UNORM;
-    default: break;
-    }
-    VKMIN_FATAL("backbuffer format %d has no vkmin_format", (int)c->backbuffer_format);
+    (void)c;
+    return VKMIN_FMT_RGBA8_UNORM;
 }
 
 vkmin_image vkmin_backbuffer(const vkmin_ctx *c) {
@@ -1453,14 +1642,67 @@ vkmin_image vkmin_backbuffer(const vkmin_ctx *c) {
 
 /* ------------------------------------------------------------ pipelines --- */
 
-static VkShaderModule make_module(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label) {
+/* Seam 3 of 3: a shader stage. The legacy path creates a transient module
+ * and destroys it once the pipeline exists; the modern path (maintenance5)
+ * chains the SPIR-V into the stage and never has a module object. Both are
+ * complete implementations of "make a stage"; the caller destroys whatever
+ * `module` comes back non-null. */
+typedef struct {
+    VkPipelineShaderStageCreateInfo stage;
+    VkShaderModuleCreateInfo inline_code; /* referenced by stage.pNext on the modern path */
+    VkShaderModule module;                /* legacy only */
+} shader_stage;
+
+static void check_spirv(const uint32_t *spv, size_t bytes, const char *label) {
     VKMIN_ASSERT(spv && bytes >= 4 && bytes % 4 == 0, "'%s': bad SPIR-V size %zu", label, bytes);
     VKMIN_ASSERT(spv[0] == 0x07230203u, "'%s': SPIR-V magic missing", label);
+}
+
+/* --- legacy-only: transient shader modules ------------------------------- */
+static void legacy_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
+                              size_t bytes, const char *label) {
+    check_spirv(spv, bytes, label);
     const VkShaderModuleCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spv};
-    VkShaderModule mod = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(c->dev, &info, NULL, &mod));
-    return mod;
+    VK_CHECK(vkCreateShaderModule(c->dev, &info, NULL, &s->module));
+    s->stage = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                 .stage = kind, .module = s->module, .pName = "main"};
+}
+/* --- end legacy-only ------------------------------------------------------ */
+
+/* --- modern-only: SPIR-V inline in the stage ----------------------------- */
+static void modern_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
+                              size_t bytes, const char *label) {
+    (void)c;
+    check_spirv(spv, bytes, label);
+    s->module = VK_NULL_HANDLE;
+    s->inline_code = (VkShaderModuleCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spv};
+    s->stage = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                 .pNext = &s->inline_code, .stage = kind, .pName = "main"};
+}
+/* --- end modern-only ------------------------------------------------------ */
+
+static void make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
+                       size_t bytes, const char *label) {
+    if (c->path == VKMIN_PATH_LEGACY) legacy_make_stage(c, s, kind, spv, bytes, label);
+    else modern_make_stage(c, s, kind, spv, bytes, label);
+}
+
+/* Debug builds ask for robustBufferAccess2 per pipeline where the device has
+ * it: the GPU-side counterpart of the bounds-checked handle lookup, fatal in
+ * debug and free in release. A property of the build, not a path. */
+static const void *robustness_chain(const vkmin_ctx *c, VkPipelineRobustnessCreateInfoEXT *info, const void *next) {
+    if (!(c->debug && c->caps.pipeline_robustness && c->caps.robust_buffer_access2)) return next;
+    *info = (VkPipelineRobustnessCreateInfoEXT){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT,
+        .pNext = next,
+        .storageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT,
+        .uniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT,
+        .vertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT,
+        .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT_EXT,
+    };
+    return info;
 }
 
 static VkCompareOp compare_lookup(vkmin_compare cmp) {
@@ -1476,15 +1718,10 @@ static VkCompareOp compare_lookup(vkmin_compare cmp) {
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     VKMIN_ASSERT(c && desc && desc->vs, "vkmin_make_pipeline: bad argument");
     const char *label = desc->label ? desc->label : "vkmin.pipeline";
-    VkShaderModule vs = make_module(c, desc->vs, desc->vs_bytes, label);
-    VkShaderModule fs = desc->fs ? make_module(c, desc->fs, desc->fs_bytes, label) : VK_NULL_HANDLE;
-
-    const VkPipelineShaderStageCreateInfo stages[2] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"},
-    };
+    shader_stage vs = {0}, fs = {0};
+    make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs, desc->vs_bytes, label);
+    if (desc->fs) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs, desc->fs_bytes, label);
+    const VkPipelineShaderStageCreateInfo stages[2] = {vs.stage, fs.stage};
     /* No vertex input state: every vertex shader pulls from a device address. */
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1542,10 +1779,11 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
         .pColorAttachmentFormats = &color_vk,
         .depthAttachmentFormat = desc->depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED,
     };
+    VkPipelineRobustnessCreateInfoEXT robust;
     const VkGraphicsPipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &rendering,
-        .stageCount = fs ? 2u : 1u,
+        .pNext = robustness_chain(c, &robust, &rendering),
+        .stageCount = desc->fs ? 2u : 1u,
         .pStages = stages,
         .pVertexInputState = &vertex_input,
         .pInputAssemblyState = &assembly,
@@ -1563,18 +1801,20 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     s->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     VK_CHECK(vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &info, NULL, &s->pipe));
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label);
-    vkDestroyShaderModule(c->dev, vs, NULL);
-    if (fs) vkDestroyShaderModule(c->dev, fs, NULL);
+    if (vs.module) vkDestroyShaderModule(c->dev, vs.module, NULL);
+    if (fs.module) vkDestroyShaderModule(c->dev, fs.module, NULL);
     return (vkmin_pipe){handle_make(index, s->gen)};
 }
 
 vkmin_pipe vkmin_make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label) {
     VKMIN_ASSERT(c != NULL, "vkmin_make_compute: null context");
-    VkShaderModule mod = make_module(c, spv, bytes, label ? label : "compute");
+    shader_stage cs = {0};
+    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, spv, bytes, label ? label : "compute");
+    VkPipelineRobustnessCreateInfoEXT robust;
     const VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main"},
+        .pNext = robustness_chain(c, &robust, NULL),
+        .stage = cs.stage,
         .layout = c->pipe_layout,
     };
     uint32_t index = 0;
@@ -1583,7 +1823,7 @@ vkmin_pipe vkmin_make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, c
     s->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
     VK_CHECK(vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &info, NULL, &s->pipe));
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label ? label : "vkmin.compute");
-    vkDestroyShaderModule(c->dev, mod, NULL);
+    if (cs.module) vkDestroyShaderModule(c->dev, cs.module, NULL);
     return (vkmin_pipe){handle_make(index, s->gen)};
 }
 
@@ -1596,12 +1836,9 @@ static void backbuffer_bind(vkmin_ctx *c, VkImage img, VkImageView view) {
     bb->w = c->extent.width;
     bb->h = c->extent.height;
     bb->format = c->backbuffer_format;
-    /* The offscreen image is the same one every frame, so its tracked use
-     * (TRANSFER_SRC, from last frame's readback) stays valid and orders this
-     * frame's first write after that read. A swapchain image arrives from the
-     * presentation engine; the acquire semaphore orders it, and PRESENT is
-     * the truthful source state. */
-    if (!c->desc.headless) bb->use = VKMIN_USE_PRESENT;
+    /* The same owned image every frame, so its tracked use (TRANSFER_SRC from
+     * last frame's readback or blit) stays valid and orders this frame's first
+     * write after that read. */
 }
 
 void vkmin_frame_begin(vkmin_ctx *c) {
@@ -1638,10 +1875,8 @@ void vkmin_frame_begin(vkmin_ctx *c) {
                                       VK_NULL_HANDLE, &c->swap_index);
         }
         if (r != VK_SUBOPTIMAL_KHR) VK_CHECK(r);
-        backbuffer_bind(c, c->swap_img[c->swap_index], c->swap_view[c->swap_index]);
-    } else {
-        backbuffer_bind(c, c->offscreen_img, c->offscreen_view);
     }
+    backbuffer_bind(c, c->offscreen_img, c->offscreen_view);
 
     c->ring_head[c->slot] = 0;
     VkCommandBuffer cmd = c->cmd[c->slot];
@@ -1935,18 +2170,14 @@ int vkmin_timestamps_read(const vkmin_ctx *c, double *ms_since_first, int cap) {
     return n;
 }
 
-void vkmin_frame_end(vkmin_ctx *c) {
-    VKMIN_ASSERT(c && c->in_frame && !c->in_pass, "vkmin_frame_end: bad state");
-    VkCommandBuffer cmd = c->cmd[c->slot];
-    image_slot *bb = &c->images[VKMIN_BACKBUFFER_SLOT];
-
-    /* Execute then inhibit: every frame copies the backbuffer into the mapped
-     * readback buffer whether or not anyone asks for a PNG. It costs one copy
-     * and buys one execution path, and a capture that never reads a swapchain
-     * image after it has been handed to the presentation engine. At 1080p the
-     * copy is real bandwidth, so the alternative is kept alive: no_readback
-     * skips it and vkmin_save_png says why it cannot. */
-    if (!c->desc.no_readback) {
+/* --- legacy-only: the per-frame staging copy ----------------------------- */
+/* Execute then inhibit: every frame copies the backbuffer into the mapped
+ * readback buffer whether or not anyone asks for a PNG, so the capture never
+ * reasons about what happened last. At 1080p the copy is real bandwidth, so
+ * the alternative is kept alive: no_readback skips it and vkmin_save_png says
+ * why it cannot. The modern path has no equivalent: it reads the image from
+ * the host after the fence, with no command at all. */
+static void legacy_record_readback(vkmin_ctx *c, VkCommandBuffer cmd, image_slot *bb) {
     cmd_transition(cmd, bb, VKMIN_USE_TRANSFER_SRC, false);
     const VkBufferMemoryBarrier2 to_device = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
@@ -1981,15 +2212,69 @@ void vkmin_frame_end(vkmin_ctx *c) {
     const VkDependencyInfo dep_host = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host};
     vkCmdPipelineBarrier2(cmd, &dep_host);
-    }
-    if (!c->desc.headless) cmd_transition(cmd, bb, VKMIN_USE_PRESENT, false);
+}
+/* --- end legacy-only ------------------------------------------------------ */
+
+/* Windowed only: blit the owned backbuffer into the acquired swapchain image.
+ * The blit converts formats (RGBA to BGRA) and scales to the window. */
+static void record_present_blit(vkmin_ctx *c, VkCommandBuffer cmd, image_slot *bb) {
+    cmd_transition(cmd, bb, VKMIN_USE_TRANSFER_SRC, false);
+    VkImageMemoryBarrier2 to_dst = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = c->swap_img[c->swap_index],
+        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
+    };
+    VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_dst};
+    vkCmdPipelineBarrier2(cmd, &dep);
+    const VkImageBlit2 region = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+        .srcOffsets = {{0, 0, 0}, {(int32_t)c->extent.width, (int32_t)c->extent.height, 1}},
+        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+        .dstOffsets = {{0, 0, 0}, {(int32_t)c->swap_extent.width, (int32_t)c->swap_extent.height, 1}},
+    };
+    const VkBlitImageInfo2 blit = {
+        .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+        .srcImage = bb->img, .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .dstImage = c->swap_img[c->swap_index], .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .regionCount = 1, .pRegions = &region, .filter = VK_FILTER_LINEAR,
+    };
+    vkCmdBlitImage2(cmd, &blit);
+    to_dst.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    to_dst.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_dst.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    to_dst.dstAccessMask = 0;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+void vkmin_frame_end(vkmin_ctx *c) {
+    VKMIN_ASSERT(c && c->in_frame && !c->in_pass, "vkmin_frame_end: bad state");
+    VkCommandBuffer cmd = c->cmd[c->slot];
+    image_slot *bb = &c->images[VKMIN_BACKBUFFER_SLOT];
+
+    /* Seam 1 of 3: the legacy path records its per-frame readback copy here;
+     * the modern path records nothing and reads the image from the host. */
+    if (c->path == VKMIN_PATH_LEGACY && !c->desc.no_readback) legacy_record_readback(c, cmd, bb);
+    if (!c->desc.headless) record_present_blit(c, cmd, bb);
+    /* Leave the backbuffer in TRANSFER_SRC either way, so the modern path's
+     * host copy reads it from a layout hostImageCopy accepts. */
+    cmd_transition(cmd, bb, VKMIN_USE_TRANSFER_SRC, false);
     VK_CHECK(vkEndCommandBuffer(cmd));
 
     const VkCommandBufferSubmitInfo cmd_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
                                                 .commandBuffer = cmd};
     const VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                         .semaphore = c->acquired[c->slot],
-                                        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+                                        .stageMask = VK_PIPELINE_STAGE_2_BLIT_BIT};
     const VkSemaphoreSubmitInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                           .semaphore = c->desc.headless ? VK_NULL_HANDLE : c->rendered[c->swap_index],
                                           .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
@@ -2019,7 +2304,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
         }
         int w = 0, h = 0;
         plat_framebuffer_size(&w, &h);
-        if (w > 0 && h > 0 && ((uint32_t)w != c->extent.width || (uint32_t)h != c->extent.height)) {
+        if (w > 0 && h > 0 && ((uint32_t)w != c->swap_extent.width || (uint32_t)h != c->swap_extent.height)) {
             c->need_recreate = true;
         }
     }
@@ -2031,34 +2316,57 @@ void vkmin_frame_end(vkmin_ctx *c) {
 
 /* -------------------------------------------------------------- readback -- */
 
+/* --- legacy-only: read the mapped staging buffer ------------------------- */
+static bool legacy_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t bytes) {
+    VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
+    c->fence_pending[c->last_slot] = false;
+    memcpy(rgba, c->readback_mapped[c->last_slot], bytes);
+    return true;
+}
+/* --- end legacy-only ------------------------------------------------------ */
+
+/* --- modern-only: host image copy, no command, no staging ---------------- */
+static bool modern_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t bytes) {
+    (void)bytes;
+    VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
+    c->fence_pending[c->last_slot] = false;
+    const VkImageToMemoryCopyEXT region = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT,
+        .pHostPointer = rgba,
+        .memoryRowLength = 0, /* tightly packed at the image width */
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+        .imageExtent = {c->extent.width, c->extent.height, 1},
+    };
+    const VkCopyImageToMemoryInfoEXT info = {
+        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT,
+        .srcImage = c->offscreen_img,
+        .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .regionCount = 1,
+        .pRegions = &region,
+    };
+    VK_CHECK(c->fp_copy_image_to_memory(c->dev, &info));
+    return true;
+}
+/* --- end modern-only ------------------------------------------------------ */
+
 bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     VKMIN_ASSERT(c && path && !c->in_frame, "vkmin_save_png: call it between frames");
     if (!c->have_submitted) {
         fprintf(stderr, "vkmin: nothing rendered yet, not writing '%s'\n", path);
         return false;
     }
-    if (c->desc.no_readback) {
+    if (c->path == VKMIN_PATH_LEGACY && c->desc.no_readback) {
         fprintf(stderr, "vkmin: readback is disabled (no_readback), not writing '%s'\n", path);
         return false;
     }
-    VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
-    c->fence_pending[c->last_slot] = false;
-
     const uint32_t w = c->extent.width, h = c->extent.height;
-    const size_t bytes = (size_t)c->readback_size;
-    const int row_pitch = (int)(w * 4u); /* bufferRowLength 0 above: tightly packed */
+    const size_t bytes = (size_t)w * h * 4u;
+    const int row_pitch = (int)(w * 4u); /* both paths copy tightly packed */
     unsigned char *rgba = malloc(bytes);
     VKMIN_ASSERT(rgba != NULL, "out of memory writing '%s'", path);
-    memcpy(rgba, c->readback_mapped[c->last_slot], bytes);
-    const bool bgra = c->backbuffer_format == VK_FORMAT_B8G8R8A8_UNORM ||
-                      c->backbuffer_format == VK_FORMAT_B8G8R8A8_SRGB;
-    if (bgra) {
-        for (size_t i = 0; i < bytes; i += 4) {
-            const unsigned char b = rgba[i];
-            rgba[i] = rgba[i + 2];
-            rgba[i + 2] = b;
-        }
-    }
+    /* Seam 1 of 3, read side. */
+    if (c->path == VKMIN_PATH_LEGACY) legacy_read_backbuffer(c, rgba, bytes);
+    else modern_read_backbuffer(c, rgba, bytes);
     for (size_t i = 3; i < bytes; i += 4) rgba[i] = 255; /* the PNG is opaque by definition */
     const bool ok = vkmin_png_write(path, (int)w, (int)h, rgba, row_pitch);
     free(rgba);

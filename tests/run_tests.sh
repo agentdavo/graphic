@@ -74,9 +74,9 @@ begin "== handles: a freed slot's old handle aborts, the new one works =="
 checks=$((checks + 1))
 ./$BUILD/handles 2>/dev/null || fail "handles"
 
-begin "== --no-readback: the per-frame copy is skipped and save_png says so =="
+begin "== --no-readback on the legacy path: the copy is skipped and save_png says so =="
 checks=$((checks + 1))
-if $CORRIDOR --frame 0 --no-readback --out "$OUT/noreadback.png" >/dev/null 2>"$OUT/noreadback.log"; then
+if $CORRIDOR --frame 0 --path=legacy --no-readback --out "$OUT/noreadback.png" >/dev/null 2>"$OUT/noreadback.log"; then
     fail "--no-readback should make the PNG save fail"
 else
     grep -q "readback is disabled" "$OUT/noreadback.log" && note "refused, with the reason" || fail "wrong failure for --no-readback"
@@ -89,11 +89,29 @@ checks=$((checks + 1))
 compare smoke
 compare smoke_bc1
 
-begin "== The Corridor: golden frames (each frame in its own process) =="
+begin "== which paths can this device run? =="
+./$BUILD/corridor --probe > "$OUT/probe.txt" 2>&1 || fail "probe"
+cat "$OUT/probe.txt" | sed 's/^/  /'
+MODERN=0
+grep -q "hostImageCopy=1 maintenance5=1" "$OUT/probe.txt" && MODERN=1
+
+begin "== The Corridor: golden frames on the legacy path (each frame in its own process) =="
 for f in $FRAMES; do
-    render "corridor_$f" --frame "$f"
+    render "corridor_$f" --frame "$f" --path=legacy
     compare "corridor_$f"
 done
+
+begin "== the same frames on the modern path must be bit-identical =="
+if [ "$MODERN" = "1" ]; then
+    for f in $FRAMES; do
+        render "modern_$f" --frame "$f" --path=modern
+        same "corridor_$f" "modern_$f" 0 "frame $f: modern == legacy"
+    done
+    render modern_naive_240 --frame 240 --path=modern --sync-naive
+    same corridor_240 modern_naive_240 0 "frame 240: modern + sync-naive == legacy"
+else
+    note "SKIP: modern path (hostImageCopy + maintenance5) not available on this device"
+fi
 
 begin "== determinism: frame 240 twice, bit-identical =="
 render corridor_240_again --frame 240
@@ -134,13 +152,17 @@ else
     checks=$((checks + 1))
     # Two frames in flight, ten frames, then the last one is captured from the
     # swapchain. d_frame_step=0 holds the animation at frame 0 for comparison.
-    if DISPLAY=$DISPLAY_RUN ./$BUILD/corridor --profile lavapipe --exit-after 10 d_frame_step=0 r_overlay=0 \
-            --out "$OUT/windowed.png" >/dev/null 2>"$OUT/windowed.log"; then
-        render headless_for_windowed --frame 0 r_overlay=0
-        same headless_for_windowed windowed "$TOLERANCE" "swapchain capture == offscreen render"
-    else
-        fail "windowed run"; sed -n '1,12p' "$OUT/windowed.log"
-    fi
+    for p in legacy modern; do
+        [ "$p" = "modern" ] && [ "$MODERN" != "1" ] && { note "SKIP: windowed modern path"; continue; }
+        checks=$((checks + 1))
+        if DISPLAY=$DISPLAY_RUN ./$BUILD/corridor --profile lavapipe --exit-after 10 d_frame_step=0 r_overlay=0 \
+                --path=$p --out "$OUT/windowed_$p.png" >/dev/null 2>"$OUT/windowed_$p.log"; then
+            render headless_for_windowed --frame 0 r_overlay=0
+            same headless_for_windowed "windowed_$p" 0 "$p: windowed backbuffer == headless render"
+        else
+            fail "windowed run ($p)"; sed -n '1,12p' "$OUT/windowed_$p.log"
+        fi
+    done
     [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" 2>/dev/null
 fi
 

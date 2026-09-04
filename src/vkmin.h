@@ -64,8 +64,16 @@ typedef enum {
     VKMIN_IMAGE_TRANSFER_SRC = 8
 } vkmin_image_usage;
 
+/* Which implementation of the three version-dependent operations to use.
+ * Chosen once at init from the features the device reports -- a 1.3 device
+ * exposing the promoted extensions is "modern" -- and never consulted again
+ * except at the three seams. */
+typedef enum { VKMIN_PATH_AUTO = 0, VKMIN_PATH_LEGACY, VKMIN_PATH_MODERN } vkmin_path;
+
 typedef struct {
     bool headless;
+    vkmin_path path;       /* AUTO picks modern when the device can; a forced path that the
+                            * device cannot do fails at init with the missing feature named */
     bool sync_naive;       /* reference path: one frame in flight, wait idle per submit */
     bool no_readback;      /* skip the per-frame backbuffer copy; vkmin_save_png then fails */
     bool vsync;
@@ -135,6 +143,21 @@ typedef struct {
     bool compute_to_transfer;      /* compute output -> copy to the ring for CPU readback */
 } vkmin_barrier_desc;
 
+/* What a device offers, and what vkmin would do with it. vkmin_probe creates a
+ * throwaway instance, asks, and creates nothing else, so a user or an agent can
+ * answer "will this run here" before anything fails. */
+typedef struct {
+    char device_name[256];
+    uint32_t api_major, api_minor;
+    bool vulkan_1_3;
+    bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
+    bool scalar_block_layout, buffer_device_address, descriptor_indexing, draw_indirect_count;
+    vkmin_path would_choose;   /* LEGACY or MODERN */
+    const char *reason;        /* one line: why */
+} vkmin_report;
+vkmin_report vkmin_probe(int device_index);
+vkmin_path vkmin_path_used(const vkmin_ctx *c);
+
 /* Lifecycle */
 vkmin_ctx *vkmin_init(const vkmin_desc *desc);
 void vkmin_shutdown(vkmin_ctx *c);
@@ -160,7 +183,7 @@ void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data
 uint32_t vkmin_register_texture(vkmin_ctx *c, vkmin_image img, uint32_t sampler_preset);
 vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb);
 vkmin_image vkmin_backbuffer(const vkmin_ctx *c); /* this frame's presentable image */
-vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c);
+vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c); /* always RGBA8_UNORM: the backbuffer is an owned image on both paths */
 
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc);
 vkmin_pipe vkmin_make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label);
