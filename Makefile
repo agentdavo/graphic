@@ -36,7 +36,7 @@ CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD
 
 .PHONY: all clean test golden texture analyze tools
 all: tools $(BUILD)/smoke $(BUILD)/corridor
-tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook
+tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -66,6 +66,9 @@ $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
 	$(CC) $(THIRD_PARTY_CFLAGS) -c -o $@ $<
 
 $(BUILD)/smoke: tests/smoke.c $(BUILD)/shaders.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/handles: tests/handles.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/corridor: demo/corridor.c demo/anim.h src/render.h src/scene.h src/mat4.h $(CORE_OBJS)
@@ -99,15 +102,18 @@ $(BUILD)/cook: tools/cook.c tools/cook_image.h src/vkm_format.h src/shared.h $(B
 texture: $(BUILD)/mktex
 	./$(BUILD)/mktex tests/assets/grid.png
 
-test: all
+# Static analysis is part of the test run, not a target someone remembers:
+# a finding fails the build.
+test: all analyze
 	./tests/run_tests.sh
 
 golden: all
 	VKMIN_WRITE_GOLDEN=1 ./tests/run_tests.sh
 
-# A second analyser finds different things than the first.
+# A second analyser finds different things than the first. Missing cppcheck is
+# a failure, not a skip: a check that silently vanishes is the failure mode.
 analyze:
-	@command -v cppcheck >/dev/null || { echo "cppcheck not installed"; exit 1; }
+	@command -v cppcheck >/dev/null || { echo "cppcheck not installed; it is required by make test"; exit 1; }
 	cppcheck --std=c11 --enable=warning,style,performance,portability \
 	    --inline-suppr --error-exitcode=1 --quiet \
 	    --suppress=missingIncludeSystem --suppress=missingInclude \

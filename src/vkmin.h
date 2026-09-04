@@ -67,6 +67,7 @@ typedef enum {
 typedef struct {
     bool headless;
     bool sync_naive;       /* reference path: one frame in flight, wait idle per submit */
+    bool no_readback;      /* skip the per-frame backbuffer copy; vkmin_save_png then fails */
     bool vsync;
     int width, height;
     int device_index;
@@ -144,6 +145,13 @@ enum { VKMIN_KEY_ESCAPE = 256, VKMIN_KEY_F1 = 290, VKMIN_KEY_F12 = 301, VKMIN_KE
 
 /* Resources. All device memory comes from the arena; all are alive until shutdown. */
 vkmin_buffer vkmin_make_buffer(vkmin_ctx *c, const vkmin_buffer_desc *desc);
+/* Freeing waits for the device to go idle, releases the slot and bumps its
+ * generation, so a handle to the freed resource aborts on its next use instead
+ * of aliasing whatever lands in the slot. Arena memory is not reclaimed: the
+ * arenas are bump allocators, and a free-list suballocator is a later parallel
+ * implementation. TODO(v0.5): deferred destruction. */
+void vkmin_free_buffer(vkmin_ctx *c, vkmin_buffer b);
+void vkmin_free_image(vkmin_ctx *c, vkmin_image img);
 uint64_t vkmin_buffer_addr(vkmin_ctx *c, vkmin_buffer b);
 void vkmin_buffer_upload(vkmin_ctx *c, vkmin_buffer b, size_t offset, const void *data, size_t bytes);
 

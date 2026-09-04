@@ -38,6 +38,7 @@
     X(r_ambient, 0.10f, "ambient radiance")                                          \
     X(r_sun_intensity, 5.0f, "sun radiance multiplier")                              \
     X(r_sync_naive, 0.0f, "one frame in flight and wait idle per submit")            \
+    X(r_readback, 1.0f, "copy the backbuffer for PNG capture every frame")           \
     X(r_vsync, 1.0f, "FIFO present mode when 1, immediate/mailbox when 0")           \
     X(d_frame_step, 1.0f, "frames advanced per rendered frame (0 pauses)")
 

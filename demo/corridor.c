@@ -373,6 +373,7 @@ static const char *usage_text =
     "  --scene PATH            cooked scene (default assets/sponza/scene.vkm)\n"
     "  --character PATH        cooked skinned character (default assets/cesium/scene.vkm)\n"
     "  --sync-naive            one frame in flight and wait idle per submit\n"
+    "  --no-readback           skip the per-frame capture copy (PNG saving then fails)\n"
     "  --exit-after N          windowed: stop after N frames (and save --out, if given)\n"
     "  --device N              physical device index\n"
     "  --cvars                 list every cvar and exit\n"
@@ -396,6 +397,7 @@ int main(int argc, char **argv) {
         const bool next = i + 1 < argc;
         if (strcmp(a, "--headless") == 0) opt.headless = true;
         else if (strcmp(a, "--sync-naive") == 0) opt.sync_naive = true;
+        else if (strcmp(a, "--no-readback") == 0) cvar_set(CV_r_readback, 0.0f);
         else if (strcmp(a, "--cvars") == 0) opt.list_cvars = true;
         else if (strcmp(a, "--frame") == 0 && next) { opt.headless = true; opt.frame_count = 1; opt.frames[0] = atoi(argv[++i]); }
         else if (strcmp(a, "--frames") == 0 && next) { opt.headless = true; parse_frames(&opt, argv[++i]); }
@@ -428,6 +430,7 @@ int main(int argc, char **argv) {
     if (opt.sync_naive) cvar_set(CV_r_sync_naive, 1.0f);
 
     vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.headless = opt.headless, .sync_naive = cvar_get_bool(CV_r_sync_naive),
+                                              .no_readback = !cvar_get_bool(CV_r_readback),
                                               .vsync = cvar_get_bool(CV_r_vsync), .width = opt.width, .height = opt.height,
                                               .device_index = opt.device, .title = "vkmin -- The Corridor"});
     vkr *r = vkr_init(gpu, &(vkr_desc){.width = opt.width, .height = opt.height, .shadow_atlas = cvar_get_int(CV_r_shadow_atlas),

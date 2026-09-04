@@ -1,0 +1,27 @@
+# make test under lavapipe on a runner with no GPU. This is the file that
+# turns "works here" into "runs every time"; it was written on a machine that
+# cannot execute it, so its first real run is the check of the file itself.
+name: test
+on: [push, pull_request]
+jobs:
+  lavapipe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan, lavapipe, validation layers, tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslang-tools mesa-vulkan-drivers vulkan-validationlayers \
+            libglfw3-dev cppcheck xvfb
+      - name: Build and test
+        run: make test
+      - name: Sanitizer build renders a frame
+        run: |
+          make BUILD=build_san SANITIZE=1 build_san/corridor
+          ASAN_OPTIONS=detect_leaks=0 ./build_san/corridor --profile lavapipe --headless --frame 120 --out /tmp/san.png
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-output
+          path: tests/out

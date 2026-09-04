@@ -70,6 +70,18 @@ begin "== pure functions =="
 checks=$((checks + 1))
 ./$BUILD/mat4_test || fail "mat4_test"
 
+begin "== handles: a freed slot's old handle aborts, the new one works =="
+checks=$((checks + 1))
+./$BUILD/handles 2>/dev/null || fail "handles"
+
+begin "== --no-readback: the per-frame copy is skipped and save_png says so =="
+checks=$((checks + 1))
+if $CORRIDOR --frame 0 --no-readback --out "$OUT/noreadback.png" >/dev/null 2>"$OUT/noreadback.log"; then
+    fail "--no-readback should make the PNG save fail"
+else
+    grep -q "readback is disabled" "$OUT/noreadback.log" && note "refused, with the reason" || fail "wrong failure for --no-readback"
+fi
+
 begin "== GPU layer smoke test: compute, device addresses, bindless, timestamps =="
 checks=$((checks + 1))
 ./$BUILD/smoke "$OUT/smoke.png" >/dev/null 2>"$OUT/smoke.log" || { fail "smoke"; sed -n '1,12p' "$OUT/smoke.log"; }

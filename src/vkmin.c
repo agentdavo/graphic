@@ -202,9 +202,9 @@ struct vkmin_ctx {
 
 /* ------------------------------------------------------------- handles ---- */
 
-/* id = generation << 20 | (index + 1). Zero is invalid. Nothing is ever freed,
- * so generations stay at 1; the field exists so that a free path, when one
- * arrives, bumps it (never back to 0) and stale handles are caught. */
+/* id = generation << 20 | (index + 1). Zero is invalid. Freeing a slot bumps
+ * its generation, so a handle to the freed resource is caught at its next
+ * lookup rather than aliasing the slot's next occupant. */
 static uint32_t handle_make(uint32_t index, uint16_t gen) {
     return ((uint32_t)gen << VKMIN_HANDLE_INDEX_BITS) | (index + 1u);
 }
@@ -212,6 +212,8 @@ static uint32_t handle_index(uint32_t id) {
     return (id & ((1u << VKMIN_HANDLE_INDEX_BITS) - 1u)) - 1u;
 }
 static uint16_t handle_gen(uint32_t id) { return (uint16_t)(id >> VKMIN_HANDLE_INDEX_BITS); }
+/* 12 bits of generation; never back to 0, which is what makes 0 invalid. */
+static uint16_t gen_next(uint16_t gen) { return (uint16_t)(gen >= 4095 ? 1 : gen + 1); }
 
 #define VKMIN_SLOT_ALLOC(pool, count, out_index)                                  \
     do {                                                                          \
@@ -1284,6 +1286,27 @@ vkmin_buffer vkmin_make_buffer(vkmin_ctx *c, const vkmin_buffer_desc *desc) {
     return b;
 }
 
+void vkmin_free_buffer(vkmin_ctx *c, vkmin_buffer b) {
+    VKMIN_ASSERT(c && !c->in_frame, "vkmin_free_buffer: call it between frames");
+    buffer_slot *s = NULL;
+    VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
+    VK_CHECK(vkDeviceWaitIdle(c->dev));
+    const uint16_t gen = gen_next(s->gen);
+    *s = (buffer_slot){.gen = gen}; /* the range in the arena stays allocated; see vkmin.h */
+}
+
+void vkmin_free_image(vkmin_ctx *c, vkmin_image img) {
+    VKMIN_ASSERT(c && !c->in_frame, "vkmin_free_image: call it between frames");
+    image_slot *s = NULL;
+    VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, img.id, s);
+    VKMIN_ASSERT(!s->external, "the backbuffer cannot be freed");
+    VK_CHECK(vkDeviceWaitIdle(c->dev));
+    vkDestroyImageView(c->dev, s->view, NULL);
+    vkDestroyImage(c->dev, s->img, NULL);
+    const uint16_t gen = gen_next(s->gen);
+    *s = (image_slot){.gen = gen};
+}
+
 uint64_t vkmin_buffer_addr(vkmin_ctx *c, vkmin_buffer b) {
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
@@ -1920,7 +1943,10 @@ void vkmin_frame_end(vkmin_ctx *c) {
     /* Execute then inhibit: every frame copies the backbuffer into the mapped
      * readback buffer whether or not anyone asks for a PNG. It costs one copy
      * and buys one execution path, and a capture that never reads a swapchain
-     * image after it has been handed to the presentation engine. */
+     * image after it has been handed to the presentation engine. At 1080p the
+     * copy is real bandwidth, so the alternative is kept alive: no_readback
+     * skips it and vkmin_save_png says why it cannot. */
+    if (!c->desc.no_readback) {
     cmd_transition(cmd, bb, VKMIN_USE_TRANSFER_SRC, false);
     const VkBufferMemoryBarrier2 to_device = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
@@ -1955,6 +1981,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
     const VkDependencyInfo dep_host = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host};
     vkCmdPipelineBarrier2(cmd, &dep_host);
+    }
     if (!c->desc.headless) cmd_transition(cmd, bb, VKMIN_USE_PRESENT, false);
     VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -2008,6 +2035,10 @@ bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     VKMIN_ASSERT(c && path && !c->in_frame, "vkmin_save_png: call it between frames");
     if (!c->have_submitted) {
         fprintf(stderr, "vkmin: nothing rendered yet, not writing '%s'\n", path);
+        return false;
+    }
+    if (c->desc.no_readback) {
+        fprintf(stderr, "vkmin: readback is disabled (no_readback), not writing '%s'\n", path);
         return false;
     }
     VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
