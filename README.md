@@ -1,4 +1,4 @@
-# vkmin v0.1 — a Doom 3-class world in a small C11 codebase
+# vkmin v0.3 — a Doom 3-class world in a small C11 codebase
 
 A Vulkan 1.3 renderer whose whole design is subtraction: no render passes, no
 framebuffers, no vertex input state, no per-draw descriptor binding, no
@@ -150,10 +150,70 @@ what the version bump was for. `make test` renders every golden frame on both
 paths and requires bit-identical output; on a device with one path the other
 is reported as skipped by name.
 
+## v0.3: the API surface
+
+`src/vkmin.h` is **223 lines** (201 non-blank) and is the documentation: the
+header comment states the shape (one context, typed handles, zero-default
+descs, no callbacks, no allocation after init, no clock, single-threaded,
+failure fatal) and every function carries a state contract in its trailing
+comment — `pure`, `reads ctx`, `writes ctx`, `gpu`, `io`. The compile-time
+block at the top (`VKMIN_MAX_BUFFERS/IMAGES/PIPES`, `VKMIN_FAIL`,
+`VKMIN_ASSERT`, `VKMIN_NO_PLATFORM`) has a default for every value.
+
+**Resources are numbers.** A shader reaches a texture by its bindless index
+(`vkmin_index`) and a buffer by its device address (`vkmin_address`); both
+travel in the push block the user defines in `shared.h`. There is no
+`vkmin_bind`: a draw is `vkmin_draw(ctx, pipe, push, bytes, verts, inst)`.
+`vkmin_frame_begin` returns `false` when the program should stop (window
+closed, `--frame N` reached), so the main loop is a `while`. The command line
+goes into `vkmin_init` and is parsed there: `--headless --frame N --out PNG
+--path=... --record FILE --replay FILE`, and any cvar as `name=value`.
+
+**The journal.** With `--record FILE`, every public call that reaches the GPU
+is appended as a record `{op, header, payload, relocation list}`, including
+the bytes of every upload, shader and push block. `vkmin_replay` re-issues the
+stream in a fresh process: `07_replay` is the replay of `06_cube`, without the
+cube's code, shaders or texture. Device addresses are the difficulty — the
+replayed process gets different ones — so the journal header stores the
+recording's arena and ring base addresses and every 8-byte word of a payload
+that *exactly equals* an address issued during recording (an arena allocation
+or a ring allocation of the current frame) is relocated. That is a heuristic,
+stated as one: an address computed by the user (base + offset) that was never
+issued as such is not relocated, and a data word that happens to equal an
+issued address would be. The renderer stays inside the rule (it stores issued
+addresses only), and replay asserts that handles and ring usage match the
+recording, so a divergence fails loudly rather than drawing garbage. The
+harness records `06_cube` and The Corridor at frame 240 on the modern path
+and replays both at tolerance 0, and replays the modern recording on the
+legacy path.
+
+**Also in v0.3.** `vkmin_math.h` is the pure maths header (every function
+`pure`, `vkmin_`-prefixed). Shader hot reload: a pipeline created with
+`vs_path`/`fs_path`/`cs_path` is rebuilt when the `.spv` mtime changes
+(`r_hotreload`). `vkmin_stats_get`, `vkmin_dump` (context state to a stream)
+and `vkmin_probe` (device report, creates nothing else). `make amalgamate`
+produces `build/vkmin_single.h`; `make test` compiles it as a check. The
+examples are the tests: `01_clear` (12 lines), `02_triangle` (18),
+`03_buffer` (25), `04_texture` (26), `05_compute` (29), `06_cube` (33),
+`07_replay` (24); each renders frame 60 at 256² against a golden.
+
+**Budgets, honestly.** The brief's budget for the core was 2500 lines with
+both paths, written for the cube lineage; `src/vkmin.c` is **2972 lines
+(2777 non-blank)** carrying both paths (108 legacy-only, 74 modern-only),
+the journal, hot reload, stats and dump. The renderer (`render.c`, 776) and
+the rest of `src/` bring the core to about 4800. It is over the number and I
+have not cut it to fit; the journal alone is ~400 lines, and taking it out
+would remove the one feature that turns every bug into a batch job. The
+brief's other acceptance test — hand the header to someone and time them to a
+cube — cannot be run here; `06_cube` is my own answer to it, and it is 33
+lines.
+
 ## Test coverage, in numbers
 
-`make test` runs **28 checks**: a pure-function unit test, the handle-
-generation test, the `--no-readback` refusal, the GPU-layer smoke test (plus
+`make test` runs **42 checks**: a pure-function unit test, the handle-
+generation test, the `--no-readback` refusal, seven example goldens, the
+journal (two recordings replayed at tolerance 0, one across paths), the
+`--probe` report, an amalgamation compile, the GPU-layer smoke test (plus
 its BC1 variant), **9 golden images** compared at **2/255 per channel** with a
 diff image written on failure (four Corridor frames, two debug views, the
 overlay, two smoke renders), the same four frames on the modern path at
