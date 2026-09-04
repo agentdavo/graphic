@@ -1,0 +1,53 @@
+#version 450
+// cull.comp -- frustum culls every instance against every view in one dispatch
+// (x: instance, y: view) and writes VkDrawIndexedIndirectCommand records.
+//
+// Two lists per view: [0] back-face culled, [1] double-sided. Two modes,
+// selected by push.param: compact (atomic append, the fast path) and stable
+// (slot = instance index, count = instance_count, culled instances written
+// with instance_count 0). Stable is the reference path: its draw order is
+// fixed, so golden images are bit-exact; compact's order is whatever the
+// atomics decide.
+#include "common.glsl"
+layout(local_size_x = VKMIN_CULL_GROUP) in;
+
+void main() {
+    Frame frame = FrameRef(push.frame).frame;
+    uint i = gl_GlobalInvocationID.x;
+    uint v = gl_GlobalInvocationID.y;
+    if (i >= frame.instance_count || v >= frame.view_count) return;
+
+    Instance inst = InstanceRef(frame.instances).i[i];
+    Material mat = MaterialRef(frame.materials).m[inst.material];
+    View view = ViewRef(frame.views).v[v];
+    Mesh mesh = MeshRef(frame.meshes).m[inst.mesh];
+
+    bool visible = (inst.flags & VKMIN_INST_HIDDEN) == 0u && (mat.flags & VKMIN_MAT_BLEND) == 0u;
+    for (int p = 0; p < 6; ++p) {
+        if (dot(view.planes[p].xyz, inst.bounds.xyz) + view.planes[p].w < -inst.bounds.w) visible = false;
+    }
+    uint list = (mat.flags & VKMIN_MAT_DOUBLE_SIDED) != 0u ? 1u : 0u;
+
+    DrawCmdRef cmds = DrawCmdRef(frame.draw_cmds);
+    CountRef counts = CountRef(frame.draw_counts);
+    DrawCmd cmd;
+    cmd.index_count = mesh.index_count;
+    cmd.instance_count = visible ? 1u : 0u;
+    cmd.first_index = mesh.first_index;
+    cmd.vertex_offset = int(mesh.vertex_offset);
+    cmd.first_instance = i;
+
+    if (push.param != 0u) {
+        if (!visible) return;
+        uint slot = atomicAdd(counts.n[v * 2u + list], 1u);
+        cmds.d[(v * 2u + list) * VKMIN_MAX_DRAWS + slot] = cmd;
+    } else {
+        // Write both lists every time so no stale command survives from a
+        // previous frame: the instance's own list gets the command, the other
+        // list gets it with instance_count 0.
+        DrawCmd none = cmd;
+        none.instance_count = 0u;
+        cmds.d[(v * 2u + list) * VKMIN_MAX_DRAWS + i] = cmd;
+        cmds.d[(v * 2u + (1u - list)) * VKMIN_MAX_DRAWS + i] = none;
+    }
+}

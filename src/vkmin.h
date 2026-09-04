@@ -33,6 +33,7 @@ typedef enum {
     VKMIN_FMT_NONE = 0,
     VKMIN_FMT_RGBA8_UNORM,
     VKMIN_FMT_RGBA8_SRGB,
+    VKMIN_FMT_BGRA8_UNORM,     /* swapchains usually come this way */
     VKMIN_FMT_BC1_SRGB,
     VKMIN_FMT_BC1_UNORM,
     VKMIN_FMT_BC3_SRGB,
@@ -128,7 +129,9 @@ typedef struct {
     bool compute_to_indirect_draw; /* cull output -> indirect commands, index/vertex reads */
     bool compute_to_fragment;      /* cluster lists -> fragment shader reads */
     bool transfer_to_compute;      /* fill/copy -> compute reads/writes */
-    bool graphics_to_compute;      /* nothing yet reads depth in compute; reserved */
+    bool frame_start;              /* last frame's draws and readback copies read what this
+                                    * frame's compute and fills are about to overwrite */
+    bool compute_to_transfer;      /* compute output -> copy to the ring for CPU readback */
 } vkmin_barrier_desc;
 
 /* Lifecycle */
@@ -149,6 +152,7 @@ void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data
 uint32_t vkmin_register_texture(vkmin_ctx *c, vkmin_image img, uint32_t sampler_preset);
 vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb);
 vkmin_image vkmin_backbuffer(const vkmin_ctx *c); /* this frame's presentable image */
+vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c);
 
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc);
 vkmin_pipe vkmin_make_compute(vkmin_ctx *c, const uint32_t *spv, size_t bytes, const char *label);
@@ -165,6 +169,10 @@ void *vkmin_ring_alloc(vkmin_ctx *c, size_t bytes, uint64_t *addr_out);
 
 void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc);
 void vkmin_fill_buffer(vkmin_ctx *c, vkmin_buffer b, size_t offset, size_t bytes, uint32_t value);
+/* Records a copy from a device buffer into ring memory obtained this frame;
+ * the bytes are valid on the host once this frame's fence has been waited,
+ * i.e. the next time this frame slot comes round. */
+void vkmin_copy_to_ring(vkmin_ctx *c, vkmin_buffer src, size_t offset, size_t bytes, uint64_t ring_addr);
 
 void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc);
 void vkmin_pass_end(vkmin_ctx *c);

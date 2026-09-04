@@ -12,13 +12,14 @@ typedef struct {
     float value;
     float def;
     const char *help;
+    bool set; /* assigned by name at least once; a profile must not undo that */
 } cvar;
 
 /* The table is process-global by design: the demo, the renderer and the
  * command line all need to agree on it, and threading a handle to it through
  * every call would be ceremony without a payoff. It is the one global. */
 static cvar table[CV_COUNT] = {
-#define VKMIN_CVAR_INIT(n, d, h) {#n, d, d, h},
+#define VKMIN_CVAR_INIT(n, d, h) {#n, d, d, h, false},
     VKMIN_CVAR_LIST(VKMIN_CVAR_INIT)
 #undef VKMIN_CVAR_INIT
 };
@@ -28,6 +29,7 @@ bool cvar_get_bool(cvar_id id) { return table[id].value != 0.0f; }
 int cvar_get_int(cvar_id id) { return (int)table[id].value; }
 void cvar_set(cvar_id id, float value) { table[id].value = value; }
 bool cvar_is_overridden(cvar_id id) { return table[id].value != table[id].def; }
+bool cvar_was_set(cvar_id id) { return table[id].set; }
 const char *cvar_name(cvar_id id) { return table[id].name; }
 
 bool cvar_parse_assignment(const char *text) {
@@ -48,6 +50,7 @@ bool cvar_parse_assignment(const char *text) {
             return false;
         }
         table[i].value = value;
+        table[i].set = true;
         return true;
     }
     fprintf(stderr, "cvar: unknown cvar '%.*s' (try --cvars)\n", (int)name_len, text);

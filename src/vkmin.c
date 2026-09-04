@@ -643,8 +643,8 @@ static void create_memory(vkmin_ctx *c) {
      * one region per frame in flight so a frame never overwrites data the
      * previous one is still reading. */
     create_backing_buffer(c, ring_cap,
-                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                           &c->ring_buf, &c->ring_mem, &c->ring_addr, "vkmin.ring");
@@ -701,6 +701,7 @@ static format_info format_lookup(vkmin_format f) {
     switch (f) {
     case VKMIN_FMT_RGBA8_UNORM: return (format_info){VK_FORMAT_R8G8B8A8_UNORM, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_RGBA8_SRGB: return (format_info){VK_FORMAT_R8G8B8A8_SRGB, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
+    case VKMIN_FMT_BGRA8_UNORM: return (format_info){VK_FORMAT_B8G8R8A8_UNORM, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_BC1_SRGB: return (format_info){VK_FORMAT_BC1_RGB_SRGB_BLOCK, 8, 4, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_BC1_UNORM: return (format_info){VK_FORMAT_BC1_RGB_UNORM_BLOCK, 8, 4, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_BC3_SRGB: return (format_info){VK_FORMAT_BC3_SRGB_BLOCK, 16, 4, VK_IMAGE_ASPECT_COLOR_BIT};
@@ -1372,8 +1373,8 @@ void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data
     image_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, img.id, s);
     VKMIN_ASSERT(mip >= 0 && (uint32_t)mip < s->mips, "mip %d out of range (%u levels)", mip, s->mips);
-    const uint32_t mw = s->w >> mip ? s->w >> mip : 1u;
-    const uint32_t mh = s->h >> mip ? s->h >> mip : 1u;
+    const uint32_t mw = (s->w >> mip) ? (s->w >> mip) : 1u;
+    const uint32_t mh = (s->h >> mip) ? (s->h >> mip) : 1u;
     /* The format table knows the exact byte count; a caller with the wrong
      * one has a mip-chain bug and should hear about it now. */
     format_info fi = {.vk = s->format, .aspect = s->aspect, .block_bytes = 4, .block_dim = 1};
@@ -1412,6 +1413,15 @@ vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb) {
     vkmin_image_upload(c, img, 0, pixels, (size_t)w * (size_t)h * 4u);
     vkmin_png_free(pixels);
     return img;
+}
+
+vkmin_format vkmin_backbuffer_format(const vkmin_ctx *c) {
+    switch (c->backbuffer_format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return VKMIN_FMT_RGBA8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VKMIN_FMT_BGRA8_UNORM;
+    default: break;
+    }
+    VKMIN_FATAL("backbuffer format %d has no vkmin_format", (int)c->backbuffer_format);
 }
 
 vkmin_image vkmin_backbuffer(const vkmin_ctx *c) {
@@ -1660,18 +1670,29 @@ void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc) {
         mem.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     }
     if (desc->transfer_to_compute) {
-        mem.srcStageMask |= VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        /* ALL_TRANSFER rather than CLEAR: the spec files vkCmdFillBuffer under
+         * CLEAR, synchronization validation files it under COPY, and the
+         * union of the transfer stages is still a narrow mask. */
+        mem.srcStageMask |= VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
         mem.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
         mem.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         mem.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     }
-    if (desc->graphics_to_compute) {
-        /* Last frame's draws read what this frame's compute is about to
-         * overwrite: a write-after-read, so no source access mask needed. */
+    if (desc->frame_start) {
+        /* Last frame's draws and its count-readback copy read what this
+         * frame's compute and fill are about to overwrite: write-after-read,
+         * so an execution dependency with no source access mask. */
         mem.srcStageMask |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
-                            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        mem.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mem.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
         mem.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+    if (desc->compute_to_transfer) {
+        mem.srcStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mem.dstStageMask |= VK_PIPELINE_STAGE_2_COPY_BIT;
+        mem.dstAccessMask |= VK_ACCESS_2_TRANSFER_READ_BIT;
     }
     const bool has_mem = mem.srcStageMask != 0;
     if (desc->image_count == 0 && !has_mem) return;
@@ -1691,6 +1712,51 @@ void vkmin_fill_buffer(vkmin_ctx *c, vkmin_buffer b, size_t offset, size_t bytes
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
     VKMIN_ASSERT(offset + bytes <= s->size, "fill overruns buffer");
     vkCmdFillBuffer(c->cmd[c->slot], c->arena_buf, s->offset + offset, bytes, value);
+}
+
+void vkmin_copy_to_ring(vkmin_ctx *c, vkmin_buffer src, size_t offset, size_t bytes, uint64_t ring_addr) {
+    VKMIN_ASSERT(c && c->in_frame && !c->in_pass, "vkmin_copy_to_ring: must be in a frame, outside a pass");
+    const buffer_slot *s = NULL;
+    VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, src.id, s);
+    VKMIN_ASSERT(offset + bytes <= s->size, "copy overruns source buffer");
+    VKMIN_ASSERT(ring_addr >= c->ring_addr && ring_addr + bytes <= c->ring_addr + c->ring_cap,
+                 "destination is not in the ring buffer");
+    /* This slot's ring bytes were written by the copy two frames ago and read
+     * by the host since. The fence orders that on the CPU; the device needs
+     * it said too, or the overwrite is an unordered write-after-write. */
+    const VkBufferMemoryBarrier2 to_device = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = c->ring_buf,
+        .offset = ring_addr - c->ring_addr,
+        .size = bytes,
+    };
+    const VkDependencyInfo dep_dev = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                      .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_device};
+    vkCmdPipelineBarrier2(c->cmd[c->slot], &dep_dev);
+    const VkBufferCopy copy = {.srcOffset = s->offset + offset, .dstOffset = ring_addr - c->ring_addr, .size = bytes};
+    vkCmdCopyBuffer(c->cmd[c->slot], c->arena_buf, c->ring_buf, 1, &copy);
+    /* Make the copy visible to the host read that happens after the fence. */
+    const VkBufferMemoryBarrier2 to_host = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+        .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = c->ring_buf,
+        .offset = ring_addr - c->ring_addr,
+        .size = bytes,
+    };
+    const VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                  .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host};
+    vkCmdPipelineBarrier2(c->cmd[c->slot], &dep);
 }
 
 void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {

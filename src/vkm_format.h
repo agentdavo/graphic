@@ -31,6 +31,7 @@ typedef struct {
     float bounds_min[3], bounds_max[3];
     float anim_duration;
     uint32_t reserved[5];
+    float skin_parent[16]; /* world transform of the root joint's parent node */
 } vkm_header;
 
 typedef struct {
@@ -70,7 +71,7 @@ typedef struct {
     float value[4];
 } vkm_key;
 
-_Static_assert(sizeof(vkm_header) == 96, "vkm_header");
+_Static_assert(sizeof(vkm_header) == 160, "vkm_header");
 _Static_assert(sizeof(vkm_texture) == 80, "vkm_texture");
 _Static_assert(sizeof(vkm_node) == 80, "vkm_node");
 _Static_assert(sizeof(vkm_joint) == 112, "vkm_joint");

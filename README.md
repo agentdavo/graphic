@@ -1,118 +1,172 @@
-# vkmin
+# vkmin v0.1 — a Doom 3-class world in a small C11 codebase
 
-An ultra-minimal Vulkan 1.3 layer in C11, whose entire purpose is to get pixels on screen and
-pixels into a PNG file with as little ceremony and as little hidden state as possible. The
-deliverable is a spinning textured cube: real vertex and index buffers, a sampled texture, and a
-per-frame transform driven by an integer frame index.
-
-It is not a renderer, an engine, or a framework.
-
-```
-make            # build
-make test       # golden-image harness, headless, works with no GPU
-make golden     # regenerate tests/golden
-make analyze    # second static analyser (cppcheck)
-```
+A Vulkan 1.3 renderer whose whole design is subtraction: no render passes, no
+framebuffers, no vertex input state, no per-draw descriptor binding, no
+material scripts, no runtime shader compilation, no allocator. What is left is
+one context, one device arena, one bindless texture set bound once per frame,
+nine pipelines created at init, and a frame that is a single function written
+in the order the GPU executes it:
 
 ```
-./build/cube --headless --frame 60 --out shot.png
-./build/cube --headless --frames 0,30,60,90 --out-dir shots/
-./build/cube                                    # windowed; F12 saves a numbered PNG, Esc quits
-./build/cube --scene clear|tri|cube|tex         # the four milestones
-./build/cube --sync-naive                       # the reference synchronisation path
+cull -> shadow atlas -> depth prepass -> light clusters
+     -> forward opaque -> forward transparent -> tonemap -> overlay
 ```
 
-## What it is made of
+The demo is **The Corridor**: a deterministic flythrough of Sponza with one sun
+(four cascades), sixty-four point lights on fixed orbits, three hundred
+instanced props, a skinned character on a loop, Sponza's own alpha-masked
+foliage, and two transparent panes. The camera rides a closed spline driven by
+the frame index and nothing else.
 
-| file | lines | what |
+```
+make                     # build everything: core, demo, tools
+make test                # golden-image harness under lavapipe; no GPU needed
+make golden              # regenerate tests/golden
+make analyze             # second static analyser (cppcheck)
+make SANITIZE=1 BUILD=build_san build_san/corridor    # ASan + UBSan build
+
+./build/corridor                                         # windowed; F1 debug views, Space pause, F12 save
+./build/corridor --headless --frame 240 --out shot.png   # exactly frame 240
+./build/corridor --headless --frames 0,120,240,360 --out-dir shots/
+./build/corridor --profile lavapipe --headless --frame 240 --out shot.png
+./build/corridor r_debug=2 r_shadows=0 r_gpu_cull=0      # any cvar as name=value
+./build/corridor --cvars                                 # list them all
+```
+
+## What is where
+
+| | lines | |
 | --- | --- | --- |
-| `src/vkmin.h` | 112 | the whole API |
-| `src/vkmin.c` | 1579 (1338 without comments and blanks) | the whole implementation |
-| `src/plat.h`, `src/plat_glfw.c` | 28 + 74 | platform surface and its GLFW backend |
-| `demo/cube.c`, `demo/mat4.h` | 307 + 95 | the demo and its (pure) maths |
-| `tools/`, `tests/` | ~300 | texture generator, image diff, solid-colour check, unit test |
+| `src/shared.h` | 252 | every struct that crosses the CPU/GPU boundary, compiled by C and GLSL |
+| `src/vkmin.h`, `src/vkmin.c` | 205 + 2036 | the GPU layer: device, arenas, ring, bindless, pipelines, recording, timestamps, readback |
+| `src/render.h`, `src/render.c` | 71 + 782 | the renderer: the frame, the shadow view builder, the transparent sort, the overlay layout |
+| `src/cvar.h`, `src/cvar.c` | ~110 | the flat tunable table |
+| `src/ktx2.c`, `src/scene.c`, `src/vkm_format.h` | ~200 | runtime loaders for the cooked assets |
+| `src/mat4.h`, `src/pack.h`, `src/plat*.c` | ~310 | pure maths, attribute packing, the GLFW backend |
+| `shaders/` | 563 | ten GLSL files, one shared preamble, one shared vertex fetch |
+| `demo/corridor.c`, `demo/anim.h` | 498 + 89 | the demo and its skeletal animation sampler |
+| `tools/cook.c`, `tools/cook_image.c` | ~800 | glTF → `.vkm` + BCn `.ktx2`, offline |
+| `tools/imgdiff.c`, `tools/mkfont.c`, … | | golden comparison, font baking, small checks |
 
-## The decisions worth knowing about
+Core (`src/`, excluding the baked font and the stb bridge) is **4056 lines**,
+about 3200 without comments and blanks. The budget was four to five thousand.
 
-**Vulkan 1.3 core, required rather than probed.** Dynamic rendering and `synchronization2` are
-demanded at init; a device without them fails loudly with a named reason. There is no
-`VkRenderPass` and no `VkFramebuffer` anywhere in the codebase, and no `if (extension_supported)`
-branch either. Every such branch avoided is a region of untested code that never exists.
+## The ten systems, and how each one is checked
 
-**Handles, not pointers.** Resources are 32-bit handles: a slot index plus a generation counter,
-with zero always invalid. A stale or garbage handle aborts with a message instead of aliasing a
-recycled slot. This deletes the null-pointer defect class from the API surface.
+**1. Memory and resources.** One device arena backs one `VkBuffer` for every
+buffer the renderer ever makes; a second arena holds every image; a
+persistently mapped host ring holds staging at init and per-frame data
+thereafter, one region per frame in flight. Bump allocation, nothing freed:
+running out is an init-time abort with the numbers in it. Handles are 20 bits
+of index and 12 of generation; every lookup checks both. Render targets are
+made once at the maximum size and a larger window is upscaled by the tonemap.
 
-**One descriptor set layout, one pipeline layout, and no per-frame descriptor churn.** Each image
-gets a descriptor set written once at creation. Pipelines that do not sample anything still bind
-a 1×1 white image, so there is no "does this pipeline have a texture" branch anywhere in the
-frame loop. The MVP travels in push constants; there is no uniform buffer.
+**2. Bindless texturing.** One descriptor set, one binding: a partially bound,
+update-after-bind array of 4096 combined image samplers, declared in GLSL as
+both `sampler2D` and `sampler2DShadow` over the same binding and indexed with
+`nonuniformEXT`. Bound once per frame to both bind points and never again.
+Five sampler presets; nothing outside `vkmin.c` sees a `VkSampler`.
 
-**Errors abort.** One `VK_CHECK` macro prints file, line, expression, and the stringified
-`VkResult`, then calls `abort()`. Nothing propagates error codes upward: a demo layer that cannot
-create a device has nothing useful to do with that information, and the plumbing would be a third
-of the code.
+**3. Compressed textures.** `tools/cook.c` writes BC1/BC3/BC5 KTX2 files with
+the full mip chain generated offline in linear light; `src/ktx2.c` reads them
+in one pass. The encoders were checked by cooking the numbered test grid and
+sampling it on the GPU (`tests/golden/smoke_bc1.png`).
 
-**Validation is fatal, in debug builds, and it is on by default.** Core validation *and*
-synchronization validation are enabled, and the debug callback aborts on anything at warning
-severity or above. Every Vulkan object is named, so a message reads `vkmin.cmd[0]` and
-`tests/assets/grid.png` rather than two hex handles.
+**4. Geometry.** One vertex arena, one index arena. A `Vertex` is 24 bytes:
+position, octahedral normal, octahedral tangent with the bitangent sign in its
+low bit, two half UVs. (The design note said twenty; twelve plus three fours is
+twenty-four.) Vertices are pulled by device address; there is no
+`VkPipelineVertexInputStateCreateInfo` in the codebase.
 
-**Determinism.** Nothing in the render path reads the wall clock or calls `rand()`. The animation
-is a pure function of an integer frame index at a fixed timestep, so `--frame 60` renders exactly
-frame 60 without simulating the fifty-nine before it, and re-running it produces bit-identical
-output. `make test` asserts that.
+**5. Instances and culling.** `cull.comp` tests every instance against every
+view in one dispatch and writes `VkDrawIndexedIndirectCommand` records into
+two lists per view (back-face culled, double-sided); each list is one
+`vkCmdDrawIndexedIndirectCount`. Two modes behind `r_cull_compact`: atomic
+append (fast) and stable slot-per-instance (fixed draw order, bit-exact
+goldens). `r_gpu_cull=0` is the CPU reference cull. `make test` requires all
+three to agree at tolerance 0, and at frame 240 they do.
 
-**The reference path stays.** `--sync-naive` uses one frame in flight and calls
-`vkDeviceWaitIdle` after every submit. It is slow on purpose and it is kept permanently: when
-something flickers, one flag says in ten seconds whether it is a synchronisation bug or a logic
-bug. `make test` renders the same frames both ways and requires bit-identical results.
+**6. Clustered forward lighting.** A 16×9×24 froxel grid filled by
+`cluster.comp`, one thread per cluster, no atomics. `r_clustered=0` is the
+brute-force reference (every light, every pixel); the harness requires the two
+to agree within 2/255. `r_debug=2` shows lights-per-cluster as a heat map.
 
-**No allocator, no runtime shader compilation.** One `VkDeviceMemory` per resource; the cube demo
-needs about eight and Vulkan guarantees 4096. (A suballocator would be a later parallel
-implementation, not a starting condition.) GLSL is compiled to SPIR-V by the build and embedded
-as `static const uint32_t[]`, so the binary is self-contained and has no file-path failure mode
-for shaders.
+**7. Shadows.** One depth atlas (4096², 1024² in the software profile). Sun
+cascades share quadrant 0; local lights get 512² tiles from the other three,
+ranked by projected size, six tiles for a point light, one for a spot. Shadow
+rendering reuses the indirect draw path with the depth-only pipelines. 3×3 PCF
+through the compare sampler, normal-offset plus slope-scaled bias. `r_debug=6`
+shows the raw atlas, `r_debug=3` colours by cascade.
 
-## The readback
+**8. Skinning.** Four joints per vertex in a parallel `SkinVertex` buffer, bone
+matrices in the ring, applied in the shared vertex fetch when the instance says
+so. CesiumMan runs its walk loop. The TODO for compute pre-skinning is in
+`shaders/scene_vertex.glsl`, where it will be read.
 
-Every frame copies its colour target into a host-visible, host-coherent buffer inside its own
-command buffer, before presenting, whether or not anyone will ask for a PNG. `vkmin_save_png`
-then waits on that frame's fence and writes the mapping. This is the execute-then-inhibit
-pattern: it costs a full-target copy per frame and buys one execution path for headless and
-windowed alike, plus — decisively — a capture that never reads a swapchain image after it has
-been handed to the presentation engine.
+**9. Transparency and post.** Blend materials are sorted back to front on the
+CPU (stable, deterministic) and drawn with the same shader through a blending
+pipeline. The frame renders into `B10G11R11_UFLOAT` and one full-screen pass
+tonemaps (ACES fit, Reinhard, or clamp) and sRGB-encodes onto the backbuffer.
 
-That last point was not a design insight, it was a bug report. The first version copied at save
-time under a `vkDeviceWaitIdle`, which does not cover the presentation engine; synchronization
-validation reported `SYNC-HAZARD-WRITE-AFTER-PRESENT`. The fix then produced
-`SYNC-HAZARD-WRITE-AFTER-WRITE` between frames sharing one readback buffer, which is why there is
-now one buffer per frame in flight and an explicit barrier ordering each overwrite against the
-host's read of it. Both were found by a tool, in the normal course of running the tests, which is
-the entire argument for having the tool switched on.
+**10. Overlay and instrumentation.** GPU timestamps bracket every pass and the
+overlay shows them per frame together with draw counts (read back one frame
+late through the ring), view and light counts, memory use, and every cvar that
+differs from its default. The font is baked at build time from a system TTF
+and committed as `src/font.h`, so the binary has nothing to fail to find.
 
-Swapchain images are usually BGRA (lavapipe hands us `B8G8R8A8_UNORM`); the swizzle happens on
-the CPU during the copy out rather than in a blit pipeline.
+## Validation is fatal, and it earned its keep
 
-## Deviations from the brief, stated plainly
+Core validation and synchronization validation are on in debug builds; the
+callback aborts at warning severity, and every object is named so the message
+says `vkmin.cmd[1]` or `vkr.shadow_atlas`, not a hex handle. Every windowed
+variant in `tests/run_tests.sh` runs two frames in flight under both.
 
-- **The platform layer is eight functions, not five.** Surface creation, framebuffer size and key
-  edges cannot be expressed in terms of the other five and every backend has to provide them.
-  No backend types appear in `vkmin.h` or `plat.h`.
-- **The readback does not call `vkGetImageSubresourceLayout`.** That function describes a linear
-  image's own memory; the copy here goes image → buffer, where `bufferRowLength = 0` means
-  tightly packed at the image width. The pitch is still computed in one named variable and passed
-  explicitly to the PNG writer rather than assumed, because a wrong pitch here is the classic
-  silent shear.
-- **`--exit-after N` was added to the demo** so the windowed swapchain path can be run under a
-  virtual display in CI instead of only believed to work.
-- **`vkmin_size` was added to the API.** Without it the demo computes its aspect ratio from the
-  size it requested at init, which is wrong the moment a window is resized.
+Synchronization validation found five real defects during this work, all in
+frame-to-frame hazards that a single-frame test can never see: the backbuffer
+losing its readback copy as a source scope; a draw-count fill racing the
+previous frame's indirect read (syncval files `vkCmdFillBuffer` under COPY,
+the spec under CLEAR — the barrier now names all transfer stages); the same
+fill racing the previous frame's count-readback copy; the count readback
+overwriting its own ring bytes two frames apart; and, in v0.0, a swapchain
+image read after present. Each fix is a comment at the barrier it changed.
 
-## Things deliberately not done
+## Determinism
 
-No suballocator. No resource destruction API — everything a demo makes lives until
-`vkmin_shutdown`; when a free path arrives it must bump the slot's generation or handles to freed
-slots will silently alias their replacements (there is a comment where that goes). No MSAA, no
-mipmaps, no blending, no second window, no compute. Removing any of them would not make the cube
-demo impossible, and adding them would.
+Nothing in the render path reads a clock or calls `rand()`. `--frame N` renders
+frame N without simulating the frames before it. `make test` renders frame 240
+twice and requires bit-identical output, and requires `--sync-naive` (one frame
+in flight, wait idle per submit) to match the two-frames-in-flight path
+exactly. Headless overlays omit timings for the same reason.
+
+Golden images are rendered under `--profile lavapipe` (320×180, 8 lights, one
+cascade, 1024 atlas, no transparents, no overlay) at frames 0, 120, 240, 360,
+one process per frame, compared at 2/255 per channel with a diff image written
+beside any failure. Under lavapipe this manages about five frames a second,
+which is what it is for.
+
+## Deviations from the design note, stated plainly
+
+- **The vertex is 24 bytes, not 20** — see system 4.
+- **Instances, lights and bones are re-uploaded every frame** through the host
+  ring rather than living in device memory and being patched. At this scene's
+  size that is ~80 KB a frame and it keeps "who owns what moves" trivially
+  clear; the device-local variant is a later parallel implementation.
+- **The forward pipelines use `LESS_EQUAL` with depth write on** rather than
+  `EQUAL` after the prepass, so the same pipelines are correct with the prepass
+  off. `r_prepass=0` is a live switch.
+- **Overdraw visualisation reuses the blend pipeline** with the prepass
+  disabled rather than adding a pipeline.
+- **Point-light and spot shadow biases are fixed fractions of the light
+  radius**, not derived per texel as the cascades' are. Good enough at this
+  scale; the atlas view will show when it is not.
+- **The KTX2 data-format descriptor is nominal.** It is well formed and our
+  reader ignores it; a stricter external tool may want more.
+- **Assets are committed cooked** (24 MB), so `make test` needs no network.
+
+## Not done, and known
+
+No compute pre-skinning, no light or instance culling for the shadow views
+beyond frustum tests, no cascade blending at split boundaries, no texture
+streaming, no resize of render targets (a larger window is upscaled). Removing
+any of these would not have made the demo impossible; adding them would have
+pushed the core past its budget.

@@ -65,7 +65,7 @@ static cook_rgba downsample(const cook_rgba *src, int srgb, int normal_map) {
             }
             uint8_t *o = out.px + ((size_t)y * out.w + x) * 4;
             if (normal_map) {
-                float n[3] = {acc[0] * 0.5f - 1.0f, acc[1] * 0.5f - 1.0f, acc[2] * 0.5f - 1.0f};
+                const float n[3] = {acc[0] * 0.5f - 1.0f, acc[1] * 0.5f - 1.0f, acc[2] * 0.5f - 1.0f};
                 const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
                 for (int k = 0; k < 3; ++k) acc[k] = len > 0 ? (n[k] / len * 0.5f + 0.5f) * 4.0f : acc[k];
             }
@@ -303,7 +303,7 @@ void cook_image_write_ktx2(const cook_rgba *src, cook_bc_format fmt, int max_siz
     fputc(3, f); fputc(3, f); fputc(0, f); fputc(0, f);                  /* texel block 4x4 (stored minus one) */
     fputc((int)((samples == 2 ? 16 : 8)), f); for (int i = 0; i < 7; ++i) fputc(0, f); /* bytes per plane */
     for (uint32_t s = 0; s < samples; ++s) {
-        put32(f, (63u << 0) | (0u << 16) | (0u << 24)); /* bit offset 0, length 64, channel 0 */
+        put32(f, 63u); /* bit offset 0, bit length 64 (stored minus one), channel 0 */
         put32(f, 0); put32(f, 0); put32(f, 0xffffffffu);   /* sample position, lower, upper */
     }
     for (uint64_t pos = dfd_offset + dfd_bytes; pos < data_offset; ++pos) fputc(0, f);

@@ -14,6 +14,7 @@
 #include "cgltf.h"
 
 #include "cook_image.h"
+#include "pack.h"
 #include "vkm_format.h"
 
 #include <math.h>
@@ -29,43 +30,6 @@
         fputc('\n', stderr);                                                      \
         exit(1);                                                                  \
     } while (0)
-
-/* ------------------------------------------------------------ packing ----- */
-
-static uint32_t pack_snorm16x2(float x, float y) {
-    const int32_t ix = (int32_t)lroundf(fmaxf(-1.0f, fminf(1.0f, x)) * 32767.0f);
-    const int32_t iy = (int32_t)lroundf(fmaxf(-1.0f, fminf(1.0f, y)) * 32767.0f);
-    return ((uint32_t)(uint16_t)iy << 16) | (uint32_t)(uint16_t)ix;
-}
-
-/* Octahedral encoding, the mirror of oct_decode in shaders/common.glsl. */
-static uint32_t oct_encode(float x, float y, float z) {
-    const float l1 = fabsf(x) + fabsf(y) + fabsf(z);
-    if (l1 == 0.0f) return pack_snorm16x2(0.0f, 0.0f);
-    float ex = x / l1, ey = y / l1;
-    if (z < 0.0f) {
-        const float ox = (1.0f - fabsf(ey)) * (ex >= 0.0f ? 1.0f : -1.0f);
-        const float oy = (1.0f - fabsf(ex)) * (ey >= 0.0f ? 1.0f : -1.0f);
-        ex = ox;
-        ey = oy;
-    }
-    return pack_snorm16x2(ex, ey);
-}
-
-static uint16_t float_to_half(float f) {
-    uint32_t x;
-    memcpy(&x, &f, 4);
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = x & 0x7fffffu;
-    if (exp <= 0) return (uint16_t)sign; /* flush tiny to zero: UVs never need denormals */
-    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
-}
-
-static uint32_t pack_half2(float u, float v) {
-    return ((uint32_t)float_to_half(v) << 16) | float_to_half(u);
-}
 
 /* ------------------------------------------------------- growable arrays -- */
 
@@ -100,6 +64,7 @@ typedef struct {
     int *image_kind;         /* what the first material to use it thinks it is */
     float bmin[3], bmax[3];
     float anim_duration;
+    float skin_parent[16];
     const char *out_dir;
     int max_size;
 } cook_state;
@@ -318,7 +283,7 @@ static void cook_primitive(cook_state *st, const cgltf_data *data, const cgltf_p
         if (nl > 0) for (int k = 0; k < 3; ++k) n[k] /= nl;
         if (tl > 0) for (int k = 0; k < 3; ++k) t[k] /= tl;
         Vertex v = {.px = p[0], .py = p[1], .pz = p[2], .normal = oct_encode(n[0], n[1], n[2]),
-                    .tangent = (oct_encode(t[0], t[1], t[2]) & ~1u) | (raw[i].t[3] < 0.0f ? 1u : 0u),
+                    .tangent = pack_tangent(t[0], t[1], t[2], raw[i].t[3]),
                     .uv = pack_half2(raw[i].uv[0], raw[i].uv[1])};
         PUSH(st->verts, v);
         if (skinned) {
@@ -380,14 +345,19 @@ static void cook_skin(cook_state *st, const cgltf_data *data) {
     if (data->skins_count == 0) return;
     if (data->skins_count > 1) fprintf(stderr, "cook: %zu skins; only the first is cooked\n", data->skins_count);
     const cgltf_skin *skin = &data->skins[0];
+    /* Joint globals are built from the joint hierarchy alone at runtime, so
+     * whatever sits above the root joint (an armature node, an axis fix-up)
+     * has to travel with the file. */
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    memcpy(st->skin_parent, identity, sizeof identity);
     for (size_t j = 0; j < skin->joints_count; ++j) {
         const cgltf_node *n = skin->joints[j];
+        if (joint_of_node(skin, n->parent) < 0 && n->parent) cgltf_node_transform_world(n->parent, st->skin_parent);
         vkm_joint out = {.parent = n->parent ? joint_of_node(skin, n->parent) : -1,
                          .rest_t = {0, 0, 0}, .rest_r = {0, 0, 0, 1}, .rest_s = {1, 1, 1}};
         if (skin->inverse_bind_matrices) {
             cgltf_accessor_read_float(skin->inverse_bind_matrices, j, out.inverse_bind, 16);
         } else {
-            const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
             memcpy(out.inverse_bind, identity, sizeof identity);
         }
         if (n->has_matrix) fprintf(stderr, "cook: joint %zu uses a matrix, not TRS; rest pose will be identity\n", j);
@@ -438,7 +408,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     cook_state st = {.out_dir = argv[2], .max_size = 512,
-                     .bmin = {1e30f, 1e30f, 1e30f}, .bmax = {-1e30f, -1e30f, -1e30f}};
+                     .bmin = {1e30f, 1e30f, 1e30f}, .bmax = {-1e30f, -1e30f, -1e30f},
+                     .skin_parent = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}};
     for (int i = 3; i < argc; ++i) {
         if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) st.max_size = atoi(argv[++i]);
     }
@@ -467,6 +438,7 @@ int main(int argc, char **argv) {
         .channel_count = (uint32_t)st.channels.n, .key_count = (uint32_t)st.keys.n,
         .anim_duration = st.anim_duration,
     };
+    memcpy(h.skin_parent, st.skin_parent, sizeof h.skin_parent);
     memcpy(h.bounds_min, st.bmin, sizeof h.bounds_min);
     memcpy(h.bounds_max, st.bmax, sizeof h.bounds_max);
     char path[1024];

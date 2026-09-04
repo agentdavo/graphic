@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
     for (int frame = 0; frame < 3; ++frame) {
         vkmin_frame_begin(c);
         vkmin_timestamp(c, 0);
-        vkmin_barrier(c, &(vkmin_barrier_desc){.graphics_to_compute = true});
+        vkmin_barrier(c, &(vkmin_barrier_desc){.frame_start = true});
         vkmin_bind_pipeline(c, fill);
         vkmin_push(c, &(Push){.aux = vkmin_buffer_addr(c, verts)});
         vkmin_dispatch(c, 1, 1, 1);

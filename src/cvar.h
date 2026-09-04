@@ -28,12 +28,14 @@
     X(r_clustered, 1.0f, "1: clustered light lists, 0: brute force every light")     \
     X(r_prepass, 1.0f, "depth prepass before the forward pass")                      \
     X(r_gpu_cull, 1.0f, "1: compute culling, 0: CPU-written draw list (reference)")  \
+    X(r_cull_compact, 1.0f, "1: atomic append (fast), 0: stable slot per instance")   \
+    X(r_shadow_distance, 40.0f, "far end of the sun cascades, world units")           \
     X(r_transparent, 1.0f, "render the sorted transparent pass")                     \
     X(r_overlay, 1.0f, "draw the stats overlay")                                     \
     X(r_debug, 0.0f, "0 off 1 normals 2 clusters 3 cascades 4 overdraw 5 albedo 6 atlas") \
     X(r_freeze_cull, 0.0f, "cull against the frozen camera, render from the live one") \
     X(r_max_lights, 256.0f, "cap on lights uploaded this frame")                     \
-    X(r_ambient, 0.03f, "ambient radiance")                                          \
+    X(r_ambient, 0.10f, "ambient radiance")                                          \
     X(r_sun_intensity, 5.0f, "sun radiance multiplier")                              \
     X(r_sync_naive, 0.0f, "one frame in flight and wait idle per submit")            \
     X(r_vsync, 1.0f, "FIFO present mode when 1, immediate/mailbox when 0")           \
@@ -50,7 +52,8 @@ float cvar_get(cvar_id id);
 bool cvar_get_bool(cvar_id id);
 int cvar_get_int(cvar_id id);
 void cvar_set(cvar_id id, float value);
-bool cvar_is_overridden(cvar_id id);
+bool cvar_is_overridden(cvar_id id); /* value differs from the default */
+bool cvar_was_set(cvar_id id);       /* explicitly assigned, even to the default value */
 const char *cvar_name(cvar_id id);
 
 /* Parses "name=value" or "+name value" forms. Returns false on an unknown
