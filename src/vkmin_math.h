@@ -284,4 +284,17 @@ static inline vkmin_tick vkmin_ticks_for_frame(uint32_t frame, uint32_t hz) {
     return (vkmin_tick){.ticks = (uint32_t)(scaled / 60u), .alpha = (float)(scaled % 60u) / 60.0f};
 }
 
+/* Deterministic scalar sine in cycles, for authored animation and DSP.
+ * Precondition: finite input with magnitude < 2^30. Compile without fast-math
+ * or FP contraction when bit equality matters. Approximation, not libm sin. */
+static inline float vkmin_sin_cycles(float cycles) {
+    cycles-=(float)(int)cycles; if (cycles<0) cycles+=1;
+    float x=cycles*6.28318530718f;
+    if (x>3.14159265359f) x-=6.28318530718f;
+    if (x>1.57079632679f) x=3.14159265359f-x;
+    if (x< -1.57079632679f) x= -3.14159265359f-x;
+    const float q=x*x;
+    return x*(1+q*(-0.16666667f+q*(0.008333333f+q*(-0.0001984127f+q*0.00000275573f))));
+}
+
 #endif /* VKMIN_MATH_H */

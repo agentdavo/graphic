@@ -1,4 +1,19 @@
-# vkmin v0.5 — outside
+# vkmin / sndmin — v0.6 integration candidate
+
+Two C11 libraries, one integer simulation timeline and one shared replay file.
+The valley now advances every audio tick even when images are skipped. Its
+two-minute ambient score uses three public synth patches. A small
+[public API example](examples/sndmin/06_unison.c) demonstrates matching audio and
+image cues, pause, mute and restart. Audio builds without Vulkan or a sound card:
+`make -f Makefile.sndmin sndmin-test`.
+
+This candidate adds persistent literal bus gains, transactional song loading,
+audio journal compatibility checks and a fix for unnamed rendering passes under
+Vulkan validation. See the [integration report and remaining gates](docs/v0.6-integration.md),
+[audio usage](docs/using-sndmin.md) and [review plan](docs/v0.6-review.md).
+Existing Corridor golden failures remain open; this is not full release acceptance.
+
+## vkmin v0.5 — outside
 
 The valley demo combines terrain LOD, GPU scatter, grass patches, foliage and
 impostors, shared wind, an analytic sky, atmospheric perspective, river water,

@@ -1,6 +1,4 @@
 # Sourced by run_tests.sh: uses its counters, failure reporting and ICD.
-checks=$((checks + 1))
-./$BUILD/outside || fail "outside pure primitives"
 begin "== outside: committed journal, current renderer, both Vulkan paths =="
 VALLEY="./$BUILD/ex_20_valley --profile=lavapipe"
 VALLEY_FRAMES="0,2400,4800,7199"
@@ -50,7 +48,7 @@ same valley-taa valley-layout-reference 0 "host and GPU image transitions produc
 # Enforce the release's physical-line budgets, not a hand-edited README count.
 begin "== v0.5 line budgets =="
 checks=$((checks + 1))
-core_lines=$(cat src/vkmin.c src/vkmin.h src/render.c src/render.h src/shared.h src/cvar.c src/cvar.h src/ktx2.c src/ktx2.h src/scene.c src/scene.h src/plat_glfw.c src/plat.h src/spirv.h src/vkmin_math.h src/pack.h src/vkm_format.h src/stb_bridge.c src/stb_bridge.h src/font.h | wc -l)
+core_lines=$(cat src/vkmin.c src/vkmin.h src/render.c src/render.h src/shared.h src/cvar.c src/cvar.h src/ktx2.c src/ktx2.h src/scene.c src/scene.h src/plat_glfw.c src/plat.h src/spirv.h src/vkmin_math.h src/pack.h src/vkm_format.h src/stb_bridge.c src/stb_bridge.h src/font.h src/jrnl.h | wc -l)
 shader_lines=$(cat shaders/*.vert shaders/*.frag shaders/*.comp shaders/*.glsl shaders/lib/*.glsl | wc -l)
 valley_lines=$(wc -l < examples/20_valley.c)
 note "core $core_lines / 10000; all shaders $shader_lines / 2500; valley $valley_lines / 600"

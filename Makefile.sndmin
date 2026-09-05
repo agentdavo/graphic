@@ -1,0 +1,93 @@
+# Standalone audio build: no Vulkan SDK, GLFW, shaders or sound card required.
+CC ?= cc
+AR ?= ar
+SND_BUILD ?= build/sndmin
+OPT ?= -O2 -g
+ANALYZER ?= -fanalyzer
+SND_WARN = -std=c11 -Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes \
+ -Wmissing-prototypes -Wold-style-definition -Wvla -Wpointer-arith -Wundef \
+ -Wformat=2 -Wdouble-promotion -Wwrite-strings -Wcast-align -Winit-self -Wredundant-decls
+SND_FLAGS = $(OPT) $(SND_WARN) $(ANALYZER) -ffp-contract=off -fno-fast-math -Isrc -Ithird_party -MMD -MP -MT $@
+SND_CORE = $(addprefix $(SND_BUILD)/,sndmin.o sndmin_acoustics.o sndmin_song.o sndmin_output.o)
+SND_OBJECTS = $(SND_CORE) $(SND_BUILD)/sndmin_io.o
+SND_WRAP = malloc calloc realloc free fopen fread fwrite fclose clock
+SND_WRAP_FLAGS = $(foreach name,$(SND_WRAP),-Wl,--wrap=$(name))
+SND_NAMES = 01_beep 02_song 03_room 04_valley 05_ambience 06_unison
+SND_EXAMPLES = $(addprefix $(SND_BUILD)/,$(SND_NAMES))
+SND_LIBS = -lm
+ifeq ($(OS),Windows_NT)
+SND_LIVE_LIBS = -lole32 -luuid -lwinmm -lavrt
+else ifeq ($(shell uname -s),Darwin)
+SND_LIVE_LIBS = -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -lpthread
+else
+SND_LIVE_LIBS = -ldl -lpthread
+endif
+.PHONY: sndmin sndmin-test sndmin-golden sndmin-analyze sndmin-live sndmin-render-test sndmin-threads sndmin-bench
+sndmin: $(SND_BUILD)/libsndmin.a $(SND_EXAMPLES) $(SND_BUILD)/test
+$(SND_BUILD):
+	mkdir -p $@
+$(SND_BUILD)/%.o: src/%.c | $(SND_BUILD)
+	$(CC) $(SND_FLAGS) -c $< -o $@
+$(SND_BUILD)/sndmin_io.o: src/sndmin_io.c | $(SND_BUILD)
+	$(CC) -std=c11 $(OPT) -ffp-contract=off -fno-fast-math -Isrc -Ithird_party -w -c $< -o $@
+$(SND_BUILD)/sndmin_miniaudio.o: src/sndmin_miniaudio.c | $(SND_BUILD)
+	$(CC) -std=c11 $(OPT) -Isrc -Ithird_party -w -c $< -o $@
+$(SND_BUILD)/libsndmin.a: $(SND_OBJECTS)
+	$(AR) rcs $@ $^
+$(SND_EXAMPLES): $(SND_BUILD)/%: examples/sndmin/%.c examples/sndmin/demo.h $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(SND_LIBS) -o $@
+$(SND_BUILD)/05_ambience: demo/valley_score.h
+$(SND_BUILD)/test: tests/sndmin.c $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(SND_LIBS) -o $@
+$(SND_BUILD)/thread-test: tests/sndmin_threads.c $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(SND_LIBS) -pthread -o $@
+sndmin-threads: $(SND_BUILD)/thread-test
+	$(SND_BUILD)/thread-test
+$(SND_BUILD)/bench: tests/sndmin_bench.c $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(SND_LIBS) -o $@
+sndmin-bench: $(SND_BUILD)/bench
+	$(SND_BUILD)/bench
+sndmin-analyze:
+	cppcheck --std=c11 --enable=warning,style,performance,portability --error-exitcode=1 --quiet \
+	 --suppress=missingIncludeSystem --suppress=missingInclude -Isrc \
+	 src/sndmin.c src/sndmin_acoustics.c src/sndmin_song.c src/sndmin_output.c src/sndmin_null.c tests/sndmin.c tests/sndmin_api.c tests/sndmin_threads.c tests/sndmin_bench.c examples/sndmin
+sndmin-test: sndmin-render-test sndmin-analyze sndmin-threads
+# Separate from interposition: sanitizer builds must generate every fresh input.
+sndmin-render-test: sndmin
+	mkdir -p tests/out/sndmin
+	$(SND_BUILD)/test
+	$(foreach name,$(SND_NAMES),$(SND_BUILD)/$(name) tests/out/sndmin/$(name) && ) true
+	python tools/test_sndmin.py $(SND_BUILD)
+	python tools/test_valley_score.py $(SND_BUILD)
+	$(SND_BUILD)/api-test
+	$(SND_BUILD)/test --replay tests/out/sndmin/api.jrnl 8 tests/out/sndmin/api-replay.wav
+	cmp tests/out/sndmin/api.wav tests/out/sndmin/api-replay.wav
+	python tools/test_unison.py $(SND_BUILD)
+sndmin-render-test: $(SND_BUILD)/api-test $(SND_BUILD)/api-headers.o
+$(SND_BUILD)/api-test: tests/sndmin_api.c $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(SND_LIBS) -o $@
+$(SND_BUILD)/api-headers.o: tests/sndmin_api.c | $(SND_BUILD)
+	$(CC) $(SND_FLAGS) -DAUDIO_HEADER_FIRST -c $< -o $@
+ifeq ($(findstring clang,$(CC)),)
+ifneq ($(shell uname -s 2>/dev/null),Darwin)
+sndmin-test: sndmin-guard
+endif
+endif
+.PHONY: sndmin-guard
+sndmin-guard: $(SND_BUILD)/guard-test
+	mkdir -p tests/out/sndmin
+	$(SND_BUILD)/guard-test
+	python tools/check_sndmin_callback.py $(SND_BUILD)/sndmin_guarded.c.000i.cgraph
+$(SND_BUILD)/sndmin_guarded.o: src/sndmin.c | $(SND_BUILD)
+	$(CC) $(SND_FLAGS) -fno-builtin -DSNDMIN_TEST_GUARD -fdump-ipa-cgraph -c $< -o $@
+$(SND_BUILD)/guard-test: tests/sndmin.c tests/sndmin_guard.c $(SND_BUILD)/sndmin_guarded.o $(filter-out $(SND_BUILD)/sndmin.o,$(SND_OBJECTS)) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(SND_FLAGS) -fno-builtin -DSNDMIN_TEST_GUARD tests/sndmin.c tests/sndmin_guard.c $(SND_BUILD)/sndmin_guarded.o $(filter-out $(SND_BUILD)/sndmin.o,$(SND_OBJECTS)) $(SND_BUILD)/sndmin_null.o $(SND_WRAP_FLAGS) $(SND_LIBS) -o $@
+sndmin-golden: sndmin
+	mkdir -p tests/out/sndmin tests/golden/sndmin
+	$(foreach name,$(SND_NAMES),$(SND_BUILD)/$(name) tests/out/sndmin/$(name) && ) true
+	python tools/test_sndmin.py $(SND_BUILD) --write-golden
+	python tools/test_valley_score.py $(SND_BUILD) --write-golden
+sndmin-live: $(SND_BUILD)/live
+$(SND_BUILD)/live: examples/sndmin/live.c $(SND_OBJECTS) $(SND_BUILD)/sndmin_miniaudio.o
+	$(CC) $(SND_FLAGS) $< $(SND_OBJECTS) $(SND_BUILD)/sndmin_miniaudio.o $(SND_LIBS) $(SND_LIVE_LIBS) -o $@
+-include $(wildcard $(SND_BUILD)/*.d)

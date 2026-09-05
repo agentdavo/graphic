@@ -52,12 +52,23 @@ endif
 EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
 
 all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
+include Makefile.sndmin
+all: sndmin
+test: sndmin-test $(BUILD)/sndmin_valley
+test: $(BUILD)/sndmin_unison
+$(BUILD)/sndmin_unison: examples/sndmin/06_unison.c examples/sndmin/demo.h $(CORE_OBJS) $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(CFLAGS) -ffp-contract=off -DSNDMIN_VIDEO -o $@ $< $(CORE_OBJS) $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(LDLIBS) $(GLFW_LIBS)
+.PHONY: sndmin-valley
+sndmin-valley: $(BUILD)/sndmin_valley
+$(BUILD)/sndmin_valley: examples/20_valley.c demo/valley_audio.h demo/valley_score.h $(BUILD)/shaders.h $(CORE_OBJS) $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o
+	$(CC) $(CFLAGS) -ffp-contract=off -DSNDMIN_VALLEY -Iexamples -o $@ $< $(CORE_OBJS) $(SND_OBJECTS) $(SND_BUILD)/sndmin_null.o $(LDLIBS) $(GLFW_LIBS)
 # Keep transitive includes honest, including standalone tools and examples.
 # This follows the default target so dependency files cannot change it.
 -include $(wildcard $(BUILD)/*.d)
 tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles $(BUILD)/spirv_test $(BUILD)/layout.comp.spv $(BUILD)/lifecycle $(BUILD)/heightfield
 tools: $(BUILD)/reload $(BUILD)/reload.frag.spv $(BUILD)/journal
 tools: $(BUILD)/outside
+
 $(BUILD)/outside: tests/outside.c tests/process.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
@@ -178,7 +189,7 @@ validate-shaders: $(SPV) $(BUILD)/layout.comp.spv $(BUILD)/reload.frag.spv
 # The single-header form is generated, never edited, and must compile alone.
 .PHONY: amalgamate
 amalgamate: $(BUILD)/vkmin_single.h
-$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/spirv.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
+$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/spirv.h src/jrnl.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
 	./tools/amalgamate.sh > $@
 $(BUILD)/amalg_check: $(BUILD)/vkmin_single.h tests/amalg_check.c
 	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function $(INCLUDES) $(filter -DVKMIN_NO_PLATFORM,$(CFLAGS)) -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
@@ -193,7 +204,7 @@ analyze:
 	cppcheck --std=c11 --enable=warning,style,performance,portability \
 	    --inline-suppr --error-exitcode=1 --quiet \
 	    --suppress=missingIncludeSystem --suppress=missingInclude \
-	    -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c -UVKMIN_NO_PLATFORM \
+        -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c -i src/sndmin_io.c -i src/sndmin_miniaudio.c -UVKMIN_NO_PLATFORM \
 	    src demo tools tests examples
 
 clean:

@@ -111,6 +111,7 @@ typedef struct {
     size_t device_arena_bytes;    /* 0 = 256 MB */
     size_t host_ring_bytes;       /* 0 = 64 MB */
     bool history;                /* render preceding frames for --frame/--frames; set before init */
+    FILE *journal;               /* borrowed jrnl.h stream, shared with audio; 0 = disabled */
 } vkmin_desc;
 
 typedef struct {
@@ -167,7 +168,7 @@ typedef struct {
     bool clear_color; float clear[4];
     bool clear_depth;             /* to 1.0 */
     int x, y, w, h;               /* render area; w == 0 = whole image */
-    const char *label;            /* debug label; 0 = none */
+    const char *label;            /* debug label; 0 = "vkmin.pass" */
 } vkmin_pass_desc;
 
 typedef struct { vkmin_image image; vkmin_use use; } vkmin_transition;
@@ -217,9 +218,11 @@ _Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...); // 
 /* The loop:  while (vkmin_running(ctx)) { f = vkmin_frame_begin(ctx, clear); ... vkmin_frame_end(ctx); }
  * running polls the window and the demo file and decides the next frame;
  * false ends the loop: window closed, --exit-after reached, every --frame
- * rendered, demo finished. frame_begin then opens the frame (with a clear,
- * also the default pass: backbuffer + depth) and returns everything the
- * frame may read from outside. frame_end submits and saves --out if asked. */
+ * rendered, demo finished. frame_begin then opens the frame. A non-NULL clear
+ * also opens the default pass (backbuffer + depth); NULL opens no pass, so
+ * call pass_begin yourself after gathering this frame's input. It returns everything the
+ * frame may read from outside. frame_end closes only the default pass, then
+ * submits and saves --out if asked. Explicit passes require pass_end first. */
 bool vkmin_running(vkmin_ctx *);                                             // writes ctx, io
 vkmin_frame vkmin_frame_begin(vkmin_ctx *, const vkmin_clear *clear);        // writes ctx, gpu, io
 void vkmin_frame_end(vkmin_ctx *);                                           // writes ctx, gpu, io

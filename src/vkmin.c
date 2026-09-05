@@ -9,8 +9,7 @@
 #include "pack.h"
 #include "plat.h"
 #include "stb_bridge.h"
-#include "vkmin_math.h"
-#include "spirv.h"
+#include "jrnl.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -199,6 +198,7 @@ struct vkmin_ctx {
      * inside other public calls, so each record is one call the program made. */
     FILE *rec;
     int rec_depth;
+    bool rec_shared;
     bool replaying;
     uint64_t rec_arena_base, rec_ring_base; /* bases in the recording being replayed */
     VkDeviceSize ring_issued[256];          /* ring offsets handed out this frame */
@@ -363,8 +363,8 @@ enum { JOURNAL_VERSION = 4 }; /* v4 adds pipeline replacement; the reader also a
 enum { RELOC_ARENA = 1, RELOC_RING = 2, VKMIN_MAX_RELOCS = 4096 };
 
 typedef struct { uint32_t magic, version, width, height; uint64_t arena_base, ring_base; } journal_header;
-typedef struct { uint32_t op, hdr_bytes, data_bytes, reloc_count; } record_header;
-typedef struct { uint32_t offset; uint32_t kind; } reloc;
+typedef jrnl_record record_header;
+typedef jrnl_reloc reloc;
 /* Fixed-size mirrors of the descs, with strings copied and pointers dropped. */
 typedef struct { uint64_t size; uint32_t result, has_data; char label[VKMIN_LABEL]; } rec_buffer;
 typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; } rec_image;
@@ -408,14 +408,17 @@ static int scan_relocs(const vkmin_ctx *c, const void *data, size_t bytes, reloc
 }
 
 static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr_bytes, const void *data, size_t data_bytes) {
-    if (!c->rec || c->rec_depth > 0) return;
+    if ((!c->rec && !c->rec_shared) || c->rec_depth > 0) return;
     VKMIN_ASSERT(hdr_bytes <= 256 && data_bytes <= (512u << 20), "journal record exceeds reader limits");
     static reloc relocs[VKMIN_MAX_RELOCS];
     const int n = data ? scan_relocs(c, data, data_bytes, relocs, VKMIN_MAX_RELOCS) : 0;
     const record_header rh = {op, (uint32_t)hdr_bytes, (uint32_t)data_bytes, (uint32_t)n};
-    const bool ok = fwrite(&rh, sizeof rh, 1, c->rec) == 1 && (hdr_bytes == 0 || fwrite(hdr, hdr_bytes, 1, c->rec) == 1) &&
-                    (data_bytes == 0 || fwrite(data, data_bytes, 1, c->rec) == 1) &&
-                    (n == 0 || fwrite(relocs, sizeof relocs[0], (size_t)n, c->rec) == (size_t)n);
+    bool ok = !c->rec || jrnl_record_write(c->rec, &rh, hdr, data, relocs);
+    if (c->rec_shared) {
+        const uint32_t bytes = (uint32_t)(sizeof rh + hdr_bytes + data_bytes + (size_t)n*sizeof *relocs);
+        ok = ok && jrnl_begin(c->desc.journal, (jrnl_packet){JRNL_VIDEO,c->frame_index,bytes}) &&
+            jrnl_record_write(c->desc.journal, &rh, hdr, data, relocs);
+    }
     VKMIN_ASSERT(ok, "journal write failed");
 }
 #define RECORD(c, op, hdr, data, bytes) journal_write((c), (op), &(hdr), sizeof(hdr), (data), (bytes))
@@ -1507,7 +1510,7 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     if (!cvar_get_bool(CV_r_readback)) c->desc.no_readback = true;
     c->desc.vsync = cvar_get_bool(CV_r_vsync);
     if (c->replay_path) { /* the recording decides the size */
-        FILE *f = fopen(c->replay_path, "rb");
+        FILE *f = jrnl_stream_open(c->replay_path, JRNL_VIDEO);
         journal_header jh;
         VKMIN_ASSERT(f && fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u, "cannot read journal '%s'", c->replay_path);
         fclose(f);
@@ -1620,6 +1623,11 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
         VKMIN_ASSERT(fwrite(&jh, sizeof jh, 1, c->rec) == 1, "journal write failed");
         fprintf(stderr, "vkmin: recording to %s\n", c->record_path);
+    }
+    if (c->desc.journal) {
+        const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
+        VKMIN_ASSERT(jrnl_write(c->desc.journal,(jrnl_packet){JRNL_VIDEO,0,sizeof jh},&jh),"shared journal header failed");
+        c->rec_shared = true;
     }
     if (c->demo_path) {
         c->demo_out = fopen(c->demo_path, "wb");
@@ -1995,6 +2003,7 @@ typedef struct {
     VkShaderModule module;                /* legacy only */
 } shader_stage;
 
+#include "spirv.h"
 
 static void check_spirv(const uint32_t *spv, size_t bytes, const char *label) {
     VKMIN_ASSERT(spv && bytes >= 4 && bytes % 4 == 0, "'%s': bad SPIR-V size %zu", label, bytes);
@@ -2107,7 +2116,7 @@ vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc
 
 static void record_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc, vkmin_pipeline p, uint32_t op) {
     const vkmin_bytes stages[3] = {desc->vs, desc->fs, desc->cs};
-    if (c->rec && c->rec_depth == 0) {
+    if ((c->rec || c->rec_shared) && c->rec_depth == 0) {
         /* Blobs concatenated: vs, fs, cs. */
         const size_t total = desc->vs.size + desc->fs.size + desc->cs.size;
         uint8_t *blob = malloc(total ? total : 1);
@@ -2630,9 +2639,9 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
                                   .pImageMemoryBarriers = barriers};
     vkCmdPipelineBarrier2(cmd, &dep);
 
-    if (c->fp_label_begin && desc->label) {
+    if (c->fp_label_begin) {
         const VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
-                                            .pLabelName = desc->label};
+                                            .pLabelName = desc->label ? desc->label : "vkmin.pass"};
         c->fp_label_begin(cmd, &label);
     }
 
@@ -3053,7 +3062,7 @@ static bool relocate(const vkmin_ctx *c, uint8_t *data, size_t bytes, const relo
 
 bool vkmin_replay(vkmin_ctx *c, const char *path) {
     VKMIN_ASSERT(c && path && c->replaying, "vkmin_replay: init the context with --replay FILE first");
-    FILE *f = fopen(path, "rb");
+    FILE *f = jrnl_stream_open(path, JRNL_VIDEO);
     if (!f) { fprintf(stderr, "cannot open journal '%s'\n", path); return false; }
     uint8_t *data = NULL;
     uint32_t records = 0;
@@ -3086,9 +3095,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             data = calloc(cap, 1);
             VKMIN_ASSERT(data != NULL, "out of memory");
         }
-        JCHECK((rh.hdr_bytes == 0 || fread(hdr, rh.hdr_bytes, 1, f) == 1) &&
-                     (rh.data_bytes == 0 || fread(data, rh.data_bytes, 1, f) == 1) &&
-                     (rh.reloc_count == 0 || fread(relocs, sizeof relocs[0], rh.reloc_count, f) == rh.reloc_count),
+        JCHECK(jrnl_record_read(f, &rh, hdr, sizeof hdr, data, cap, relocs, VKMIN_MAX_RELOCS),
                      "truncated journal");
         JCHECK(relocate(c, data, rh.data_bytes, relocs, rh.reloc_count), "invalid relocation");
         ++records;

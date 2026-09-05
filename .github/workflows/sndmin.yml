@@ -1,0 +1,77 @@
+name: sndmin
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  golden:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Linux tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y gcc make cppcheck
+      - name: macOS tools
+        if: runner.os == 'macOS'
+        run: brew install cppcheck
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cppcheck mingw-w64-ucrt-x86_64-python
+      - name: Linux goldens, guard and threaded null test
+        if: runner.os == 'Linux'
+        run: |
+          make -f Makefile.sndmin -j4 sndmin-test sndmin-live
+      - name: macOS goldens (Clang and cppcheck)
+        if: runner.os == 'macOS'
+        run: make -f Makefile.sndmin CC=clang ANALYZER= -j4 sndmin-test sndmin-live
+      - name: Windows goldens
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make -f Makefile.sndmin CC=gcc -j4 sndmin-test sndmin-live
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sndmin-${{ matrix.os }}
+          path: tests/out/sndmin
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang make
+      - name: Memory safety and undefined behavior, including all fresh examples
+        if: matrix.sanitizer == 'address'
+        run: >-
+          make -f Makefile.sndmin CC=clang ANALYZER= SND_BUILD=build/sndmin-asan
+          OPT='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer'
+          -j4 sndmin-render-test sndmin-threads
+      - name: Race detection with overlapping producer and mixer
+        if: matrix.sanitizer == 'thread'
+        run: >-
+          make -f Makefile.sndmin CC=clang ANALYZER= SND_BUILD=build/sndmin-tsan
+          OPT='-O1 -g -fsanitize=thread -fno-omit-frame-pointer'
+          -j4 sndmin-threads
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sndmin-${{ matrix.sanitizer }}
+          path: tests/out/sndmin

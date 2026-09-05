@@ -81,6 +81,8 @@ checks=$((checks + 1))
 checks=$((checks + 2))
 ./$BUILD/spirv_test "$BUILD/layout.comp.spv" || fail "SPIR-V reflection"
 ./$BUILD/heightfield || fail "heightfield"
+checks=$((checks + 1))
+./$BUILD/outside || fail "outside primitives"
 
 begin "== frame lifecycle: repeated running queries preserve the input stream =="
 checks=$((checks + 1))
@@ -291,6 +293,11 @@ else
 fi
 
 . ./tests/outside.sh
+begin "== shared graphics/audio journal =="
+checks=$((checks + 1))
+python tools/test_sndmin_shared.py "$BUILD/sndmin_valley" --full || fail "shared valley image/audio replay"
+checks=$((checks + 1))
+python tools/test_unison.py "${SND_BUILD:-build/sndmin}" "$BUILD/sndmin_unison" || fail "public API A/V timeline"
 
 printf '\n%d checks, %d failures\n' "$checks" "$failures"
 [ "$failures" -eq 0 ]

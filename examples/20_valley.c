@@ -5,9 +5,12 @@
  */
 #include "gamekit.h"
 #include "stb_bridge.h"
+#include "valley_path.h"
+#ifdef SNDMIN_VALLEY
+#include "valley_audio.h"
+#endif
 
 enum { MAX_INSTANCES = 16384, KEY_CAP = 16 };
-typedef struct { vec3 eye, target; } valley_key;
 
 static uint32_t load_texture(vkmin_ctx *gpu, const char *name, bool clamp) {
     char path[256];
@@ -56,15 +59,6 @@ static uint32_t load_texture(vkmin_ctx *gpu, const char *name, bool clamp) {
     return vkmin_index(gpu,image);
 }
 
-static vec3 spline(vec3 a, vec3 b, vec3 c, vec3 d, float t) {
-    const float w[4] = {-0.5f*t+t*t-0.5f*t*t*t, 1-2.5f*t*t+1.5f*t*t*t,
-                        0.5f*t+2*t*t-1.5f*t*t*t, -0.5f*t*t+0.5f*t*t*t};
-    const vec3 p[4] = {a,b,c,d};
-    vec3 out = {0};
-    for (int i = 0; i < 4; ++i) out = vkmin_vec3_add(out,vkmin_vec3_scale(p[i],w[i]));
-    return out;
-}
-
 static uint32_t read_tree(FILE *file, vkr *r) {
     uint32_t vn = 0, in = 0;
     if (fscanf(file,"%u %u",&vn,&in) != 2 || vn == 0 || vn > 4096 || in == 0 || in > 16384) gk_die("bad tree mesh counts");
@@ -92,11 +86,31 @@ int main(int argc, char **argv) {
         "Normal profile: 120s at 60fps. --frame N warms TAA from zero; +taa 0 is isolated.\n"
         "--record FILE captures GPU calls; --replay FILE reproduces them.\n");
     const bool small = options.profile != NULL;
+#ifdef SNDMIN_VALLEY
+    FILE *shared_journal = NULL;
+    const char *audio_out = "tests/out/sndmin/valley.wav";
+    const char *audio_png = "tests/out/sndmin/valley.png";
+    uint32_t audio_frames = 600;
+    for (int k=1;k+1<argc;++k) {
+        if (!strcmp(argv[k],"--shared-journal")) shared_journal=jrnl_open(argv[k+1],true);
+        if (!strcmp(argv[k],"--audio-out")) audio_out=argv[k+1];
+        if (!strcmp(argv[k],"--audio-png")) audio_png=argv[k+1];
+        if (!strcmp(argv[k],"--audio-frames")) audio_frames=(uint32_t)strtoul(argv[k+1],NULL,10);
+    }
+#endif
     if (small) { cvar_set(CV_taa,0); cvar_set(CV_bloom,0); }
     vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "valley",
+#ifdef SNDMIN_VALLEY
+        .journal = shared_journal,
+#endif
         .headless = options.headless, .history = cvar_get_bool(CV_taa), .device_arena_bytes = 512u*1024u*1024u});
     if (small) { cvar_set(CV_taa,0); cvar_set(CV_bloom,0); }
     for (int k = 1; k+1 < argc; ++k) if (!strcmp(argv[k],"--replay")) {
+#ifdef SNDMIN_VALLEY
+        sndmin_ctx *audio=sndmin_init(&(sndmin_desc){.offline=true});
+        if(!audio||!sndmin_replay(audio,argv[k+1])||!sndmin_render(audio,audio_frames,audio_out,audio_png)) gk_die("audio replay failed");
+        sndmin_shutdown(audio);
+#endif
         const bool ok = vkmin_replay(gpu,argv[k+1]); vkmin_shutdown(gpu); return ok ? 0 : 1;
     }
     int width, height;
@@ -195,15 +209,31 @@ int main(int argc, char **argv) {
     gk_build_sphere(&builder,5,7);
     for (uint32_t k = 0; k < builder.vn; ++k) builder.v[k].py *= 0.6f;
     const uint32_t rocks = gk_upload_mesh(r,&builder,1.1f);
+#ifdef SNDMIN_VALLEY
+    valley_audio audio=valley_audio_init(shared_journal);
+#endif
     double measured[6] = {0}, minimum_ms = INFINITY, maximum_ms = 0;
     uint32_t measurements = 0;
     while (vkmin_running(gpu)) {
         const vkmin_frame frame = vkmin_frame_begin(gpu,NULL);
-        const float t = fminf((float)frame.index/7199,1)*(float)(key_count-1);
-        const uint32_t b = (uint32_t)t < key_count-1 ? (uint32_t)t : key_count-2;
-        const uint32_t a = b ? b-1 : b, c = b+1, d = c+1 < key_count ? c+1 : c;
-        const vec3 eye = spline(keys[a].eye,keys[b].eye,keys[c].eye,keys[d].eye,t-(float)b);
-        const vec3 target = spline(keys[a].target,keys[b].target,keys[c].target,keys[d].target,t-(float)b);
+        const valley_camera camera_state=valley_camera_at(keys,key_count,frame.index);
+        const vec3 eye=camera_state.eye, target=camera_state.target;
+#ifdef SNDMIN_VALLEY
+        /* Coarse solid ground columns follow the authored terrain, not a scene graph. */
+        sndmin_box acoustic_boxes[64];
+        for(unsigned k=0;k<64;++k) {
+            const vec4 bound=nodes[21+k].bounds;
+            const float top=fmaxf(minimum-9,bound.y-bound.w*.35f);
+            acoustic_boxes[k]=(sndmin_box){{bound.x-cell*(float)chunk*.5f,minimum-10,bound.z-cell*(float)chunk*.5f},
+                {bound.x+cell*(float)chunk*.5f,top,bound.z+cell*(float)chunk*.5f},0};
+        }
+        /* Rendering may select isolated frames. Audio still receives every
+         * preceding game tick, using the same pure route evaluation. */
+        while(audio.frames<=frame.index) {
+            const valley_camera step=valley_camera_at(keys,key_count,audio.frames);
+            valley_audio_frame(&audio,audio.frames,step.eye,step.target,step.velocity,acoustic_boxes,64,river);
+        }
+#endif
         const vec4 camera = {eye.x,eye.y,eye.z,1};
         uint32_t selected[64];
         const uint32_t terrain_count = vkmin_terrain_select(nodes,camera,1.8f,small,selected,64);
@@ -261,6 +291,13 @@ int main(int argc, char **argv) {
         printf("grass geometry: %u blades per patch, %u candidate patches; GPU cull retains fixed command slots\n",
             blade_count,patches ? 4096u : 14400u);
     }
+#ifdef SNDMIN_VALLEY
+    if(!sndmin_render(audio.ctx,audio.frames,audio_out,audio_png)) gk_die("audio render failed");
+    sndmin_dump(audio.ctx,stdout); sndmin_shutdown(audio.ctx);
+#endif
     vkr_shutdown(r); vkmin_shutdown(gpu);
+#ifdef SNDMIN_VALLEY
+    if(shared_journal&&fclose(shared_journal)!=0) gk_die("shared journal close failed");
+#endif
     return 0;
 }
