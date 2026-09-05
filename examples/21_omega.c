@@ -476,10 +476,13 @@ int main(int argc,char **argv) {
         // the camera and the vortex opens at their midpoint. The reveal
         // dollies in and swings to a three-quarter view; the camera then
         // follows the hull as it flies past and pans back for the closing.
+        // A slow drift from the first frame, a gentle orbit, dolly-in and
+        // rise, so the reveal continues motion already under way rather than
+        // starting from rest.
         const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
-        const float angle=-.195f-.28f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
-        const float radius=80.f-18.f*reveal;
-        const vec3 eye={sinf(angle)*radius,6.f+6.f*reveal+elevation,cosf(angle)*-radius};
+        const float angle=-.16f-.007f*t-.28f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float radius=86.f-fminf(t,6.f)-18.f*reveal;
+        const vec3 eye={sinf(angle)*radius,5.f+.17f*fminf(t,6.f)+6.f*reveal+elevation,cosf(angle)*-radius};
         const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
         const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
         const vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));

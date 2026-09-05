@@ -22,10 +22,10 @@ The 20-second loop follows the supplied gate-opening sequence:
 | Time | Action |
 | --- | --- |
 | 0–1 seconds | Dormant pylons against black space |
-| 0.2–2.3 seconds | Red-orange charge flares pulse a quarter of the way along each pylon |
-| 1–2.65 seconds | Central white ignition flash, with halo, streak and ring, lights the structures |
+| 0.25–2.2 seconds | A red-orange flare appears part way along each pylon, travels toward the far cap brightening at every fin station, and swells into a pink-white sphere |
+| 1.9–2.9 seconds | The four spheres merge into a central white flash, with halo, streak and ring, that lights the structures |
 | 2–4.5 seconds | A small blue ring with a dark centre expands into the funnel |
-| 4.5–9.55 seconds | Tiny ship cruises rapidly through the distant corridor |
+| 4.5–9.55 seconds | Tiny ship cruises rapidly through the distant corridor; a warm glow at the throat from 7 to 9.4 seconds announces its arrival |
 | 9.55–13 seconds | Rapid perspective growth; the hull settles to 22 units/second and flies out past the camera |
 | 10.25–16.25 seconds | Two short–short–long bursts, beginning halfway out of the gate |
 | 13–17 seconds | The camera follows the receding hull, then pans back to the gate |
@@ -36,9 +36,11 @@ Audio simulation advances on every 60 Hz tick, including ticks skipped
 by slow rendering or isolated screenshot requests. Pausing mutes audio while
 existing audio tails continue to advance silently.
 
-The camera starts about 11 degrees off the gate axis and slightly above it,
-80 units back, so the splayed pylons reach toward the viewer with the vortex
-opening at their midpoint. The pan begins at 6 seconds and finishes at 11
+The camera starts about 9 degrees off the gate axis and slightly above it,
+86 units back, so the splayed pylons reach toward the viewer with the vortex
+opening near their camera-side ends. From the first frame it drifts gently,
+orbiting, dollying in to 80 units and rising, so the later moves continue
+motion already under way. The pan begins at 6 seconds and finishes at 11
 seconds, swinging to a three-quarter view 62 units out and 28 units beside the
 corridor. From 11 to 12.6 seconds the look-at target slides from the gate to
 the hull, which passes about 30 units from the camera; between 14.4 and 17.2
@@ -51,25 +53,25 @@ tick schedule driving the beams, muzzle lighting and short/sustained sounds.
 The ship has 11,184 triangles including three four-wing escorts, a rotating
 counterbalanced habitat, bow cannon mantlets, antennae, ribs, windows, a reactor
 block and four engine banks. Four fixed gate pylons bring the scene to 15,696
-triangles. Each is an open box truss of four rust rails from z=26 inside the
-funnel to z=-16 toward the camera, splayed outward by 4 degrees about its far
+triangles. Each is an open box truss of four rust rails from z=38 inside the
+cone to z=-4 toward the camera, splayed outward by 4 degrees about its far
 cap, with a cross frame, a yellow window bay and a pair of long tangential
 blade fins at each of seven stations, and an inward-facing emitter at the far
-cap. The mouth sits at their midpoint, so the inner half of each pylon
-dissolves into the gate's energy while the outer half frames the emerging
-hull, as in the reference footage. The ignition flash lights their metal
-surfaces.
+cap. The mouth sits about 12% of the way along them from the camera-side caps, so
+most of each pylon reaches back into the gate's energy and shows through it
+at reduced contrast, as in the reference footage. The ignition flash lights
+their metal surfaces.
 
 The rendering passes are a 2048-square directional shadow map, a separate HDR
 gate layer, the composite HDR scene, quarter-resolution bloom, and a period
 grade: highlights clip to white with a gentle knee, chroma bleeds sideways
 while luma stays sharp, and fine per-tick grain is added. Hull
 shading includes procedural armor panels, rivets, roughness, key lighting,
-gate-colored rim lighting and transient red muzzle lighting. The 1,195.5-unit-deep
-gate is two analytic cone segments: a steep entry funnel from the 12.6-unit
-mouth to a 5-unit knee 35 units in, then a long narrow throat to the distant
-entrance, so the opening reads as a funnel with the dark throat offset toward
-the vanishing point. Rays that miss the mouth disc see the funnel's outer skin
+gate-colored rim lighting and transient red muzzle lighting. The
+vortex is one analytic cone from the 14-unit mouth to a 1.5-unit throat 74
+units in, so the opening reads as a cone with the dark throat offset toward
+the vanishing point. The ship's approach route is far deeper than the cone;
+inside the gate it is only ever seen through the mouth disc. Rays that miss the mouth disc see the funnel's outer skin
 fading within a third of a radius, so from the off-axis camera the gate reads
 as a feathered ellipse rather than a pipe. Big soft billows dominate the
 energy, with finer advected strands only adding texture, and a faint
@@ -82,11 +84,15 @@ and keeps going, crossing the mouth at 10.25 seconds, passing the camera at
 about 12.8 seconds and reaching z=-213 by the end of the loop. Position and
 speed are continuous at the transition.
 Perspective makes the ship grow as it approaches; its geometry is not scaled.
-The mouth sits at z=4.5, midway along the pylons. Its 12.6-unit radius fits
+Beyond the mouth the hull is clipped to the mouth disc, so it is seen only
+through the opening: from the off-axis camera it first appears as a small
+silhouette deep in the vortex at about 8.5 seconds and grows, and it is never
+drawn beside the cone.
+The mouth sits at z=1, about 12% of the way along the pylons. Its 14-unit radius fits
 inside the pylons, whose axes sit 15.8 units from the corridor center at the
 four cardinal positions before the splay.
 A broad feather blends the edge into the stars, and outer wisps fade before
-reaching beyond the containment structures. The distant throat is at z=1200.
+reaching beyond the containment structures. The cone's throat is at z=75; the ship's route begins at z=1180.
 Plasma strands and rim wisps share a slow
 0.10-radian/second rotation (about 5.7 degrees/second), with gentle internal flow.
 The camera begins looking down the tunnel from off axis and moves to a wide

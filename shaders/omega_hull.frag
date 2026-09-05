@@ -16,13 +16,25 @@ vec3 gateVeil(vec3 surface) {
     float r=length(mouth)/(OMEGA_GATE_MOUTH_RADIUS*shape.z);
     float footprint=1.-smoothstep(.94,1.12,r);
     // The half of each pylon inside the funnel dissolves into its energy.
-    float recess=smoothstep(OMEGA_GATE_MOUTH_Z,OMEGA_GATE_MOUTH_Z+18.,world.z);
-    float veil=(1.-exp(-recess*4.5))*footprint*smoothstep(.15,.85,o.scene.w);
+    float recess=smoothstep(OMEGA_GATE_MOUTH_Z,OMEGA_GATE_MOUTH_Z+24.,world.z);
+    float veil=(1.-exp(-recess*4.5))*.6*footprint*smoothstep(.15,.85,o.scene.w);
     vec2 screen=gl_FragCoord.xy/vec2(textureSize(TEX(o.gate_id),0));
     return mix(surface,texture(TEX(o.gate_id),screen).rgb,veil);
 }
 void main() {
     float structure=tint.a;
+    // Inside the funnel the hull exists only as seen through the mouth disc:
+    // a fragment beyond the mouth whose line of sight misses the opening is
+    // dropped, so the ship appears as a small silhouette deep in the vortex
+    // and grows, and is never visible beside the cone from an off-axis view.
+    if(structure<.5 && world.z>OMEGA_GATE_MOUTH_Z) {
+        vec3 shape=omegaGateShape();
+        vec3 ray=world-o.eye.xyz;
+        if(ray.z<=0. || o.scene.w<.005) discard;
+        float t=(shape.x-o.eye.z)/ray.z;
+        float r=length((o.eye.xyz+ray*t).xy)/(OMEGA_GATE_MOUTH_RADIUS*shape.z);
+        if(t<0. || r>.97) discard;
+    }
     vec3 n=normalize(normal),v=normalize(o.eye.xyz-world);
     if(!gl_FrontFacing) n=-n;
     if(material==6) {
@@ -83,7 +95,7 @@ void main() {
     c+=vec3(.025,.42,1.)*(base*.7+fres*.18)*pow(max(dot(n,rim),0.),.65)*o.scene.w*1.4;
     // The fixed gate machinery receives blue light from its inward emitters.
     if(structure>.5) c+=base*vec3(.08,.6,1.3)*max(dot(n,normalize(vec3(-world.xy,0))),0.)*o.scene.w;
-    float ignition=smoothstep(1.,1.65,o.scene.x)*(1.-smoothstep(1.8,2.65,o.scene.x));
+    float ignition=smoothstep(1.9,2.3,o.scene.x)*(1.-smoothstep(2.4,2.9,o.scene.x));
     if(structure>.5) c+=base*vec3(3.,2.6,2.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
     // The plasma muzzle lights illuminate the forward armor in world space.
     for(int j=0;j<2;j++) {

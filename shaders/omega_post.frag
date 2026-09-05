@@ -22,6 +22,8 @@ void main() {
         bloom+=texture(TEX(o.bloom_id),uv+vec2(0,k)*bp*2.).rgb*exp(-float(k*k)*.16);
     }
     c+=bloom*.085;
+    vec3 flares=omegaFlares(uv);
+    c+=flares;
     // Period look: no filmic curve, highlights clip to white the way a
     // 1990s renderer wrote them; a gentle knee keeps mid-tones from posterising.
     c*=1.15;
@@ -31,7 +33,7 @@ void main() {
     vec3 wide=vec3(0);
     for(int k=-3;k<=3;k++) {
         vec3 s=texture(TEX(o.texture_id),uv+vec2(k,0)*px*1.5).rgb;
-        s+=bloom*.085; s*=1.15; s=s/(1.+s*.06);
+        s+=bloom*.085+flares; s*=1.15; s=s/(1.+s*.06);
         wide+=pow(clamp(s,0.,1.),vec3(1./2.2))*exp(-float(k*k)*.22);
     }
     wide/=1.+2.*(exp(-.22)+exp(-.88)+exp(-1.98));

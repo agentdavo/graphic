@@ -2,11 +2,10 @@
 #include "omega.glsl"
 layout(location=0) in vec2 uv;
 layout(location=0) out vec4 result;
-// Finite hollow funnel in two linear segments: a steep entry cone from the
-// mouth to the knee, then a long narrow throat to the distant entrance.
-// Analytic intersections give the energy funnel perspective and curvature.
-// It is a luminous backdrop, not an opaque wall that clips the passing hull.
-const float mouthZ=OMEGA_GATE_MOUTH_Z,entranceZ=OMEGA_GATE_ENTRANCE_Z,mouthRadius=OMEGA_GATE_MOUTH_RADIUS,entranceRadius=OMEGA_GATE_ENTRANCE_RADIUS;
+// Finite hollow cone from the mouth to a narrow throat. Analytic
+// intersections give the energy cone perspective and curvature. It is a
+// luminous backdrop, not an opaque wall that clips the passing hull.
+const float mouthZ=OMEGA_GATE_MOUTH_Z,entranceZ=OMEGA_GATE_THROAT_Z,mouthRadius=OMEGA_GATE_MOUTH_RADIUS,entranceRadius=OMEGA_GATE_THROAT_RADIUS;
 float coneHit(vec3 eye,vec3 ray,float z0,float z1,float r0,float r1) {
     float slope=(r1-r0)/max(z1-z0,1e-4);
     float radius=r0+slope*(eye.z-z0);
@@ -67,9 +66,7 @@ void main() {
         float rotation=max(time-2.,0.)*.10;
         vec3 shape=omegaGateShape();
         float gateStart=shape.x,gateEnd=shape.y,scale=shape.z;
-        float knee=mix(gateStart,gateEnd,(OMEGA_GATE_KNEE_Z-mouthZ)/(entranceZ-mouthZ));
-        float hit=min(coneHit(o.eye.xyz,ray,gateStart,knee,mouthRadius*scale,OMEGA_GATE_KNEE_RADIUS*scale),
-                      coneHit(o.eye.xyz,ray,knee,gateEnd,OMEGA_GATE_KNEE_RADIUS*scale,entranceRadius*scale));
+        float hit=coneHit(o.eye.xyz,ray,gateStart,gateEnd,mouthRadius*scale,entranceRadius*scale);
         bool throat=false;
         if(ray.z>1e-5) {
             float end=(gateEnd-o.eye.z)/ray.z;
@@ -119,7 +116,7 @@ void main() {
             // until the aperture has grown.
             color*=mix(.12,1.,smoothstep(.10,.45,aperture));
             const vec3 voidColor=vec3(.000025,.00006,.00016);
-            color=mix(color,voidColor,smoothstep(.40,.78,depth));
+            color=mix(color,voidColor,smoothstep(.62,.92,depth));
             // The lip dissolves into the starfield over a broad region.
             color=mix(skyColor,color,smoothstep(0.,.14,depth));
             color=mix(skyColor,color,outsideFade*mix(exp(-depth*5.),1.,outsideFade));
@@ -149,37 +146,20 @@ void main() {
             color+=vec3(.08,.7,1.8)*anchor*exp(-abs(r-1.)*38.)
                 *(.7+.3*sin(time*4.))*aperture;
         }
-    }
-    // Concentrated ignition in empty space, before the throat has opened.
-    float ignition=smoothstep(1.,1.65,o.scene.x)*(1.-smoothstep(1.8,2.65,o.scene.x));
-    vec4 center=o.vp*vec4(0,0,mouthZ,1);
-    vec2 delta=uv-(center.xy/center.w*.5+.5); delta.x*=o.scene.y;
-    float d2=dot(delta,delta);
-    // A warm white sphere with a pink halo and a faint red ring: the optical
-    // flare vocabulary of the reference footage rather than a blue spark.
-    color+=ignition*(vec3(18,15,12)*exp(-d2*140.)+vec3(1.6,.30,.22)*exp(-d2*14.)
-        +vec3(.35,.05,.03)*exp(-pow((sqrt(d2)-.20)*22.,2.)));
-    // Renderer-style lens artefacts: a horizontal streak and a faint ring.
-    color+=ignition*(vec3(1.4,1.0,.85)*exp(-abs(delta.y)*320.-abs(delta.x)*5.)
-        +vec3(.22,.10,.08)*exp(-pow((sqrt(d2)-.34)*45.,2.)));
-    // Each pylon charges first: a pulsing red-orange flare a quarter of the
-    // way along its spine, on the side facing the corridor.
-    float charge=smoothstep(.2,.9,o.scene.x)*(1.-smoothstep(1.7,2.3,o.scene.x));
-    for(int k=0;k<4;k++) {
-        float a=float(k)*O_PI*.5;
-        vec3 local=vec3(0,OMEGA_GATE_PYLON_RADIAL-1.2,OMEGA_GATE_PYLON_BACK_Z+10.);
-        // Follow the pylon splay about its far cap.
-        float dz=local.z-OMEGA_GATE_PYLON_Z,cs=cos(OMEGA_PYLON_SPLAY),sn=sin(OMEGA_PYLON_SPLAY);
-        local=vec3(0,OMEGA_GATE_PYLON_RADIAL+(local.y-OMEGA_GATE_PYLON_RADIAL)*cs-dz*sn,
-                   OMEGA_GATE_PYLON_Z+(local.y-OMEGA_GATE_PYLON_RADIAL)*sn+dz*cs);
-        vec3 anchorPos=vec3(cos(a)*local.x-sin(a)*local.y,sin(a)*local.x+cos(a)*local.y,local.z);
-        vec4 c=o.vp*vec4(anchorPos,1);
-        if(c.w<=0.) continue;
-        vec2 dp=uv-(c.xy/c.w*.5+.5); dp.x*=o.scene.y;
-        float g2=dot(dp,dp);
-        float pulse=.7+.3*sin(o.scene.x*9.+float(k)*1.7);
-        color+=charge*pulse*(vec3(2.6,.55,.28)*exp(-g2*1400.)+vec3(.9,.14,.07)*exp(-g2*320.)
-            +vec3(.30,.04,.02)*exp(-pow((sqrt(g2)-.05)*110.,2.)));
+        // Arrival: a warm pink-white glow at the throat, where the hull will
+        // appear, grows just before its silhouette shows and fades as it does.
+        if(ray.z>1e-5) {
+            float near=(gateStart-o.eye.z)/ray.z;
+            float inside=1.-smoothstep(.9,1.,length((o.eye.xyz+ray*near).xy)/(mouthRadius*scale));
+            float arrival=smoothstep(7.0,8.2,time)*(1.-smoothstep(8.6,9.4,time));
+            vec4 hull=o.vp*vec4(0,0,mix(gateStart,gateEnd,.9),1);
+            if(arrival>0. && hull.w>0.) {
+                vec2 dp=uv-(hull.xy/hull.w*.5+.5); dp.x*=o.scene.y;
+                float d=length(dp),radius=mix(.015,.06,smoothstep(7.,9.,time));
+                color+=arrival*inside*(vec3(3.,1.7,1.3)*exp(-d*d/(radius*radius))
+                    +vec3(.9,.28,.22)*exp(-d*d/pow(radius*2.5,2.)));
+            }
+        }
     }
     result=vec4(color,1);
 }

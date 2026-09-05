@@ -2,20 +2,22 @@
 #ifndef OMEGA_SHARED_H
 #define OMEGA_SHARED_H
 #include "shared.h"
-#define OMEGA_GATE_MOUTH_Z 4.5f
-/* Pylons straddle the mouth: half their length is inside the funnel. They
+#define OMEGA_GATE_MOUTH_Z 1.0f
+/* Pylons straddle the mouth, which sits about 12% of the way along them
+ * from the camera-side caps, so most of each pylon reaches back into the energy. They
  * splay outward toward the camera by OMEGA_PYLON_SPLAY radians. */
-#define OMEGA_GATE_PYLON_Z 26.0f
-#define OMEGA_GATE_PYLON_BACK_Z -16.0f
+#define OMEGA_GATE_PYLON_Z 38.0f
+#define OMEGA_GATE_PYLON_BACK_Z -4.0f
 #define OMEGA_GATE_PYLON_RADIAL 15.8f
 #define OMEGA_PYLON_SPLAY 0.07f
 #define OMEGA_PYLON_STATIONS 7
 #define OMEGA_PYLON_STATION_SPACING 6.0f
-/* The funnel narrows steeply to a knee, then continues as a long throat. */
-#define OMEGA_GATE_MOUTH_RADIUS 12.6f
-#define OMEGA_GATE_KNEE_Z 40.0f
-#define OMEGA_GATE_KNEE_RADIUS 5.0f
-#define OMEGA_GATE_ENTRANCE_RADIUS 4.0f
+/* The visible vortex is one straight cone from the mouth to a narrow throat.
+ * The ship's approach route is far deeper; inside the gate it is only ever
+ * seen through the mouth disc, so the cone need not contain it. */
+#define OMEGA_GATE_MOUTH_RADIUS 14.0f
+#define OMEGA_GATE_THROAT_Z 75.0f
+#define OMEGA_GATE_THROAT_RADIUS 1.5f
 #define OMEGA_GATE_ENTRANCE_Z 1200.0f
 #define OMEGA_GATE_CLOSE_START 17.5f
 #define OMEGA_GATE_CLOSE_END 19.5f
