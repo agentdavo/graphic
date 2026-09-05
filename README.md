@@ -1,4 +1,4 @@
-# vkmin v0.3 — a Doom 3-class world in a small C11 codebase
+# vkmin v0.4 — a Doom 3-class world in a small C11 codebase, and five games on it
 
 A Vulkan 1.3 renderer whose whole design is subtraction: no render passes, no
 framebuffers, no vertex input state, no per-draw descriptor binding, no
@@ -207,6 +207,98 @@ would remove the one feature that turns every bug into a batch job. The
 brief's other acceptance test — hand the header to someone and time them to a
 cube — cannot be run here; `06_cube` is my own answer to it, and it is 33
 lines.
+
+## v0.4: what games need
+
+Five games, one engine, and the rule that a primitive goes in only if two of
+them use it. Written down first, as the brief asked: a shooter wants a
+perspective camera, many lights, shadows, skinned characters, particles and a
+HUD; a strategy game a tilted camera over terrain, thousands of units,
+picking, selection rectangles and health bars; a top-down game an
+orthographic camera, sprites among 3D props, picking; a platformer a side
+camera, parallax and one animated character; the anime game any camera,
+quantised lighting, outlines and grading. Stripped of the genre words that
+is nine things, and the table below is where each lives and who uses it.
+
+| primitive | where | used by |
+| --- | --- | --- |
+| cameras as pure functions (`camera_fps/rts/ortho_topdown/side`) | `vkmin_math.h` | all five |
+| rays (`ray_from_pixel`, ray-AABB, ray-triangle) | `vkmin_math.h` | shooter (hit test), rts (march orders), topdown (ground cursor) |
+| `ticks_for_frame` fixed-step time | `vkmin_math.h` | all five |
+| `vkmin_input` snapshot, journalled; `--demo`/`--play` | `vkmin.h` | all five |
+| instancing + GPU cull with the CPU reference (`d_check_cull`) | `render.c`, `cull.comp` | all five (rts: 2000 units + terrain chunks) |
+| quad batcher: sprites, particles, billboards, UI, parallax | `render.c`, `quad.vert/frag` | shooter (particles, HUD), rts (selection, health bars), topdown (sprites), platformer (parallax), anime (title) |
+| SDF text (`vkr_text`) | `render.c`, `tools/mkfont` | shooter, rts, topdown, platformer, anime |
+| skinning | `scene_vertex.glsl`, `demo/anim.h` | shooter (two enemies), platformer, anime |
+| shadow atlas | `render.c` | shooter (cascades), rts (one cascade), topdown (point), platformer, anime |
+| lighting library the user's shader includes | `shaders/lib/` | `lit_pbr.frag`: shooter, rts, topdown; `lit_cel.frag`: platformer, anime |
+| clustered lights | `cluster.comp`, `lib/lights.glsl` | shooter (25 lights), topdown (2); the rest pay nothing |
+| ID target + `vkmin_pick` | `vkmin.c`, `render.c` | rts (hover), topdown (click); `tests/pick.c` |
+| `vkmin_heightfield` | `vkmin.c` | rts (2 km² terrain), topdown (the tile floor) |
+| post: normal target, outline, LUT, tonemap | `tonemap.frag` | outline: platformer, anime; LUT: anime; fog: shooter, rts |
+| glTF via cgltf, KTX2 | `tools/cook.c`, `src/scene.c`, `src/ktx2.c` | shooter (Sponza + CesiumMan), platformer, anime (CesiumMan) |
+
+Nothing was used by one game only, so nothing was removed. The colour LUT
+has one user (anime); it is one function in a pass every game runs and was
+kept as part of "post" rather than counted alone -- say so if you disagree.
+
+**The journal is a demo file.** `vkmin_input` is read at one point in
+`vkmin_frame_begin`, edges are computed there against the previous snapshot,
+and it travels in the frame-begin journal record. `--demo FILE` writes the
+snapshots alone (frame index + inputs, ~150 bytes a frame); `--play FILE`
+feeds them back one frame per record. Every game simulates at a fixed rate
+from the frame index and reads no clock, so a demo replays the same game and
+the goldens are taken from replayed demos. `tests/journals/*.vkd` are
+**scripted by `tools/mkdemo.c`, not recorded by a person** -- CI has no
+hands -- and a demo recorded in a window is the same file format.
+`vkmin_pick` is journalled with its result, so a full journal replay asserts
+that the replayed frame picks the same instance the recording did.
+
+**Deviations, stated plainly.** The post stack is one full-screen pass with
+every stage always executed and inhibited by its strength, not three passes;
+the visible result is the brief's, the ordering is fixed, and it is one
+pipeline instead of three. The normal target is written by the forward
+pass as a second MRT attachment (with the id as the first) rather than by the
+depth prepass, so it survives `r_prepass=0`. A blended pipeline masks the id
+and normal attachments off, so one shader serves opaque and transparent
+draws. Inverted-hull outlines and compute pre-skinning remain the noted
+parallel implementations, not built. glTF goes through the offline cooker
+(cgltf, from v0.1), not a runtime loader. The platformer's "idle, run and
+jump" are one clip -- CesiumMan's walk -- held, played and held mid-stride;
+that is honest about the one skinned asset in the tree, not about the
+design. Picking is one frame late by construction (it reads the frame just
+submitted). `vkr_look`, the cel ramp, rim, shadow tint, fog, outline and
+LUT parameters, travel in the frame desc; the cvars `r_outline` and `r_lut`
+are live multipliers.
+
+**A bug found by the platformer, worth recording.** `anim_bones` builds
+bone matrices relative to the transform it is given; given the placed
+instance transform it cancels the placement and every character lands at
+the asset origin. The Corridor had done it right by accident (it passed the
+node's own transform), my first draft of the games did it wrong, and the
+platformer's hero vanished off the left of the screen. `gk_node_transform`
+now exists so the right matrix has a name.
+
+**A lavapipe quirk.** A pipeline whose extra attachments are masked off still
+needs its fragment shader to declare those outputs: undeclared, the normal
+target came out stippled under the parallax quads and the outline pass drew
+the stipple. Declared and written, the mask does its job. `quad.frag` says
+so.
+
+**Numbers.** Core (`src/*.c`, `src/*.h` less the stb bridge and the baked
+font): **5582 lines** with both paths, against a budget of 7000. The shader
+library is 259 lines (budget 1000); every shader in the tree, library
+included, is 877. `vkmin.h` is 247 lines. The games: `10_shooter` 193,
+`11_rts` 262, `12_topdown` 150, `13_platformer` 165, `14_anime` 113 (budget
+500 each), sharing `demo/gamekit.h` (303: mesh builders, scene upload,
+procedural textures, the lavapipe profile, option parsing) and `demo/anim.h`
+(89). The Corridor now uses the same kit and lost 190 lines. The game
+developer's test -- someone who has shipped a game reads the header, the
+library and one example -- was not run here. Building the five, the things
+I reached for and did not have: a sprite-sheet frame helper (three games
+faked it with procedural textures), a depth-writing quad mode so sprites can
+occlude each other, and a debug line primitive (two games would have drawn
+their rays). By the brief's rule the first two belong in v0.5.
 
 ## Test coverage, in numbers
 

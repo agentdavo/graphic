@@ -37,7 +37,7 @@ CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD
 .PHONY: all clean test golden texture analyze tools
 EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
 
-all: tools $(BUILD)/smoke $(BUILD)/corridor $(EXAMPLES)
+all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
 tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles
 
 $(BUILD):
@@ -70,15 +70,18 @@ $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
 $(BUILD)/smoke: tests/smoke.c $(BUILD)/shaders.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
+$(BUILD)/pick: tests/pick.c demo/gamekit.h src/render.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
 $(BUILD)/handles: tests/handles.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 # The examples are the tutorial and the tests: each builds alone against the
 # header, and each produces a golden image in make test.
-$(BUILD)/ex_%: examples/%.c examples/cube_data.h src/vkmin.h src/vkmin_math.h $(BUILD)/shaders.h $(CORE_OBJS)
+$(BUILD)/ex_%: examples/%.c examples/cube_data.h demo/gamekit.h demo/anim.h src/vkmin.h src/vkmin_math.h src/render.h $(BUILD)/shaders.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
-$(BUILD)/corridor: demo/corridor.c demo/anim.h src/render.h src/scene.h src/vkmin_math.h $(CORE_OBJS)
+$(BUILD)/corridor: demo/corridor.c demo/anim.h demo/gamekit.h src/render.h src/scene.h src/vkmin_math.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/imgdiff: tools/imgdiff.c $(BUILD)/stb_bridge.o | $(BUILD)
@@ -89,6 +92,14 @@ $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
 
 $(BUILD)/mat4_test: tests/mat4_test.c src/vkmin_math.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lm
+
+$(BUILD)/mkdemo: tools/mkdemo.c src/vkmin.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+# The demo files are committed (tests/journals); `make demos` rewrites them.
+.PHONY: demos
+demos: $(BUILD)/mkdemo
+	./$(BUILD)/mkdemo tests/journals
 
 $(BUILD)/mkfont: tools/mkfont.c | $(BUILD)
 	$(CC) $(THIRD_PARTY_CFLAGS) -o $@ $< -lm

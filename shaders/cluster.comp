@@ -11,6 +11,8 @@ vec3 unproject_at_depth(Frame frame, vec2 ndc, float depth) {
     mat4 inv_proj = inverse(frame.proj);
     vec4 p = inv_proj * vec4(ndc, 0.0, 1.0);
     p /= p.w;
+    // Orthographic (w row 0,0,0,1): the near point slides straight back.
+    if (frame.proj[3][3] == 1.0 && frame.proj[2][3] == 0.0) return vec3(p.xy, -depth);
     return p.xyz * (depth / -p.z);
 }
 

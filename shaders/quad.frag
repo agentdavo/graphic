@@ -10,6 +10,11 @@ layout(location = 2) flat in uint v_texture;
 layout(location = 3) flat in uint v_flags;
 layout(location = 4) in float v_softness;
 layout(location = 0) out vec4 o_color;
+// The world-quad pipeline masks these off, but an undeclared output leaves
+// whatever the slot held (lavapipe stippled the normal target with garbage
+// until they were declared); declared and written, the mask does its job.
+layout(location = 1) out uint o_id;
+layout(location = 2) out vec2 o_normal;
 
 void main() {
     vec4 t = texture(TEX(v_texture), v_uv);
@@ -25,4 +30,6 @@ void main() {
         rgb = t.rgb * v_color.rgb;
     }
     o_color = vec4(rgb * a, a);
+    o_id = 0u;
+    o_normal = vec2(0.5);
 }

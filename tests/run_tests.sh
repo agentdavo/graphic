@@ -1,5 +1,5 @@
 #!/bin/sh
-# The golden-image harness for vkmin v0.1. Runs headless under lavapipe with
+# The golden-image harness for vkmin. Runs headless under lavapipe with
 # the software profile, compares against tests/golden with a small per-channel
 # tolerance, writes a diff image beside any failure, and checks every
 # reference path against the fast path it shadows.
@@ -108,6 +108,54 @@ for ex in 01_clear 02_triangle 03_buffer 04_texture 05_compute 06_cube; do
         fail "example $ex"; sed -n '1,8p' "$OUT/ex_$ex.log"
     fi
 done
+
+begin "== the ID target: vkmin_pick reads the instance under a texel, both paths =="
+for p in legacy modern; do
+    [ "$p" = "modern" ] && [ "$MODERN" != "1" ] && continue
+    checks=$((checks + 1))
+    ./$BUILD/pick --headless --frame 1 --path=$p >/dev/null 2>"$OUT/pick_$p.log" || { fail "pick ($p)"; sed -n '1,6p' "$OUT/pick_$p.log"; }
+done
+
+begin "== the five games: each replays its demo file to a golden frame =="
+# game <name> <frame> [extra flags]: play tests/journals/<name>.vkd headless
+# on the default path, compare the frame to its golden; then the same frame
+# on the legacy path must be bit-identical.
+game() {
+    name=$1; frame=$2; shift 2
+    checks=$((checks + 1))
+    if ./$BUILD/ex_$name --profile lavapipe --headless --play "tests/journals/$name.vkd" --frame "$frame" \
+            --out "$OUT/ex_$name.png" "$@" >/dev/null 2>"$OUT/ex_$name.log"; then
+        checks=$((checks - 1))
+        compare "ex_$name"
+    else
+        fail "game $name"; sed -n '1,8p' "$OUT/ex_$name.log"
+    fi
+    if [ "$MODERN" = "1" ]; then
+        checks=$((checks + 1))
+        if ./$BUILD/ex_$name --profile lavapipe --headless --play "tests/journals/$name.vkd" --frame "$frame" --path=legacy \
+                --out "$OUT/ex_${name}_legacy.png" "$@" >/dev/null 2>"$OUT/ex_${name}_legacy.log"; then
+            checks=$((checks - 1))
+            same "ex_$name" "ex_${name}_legacy" 0 "$name: legacy path == modern path"
+        else
+            fail "game $name (legacy)"; sed -n '1,8p' "$OUT/ex_${name}_legacy.log"
+        fi
+    fi
+}
+game 10_shooter 150
+game 11_rts 300 d_check_cull=1
+game 12_topdown 300
+game 13_platformer 300
+game 14_anime 240
+
+begin "== a game's journal: record 14_anime playing its demo, replay it, same pixels =="
+checks=$((checks + 1))
+./$BUILD/ex_14_anime --profile lavapipe --headless --play tests/journals/14_anime.vkd --frame 240 --record "$OUT/anime.vkj" >/dev/null 2>"$OUT/record_anime.log" || fail "record 14_anime"
+checks=$((checks + 1))
+if ./$BUILD/ex_07_replay --replay "$OUT/anime.vkj" --frame 240 --path=legacy --out "$OUT/anime_replay.png" >/dev/null 2>"$OUT/replay_anime.log"; then
+    same ex_14_anime anime_replay 0 "14_anime's journal, recorded on one path, replays on the other"
+else
+    fail "replay 14_anime"; sed -n '1,8p' "$OUT/replay_anime.log"
+fi
 
 begin "== the journal: record 06_cube, replay it without the program, same pixels =="
 checks=$((checks + 1))

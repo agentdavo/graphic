@@ -341,14 +341,17 @@ static vec3 perpendicular_up(vec3 dir) {
     return fabsf(dir.y) < 0.99f ? (vec3){0, 1, 0} : (vec3){1, 0, 0};
 }
 
-/* The eight corners of the camera frustum between two view-space depths. */
+/* The eight corners of the camera frustum between two view-space depths.
+ * An orthographic projection (w row 0,0,0,1) has parallel edges: the near
+ * corners simply slide back to the depth instead of scaling. */
 static void frustum_slice_corners(mat4 inv_view, mat4 proj, float d0, float d1, vec3 out[8]) {
     const mat4 inv_proj = vkmin_mat4_inverse(proj);
+    const bool ortho = proj.m[15] == 1.0f && proj.m[11] == 0.0f;
     for (int k = 0; k < 8; ++k) {
         const float nx = (k & 1) ? 1.0f : -1.0f, ny = (k & 2) ? 1.0f : -1.0f;
         const vec3 on_near = vkmin_mat4_mul_point(inv_proj, (vec3){nx, ny, 0.0f});
         const float depth = (k & 4) ? d1 : d0;
-        const vec3 view_p = vkmin_vec3_scale(on_near, depth / -on_near.z);
+        const vec3 view_p = ortho ? (vec3){on_near.x, on_near.y, -depth} : vkmin_vec3_scale(on_near, depth / -on_near.z);
         out[k] = vkmin_mat4_mul_point(inv_view, view_p);
     }
 }

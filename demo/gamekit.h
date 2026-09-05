@@ -138,7 +138,7 @@ static inline vec4 gk_world_bounds(mat4 transform, vec4 local) {
 }
 
 static inline mat4 gk_mat4_from_array(const float *a) {
-    mat4 m;
+    mat4 m = vkmin_mat4_identity();
     memcpy(m.m, a, sizeof m.m);
     return m;
 }
@@ -170,6 +170,11 @@ static inline uint32_t gk_load_scene(vkr *r, vkmin_ctx *gpu, const scene *s, uin
                                                   .skin_vertices = s->skin_vertices, .skin_vertex_count = s->header.skin_vertex_count,
                                                   .meshes = s->meshes, .mesh_count = s->header.mesh_count});
 }
+
+/* A node's own world transform, as cooked. Bone matrices are built against
+ * this, not the placed instance transform: anim_bones cancels what it is
+ * given, so give it the placement too and the placement cancels as well. */
+static inline mat4 gk_node_transform(const scene *s, uint32_t node) { return gk_mat4_from_array(s->nodes[node].transform); }
 
 /* The instance for one node of a loaded scene, placed by `placement`. */
 static inline Instance gk_scene_instance(const scene *s, uint32_t node, uint32_t first_mesh, uint32_t first_material, mat4 placement) {
