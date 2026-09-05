@@ -15,7 +15,8 @@ vec3 gateVeil(vec3 surface) {
     vec2 mouth=(o.eye.xyz+t*ray).xy;
     float r=length(mouth)/(OMEGA_GATE_MOUTH_RADIUS*shape.z);
     float footprint=1.-smoothstep(.94,1.12,r);
-    float recess=smoothstep(OMEGA_GATE_PYLON_Z+10.,OMEGA_GATE_PYLON_Z+60.,world.z);
+    // The half of each pylon inside the funnel dissolves into its energy.
+    float recess=smoothstep(OMEGA_GATE_MOUTH_Z,OMEGA_GATE_MOUTH_Z+18.,world.z);
     float veil=(1.-exp(-recess*4.5))*footprint*smoothstep(.15,.85,o.scene.w);
     vec2 screen=gl_FragCoord.xy/vec2(textureSize(TEX(o.gate_id),0));
     return mix(surface,texture(TEX(o.gate_id),screen).rgb,veil);
@@ -31,11 +32,11 @@ void main() {
     if(material==5) {
         if(o.flash<.01) discard;
         float fres=pow(abs(dot(n,v)),.6);
-        result=vec4(vec3(12, .025, .008)*o.flash+vec3(9,2.0,.8)*pow(fres,3.)*o.flash,1); return;
+        result=vec4(vec3(5.5, .02, .006)*o.flash+vec3(7,1.6,.6)*pow(fres,3.)*o.flash,1); return;
     }
     if(material==3 || material==4) {
         vec3 emission=material==3?vec3(.12,2.3,4.4):vec3(3.2,.9,.12);
-        float level=structure>.5?.10:1.;
+        float level=(structure>.5 && material==3)?.10:1.;
         result=vec4(gateVeil(tint.rgb*emission*(1.2+.15*sin(o.scene.x*7.+local.z))*level),1); return;
     }
     // Choose a face in model space. World normals rotate with the habitat and
@@ -78,12 +79,12 @@ void main() {
     float ao=mix(.60,1.,smoothstep(.65,3.8,length(local.xy)));
     vec3 c=base*(vec3(.06,.08,.13)*ao+vec3(1.4,1.32,1.18)*ndl*visibility);
     c+=vec3(.8,.70,.57)*spec*visibility;
-    c*=mix(1.,.13+.30*o.scene.w,structure);
+    c*=mix(1.,.38+.30*o.scene.w,structure);
     c+=vec3(.025,.42,1.)*(base*.7+fres*.18)*pow(max(dot(n,rim),0.),.65)*o.scene.w*1.4;
     // The fixed gate machinery receives blue light from its inward emitters.
     if(structure>.5) c+=base*vec3(.08,.6,1.3)*max(dot(n,normalize(vec3(-world.xy,0))),0.)*o.scene.w;
     float ignition=smoothstep(1.,1.65,o.scene.x)*(1.-smoothstep(1.8,2.65,o.scene.x));
-    if(structure>.5) c+=base*vec3(.2,1.8,3.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
+    if(structure>.5) c+=base*vec3(3.,2.6,2.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
     // The plasma muzzle lights illuminate the forward armor in world space.
     for(int j=0;j<2;j++) {
         vec3 light=vec3(j==0?-1.25:1.25,.55,-10.1+o.scene.z)-world;

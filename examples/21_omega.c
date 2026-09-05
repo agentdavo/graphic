@@ -71,6 +71,29 @@ static void tube(omega_mesh *m,vec3 a,vec3 b,float ra,float rb,vec4 color,int ma
         quad(m,p,q,r,ss,color,material); triangle(m,a,q,p,color,material); triangle(m,b,ss,r,color,material);
     }
 }
+/* Tapered flat blade from root to tip. chord is the width direction; the
+ * thickness direction follows from it, so root and tip stay parallel. */
+static void blade(omega_mesh *m,vec3 root,vec3 tip,vec3 chord,float root_len,float tip_len,
+                  float root_thick,float tip_thick,vec4 color,int material) {
+    const vec3 axis=vkmin_vec3_normalize(vkmin_vec3_sub(tip,root));
+    const vec3 c=vkmin_vec3_normalize(chord);
+    const vec3 t=vkmin_vec3_normalize(vkmin_vec3_cross(axis,c));
+    vec3 corner[2][4];
+    for(int end=0;end<2;++end) {
+        const vec3 centre=end?tip:root;
+        const float half_len=(end?tip_len:root_len)*.5f,half_thick=(end?tip_thick:root_thick)*.5f;
+        for(int k=0;k<4;++k) {
+            const float sc=(k==0||k==3)?-half_len:half_len,st=k<2?-half_thick:half_thick;
+            corner[end][k]=vkmin_vec3_add(centre,vkmin_vec3_add(vkmin_vec3_scale(c,sc),vkmin_vec3_scale(t,st)));
+        }
+    }
+    for(int k=0;k<4;++k) {
+        const int j=(k+1)%4;
+        quad(m,corner[0][k],corner[0][j],corner[1][j],corner[1][k],color,material);
+    }
+    quad(m,corner[0][3],corner[0][2],corner[0][1],corner[0][0],color,material);
+    quad(m,corner[1][0],corner[1][1],corner[1][2],corner[1][3],color,material);
+}
 static omega_mesh make_ship(void) {
     omega_mesh m={.v=calloc(OMEGA_CAPACITY,sizeof(OmegaVertex))};
     VKMIN_ASSERT(m.v,"omega mesh allocation");
@@ -88,7 +111,7 @@ static omega_mesh make_ship(void) {
         tube(&m,(vec3){x*1.25f,.55f,-8.9f},(vec3){x*1.25f,.55f,-9.45f},.47f,.32f,dark,0,16);
         tube(&m,(vec3){x*1.25f,.55f,-9.45f},(vec3){x*1.25f,.55f,-10.0f},.23f,.19f,steel,0,16);
         tube(&m,(vec3){x*1.25f,.55f,-10.01f},(vec3){x*1.25f,.55f,-10.04f},.13f,.13f,red,4,16);
-        tube(&m,(vec3){x*1.25f,.55f,-10.05f},(vec3){x*1.25f,.55f,-90.f},.085f,.07f,red,5,12);
+        tube(&m,(vec3){x*1.25f,.55f,-10.05f},(vec3){x*1.25f,.55f,-90.f},.042f,.034f,red,5,12);
         for(int k=0;k<3;++k) {
             tube(&m,(vec3){x*.95f,-1.7f,-8.98f+(float)k*.08f},(vec3){x*.95f,-.65f,-8.98f+(float)k*.08f},.27f,.27f,dark,0,12);
         }
@@ -177,54 +200,46 @@ static omega_mesh make_ship(void) {
             tube(&m,(vec3){tip.x,tip.y,tip.z+.36f},(vec3){tip.x,tip.y,tip.z+.55f},.067f,.018f,(vec4){.5f,.7f,1,1},3,8);
         }
     }
-    // Four longitudinal containment pylons surround the transit corridor.
-    // Their forward caps bracket the mouth; the spines recede into the gate.
+    // Four containment pylons run from the mouth back toward the camera, so
+    // the vortex forms at their far tips and the emerging hull passes between
+    // them. Each is an open box truss of four rails with a cross frame, a
+    // yellow window bay and a pair of long tangential blade fins per station.
     m.part=3;
     for(int station=0;station<4;++station) {
         const uint32_t first=m.count;
-        const vec4 frame={.42f,.46f,.50f,1}, radiator={.045f,.085f,.15f,1};
-        const float front=OMEGA_GATE_PYLON_Z,radial=15.8f;
-        hull(&m,(vec3){0,radial,front+1},(vec3){1.9f,1.9f,2.8f},.4f,dark,0);
-        hull(&m,(vec3){0,radial,front-.3f},(vec3){2.2f,2.1f,.45f},.4f,frame,0);
-        hull(&m,(vec3){0,radial,69},(vec3){1.6f,1.5f,3},.3f,dark,0);
-        // Open lattice rails and swept radiator vanes run along the flight axis.
-        for(int side=-1;side<=1;side+=2) {
-            const float x=(float)side*.55f;
-            tube(&m,(vec3){x,radial-.45f,front+2},(vec3){x,radial-.45f,69},.11f,.09f,frame,0,6);
-            tube(&m,(vec3){x,radial+.45f,front+2},(vec3){x,radial+.45f,69},.11f,.09f,frame,0,6);
-            for(int bay=0;bay<8;++bay) {
-                const float z=front+2+(float)bay*7.4f;
-                tube(&m,(vec3){x,radial-.45f,z},(vec3){x,radial+.45f,z+7.2f},.07f,.07f,frame,0,5);
-                tube(&m,(vec3){x,radial+.45f,z},(vec3){x,radial-.45f,z+7.2f},.07f,.07f,frame,0,5);
-            }
-            for(int fin=0;fin<8;++fin) {
-                const float z=front+4+(float)fin*7.2f;
-                const float span=(float)side*(3.4f-(float)fin*.18f);
-                const vec3 a0={x,radial,z},b0={span,radial+.25f,z+2.5f};
-                const vec3 c0={span,radial+.25f,z+4.3f},d0={x,radial,z+1.1f};
-                quad(&m,a0,b0,c0,d0,radiator,2);
-                tube(&m,a0,b0,.055f,.035f,frame,0,5);
-                tube(&m,b0,c0,.035f,.035f,frame,0,5);
-                tube(&m,c0,d0,.035f,.055f,frame,0,5);
+        const vec4 rail={.36f,.21f,.12f,1}, frame={.30f,.29f,.27f,1}, fin={.50f,.56f,.66f,1};
+        const vec4 window={.30f,.70f,1.6f,1};
+        const float front=OMEGA_GATE_PYLON_Z,back=OMEGA_GATE_PYLON_BACK_Z,radial=OMEGA_GATE_PYLON_RADIAL;
+        const float hw=1.0f,hh=.8f;
+        for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2)
+            tube(&m,(vec3){(float)sx*hw,radial+(float)sy*hh,back},(vec3){(float)sx*hw,radial+(float)sy*hh,front-1},.17f,.17f,rail,0,6);
+        hull(&m,(vec3){0,radial,back-.4f},(vec3){2*hw+.4f,2*hh+.4f,.8f},.2f,dark,0);
+        hull(&m,(vec3){0,radial,front-.5f},(vec3){2*hw-.2f,2*hh-.2f,1.0f},.25f,frame,0);
+        for(int k=0;k<OMEGA_PYLON_STATIONS;++k) {
+            const float z=back+2+(float)k*OMEGA_PYLON_STATION_SPACING;
+            hull(&m,(vec3){0,radial,z},(vec3){2*hw+.5f,2*hh+.5f,.6f},.18f,frame,0);
+            for(int sx=-1;sx<=1;sx+=2) {
+                const float x=(float)sx;
+                hull(&m,(vec3){x*(hw-.12f),radial,z+3.f},(vec3){.08f,.38f,2.2f},.02f,window,4);
+                blade(&m,(vec3){x*hw,radial,z},(vec3){x*(hw+6.4f),radial,z+1.3f},
+                    (vec3){0,0,1},1.5f,.45f,.34f,.10f,fin,0);
             }
         }
-        // Distributed coils sustain the field along the corridor, with a
-        // broad inward emitter at each front cap instead of a radial spoke.
-        tube(&m,(vec3){0,radial,front+3},(vec3){0,radial,68},.25f,.25f,dark,0,12);
-        for(int coil=0;coil<16;++coil) {
-            const float z=front+3+(float)coil*3.8f;
-            tube(&m,(vec3){0,radial,z},(vec3){0,radial,z+.18f},.32f,.32f,(vec4){.12f,.3f,.5f,1},6,12);
-        }
-        tube(&m,(vec3){0,radial-.6f,front+1},(vec3){0,radial-1.4f,front+.2f},.42f,.27f,frame,0,16);
-        tube(&m,(vec3){0,radial-1.4f,front+.2f},(vec3){0,radial-1.55f,front+.05f},.23f,.23f,(vec4){.5f,.8f,1,1},6,16);
-        hull(&m,(vec3){0,radial,front-.57f},(vec3){.2f,.1f,.05f},.02f,(vec4){.3f,.5f,.7f,1},4);
-        // Rotate the complete local assembly around the mouth, including normals.
-        const float angle=omega_pi*.25f+(float)station*omega_pi*.5f;
+        // A broad inward emitter at the far cap injects energy into the mouth.
+        tube(&m,(vec3){0,radial-.7f,front-.5f},(vec3){0,radial-1.5f,front-.2f},.42f,.27f,frame,0,16);
+        tube(&m,(vec3){0,radial-1.5f,front-.2f},(vec3){0,radial-1.65f,front-.05f},.23f,.23f,(vec4){.5f,.8f,1,1},6,16);
+        // Splay the pylon outward about its far cap, then rotate the complete
+        // local assembly around the mouth, including normals.
+        const float splay_c=cosf(OMEGA_PYLON_SPLAY),splay_s=sinf(OMEGA_PYLON_SPLAY);
+        const float angle=(float)station*omega_pi*.5f;
         const float cs=cosf(angle),sn=sinf(angle);
         for(uint32_t i=first;i<m.count;++i) {
             const vec4 p=m.v[i].position,n=m.v[i].normal;
-            m.v[i].position.x=cs*p.x-sn*p.y; m.v[i].position.y=sn*p.x+cs*p.y;
-            m.v[i].normal.x=cs*n.x-sn*n.y; m.v[i].normal.y=sn*n.x+cs*n.y;
+            const float dy=p.y-radial,dz=p.z-front;
+            const vec3 sp={p.x,radial+dy*splay_c-dz*splay_s,front+dy*splay_s+dz*splay_c};
+            const vec3 sn3={n.x,n.y*splay_c-n.z*splay_s,n.y*splay_s+n.z*splay_c};
+            m.v[i].position.x=cs*sp.x-sn*sp.y; m.v[i].position.y=sn*sp.x+cs*sp.y; m.v[i].position.z=sp.z;
+            m.v[i].normal.x=cs*sn3.x-sn*sn3.y; m.v[i].normal.y=sn*sn3.x+cs*sn3.y; m.v[i].normal.z=sn3.z;
         }
     }
     return m;
@@ -454,9 +469,13 @@ int main(int argc,char **argv) {
         const float reveal=smooth(6.f,11.f,t);
         // Stay inside the mouth's viewing angle so the far throat remains
         // visible throughout the pan, even with the much deeper corridor.
+        // Off-axis and above, far enough back that the pylons reach toward
+        // the camera and the vortex sits at their tips; the reveal dollies in
+        // and swings wide so the emerging hull fills the frame.
         const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
-        const float angle=-.035f-.14f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
-        const vec3 eye={sinf(angle)*38,1.4f+2.2f*reveal+elevation,cosf(angle)*-38};
+        const float angle=-.195f-.55f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float radius=80.f-14.f*reveal;
+        const vec3 eye={sinf(angle)*radius,6.f+6.f*reveal+elevation,cosf(angle)*-radius};
         p.eye=(vec4){eye.x,eye.y,eye.z,1.4f*reveal};
         p.vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),
             vkmin_mat4_look_at(eye,(vec3){0,p.eye.w,1},(vec3){0,1,0}));

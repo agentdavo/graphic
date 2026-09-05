@@ -3,11 +3,12 @@
 **New demo: [OMEGA — Through the Blue](docs/omega.md).** A procedural destroyer
 emerges from a blue jump gate and fires its forward cannons, with a rotating
 habitat, escorts, custom shaders, shadows, bloom and synchronized sndmin audio.
-Four finned pylons power an ignition flash and expanding funnel with a dark
-throat; the ship approaches rapidly, brakes near the exit, and the gate closes.
+Four truss pylons with blade fins reach from the mouth toward an off-axis
+camera; they charge with red flares, a white flash opens a funnel with a dark
+throat, the ship approaches rapidly, brakes near the exit, and the gate closes.
 The 20-second sequence includes a crackling bass-heavy gate startup and an
-original 150 BPM electronic score synthesized with sndmin. The gate's energy
-veils the recessed pylons while leaving the emerging ship clear.
+original 150 BPM electronic score synthesized with sndmin. The grade clips
+highlights and bleeds chroma the way 1990s broadcast CGI did.
 On Windows, open `OMEGA.cmd`. Both MSYS2 UCRT and Clang builds are supported via
 `tools/build-msys2.ps1`; see the demo guide for controls and verified builds.
 
