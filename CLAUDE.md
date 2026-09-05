@@ -233,6 +233,37 @@ Concretely:
 - Housekeeping is a legitimate and valuable use of your time: tightening `const`, removing dead
   paths, making an analyser-hostile construct explicit, shrinking a function's reach.
 
+## 8. Toolchain on this Windows machine
+
+The compilers live in MSYS2 at `C:\msys64`. Nothing is on the default PATH,
+and `w64devkit/` is not installed, so do not search for `gcc` or `make`
+elsewhere or reach for `tools/test-windows.ps1`, which requires w64devkit.
+
+- Build and test through `tools/build-msys2.ps1` (`-Toolchain ucrt64` is the
+  verified default; `clang64` is also present). It sets PATH to
+  `C:/msys64/<toolchain>/bin` and `C:/msys64/usr/bin`, runs
+  `mingw32-make` with `BUILD=build/omega-<suffix>`, and reads `VULKAN_SDK`.
+  Pass one make target per invocation, e.g. `-Target all`, `-Target test`,
+  `-Target omega`, `-Headless` for the null-audio, no-GLFW build.
+- `make test` needs three things the script does not supply. Prepend
+  `build/deps/cppcheck-src` to PATH for `cppcheck`; MSYS2 here has no
+  `diffutils`, so prepend `C:\Program Files\Git\usr\bin` for `cmp`; and set
+  `VK_DRIVER_FILES` to the absolute path of `build/deps/lavapipe.json`. The
+  relative-path manifest under `build/deps/mesa/x64` fails to load through
+  the MSYS2 shell and the harness then reports "test driver is not lavapipe".
+- Under Windows PowerShell 5.1 a native program that writes to stderr while
+  `$ErrorActionPreference = 'Stop'` looks like a failure. Check the exit code
+  or the output file before concluding a run failed; `ex_21_omega --headless`
+  prints its device line to stderr and succeeds.
+- GLFW 3.5.1 binaries are cached under `build/deps/glfw`; the build script
+  downloads them only when missing.
+- Claude Code's Bash tool exports `NoDefaultCurrentDirectoryInExePath=1`.
+  Under it, Windows will not launch `build/x/foo.exe` without a `./` prefix,
+  so python test drivers that spawn relative executables
+  (`tools/test_sndmin_shared.py`, `tools/test_unison.py`) fail from that
+  shell with WinError 2 while the executables exist. Run those from the
+  PowerShell tool, or `env -u NoDefaultCurrentDirectoryInExePath` first.
+
 ---
 
 ## Sources

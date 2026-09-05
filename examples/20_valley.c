@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
 #ifdef SNDMIN_VALLEY
     valley_audio audio=valley_audio_init(shared_journal);
 #endif
-    double measured[6] = {0}, minimum_ms = INFINITY, maximum_ms = 0;
+    double measured[6] = {0}, minimum_ms = HUGE_VAL, maximum_ms = 0;
     uint32_t measurements = 0;
     while (vkmin_running(gpu)) {
         const vkmin_frame frame = vkmin_frame_begin(gpu,NULL);

@@ -30,9 +30,12 @@ scene scene_load(const char *path) {
     size_t off = sizeof(vkm_header);
 #define TAKE(field, type, count)                                                   \
     do {                                                                          \
+        if ((size_t)(count) > ((size_t)size-off)/sizeof(type))                    \
+            fail(path, "truncated: " #field);                                   \
         const size_t bytes__ = (size_t)(count) * sizeof(type);                    \
-        if (off + bytes__ > (size_t)size) fail(path, "truncated: " #field);       \
-        s.field = (const type *)(blob + off);                                     \
+        const void *record__ = blob + off;                                       \
+        if ((uintptr_t)record__ % _Alignof(type)) fail(path, "unaligned: " #field); \
+        s.field = record__;                                                       \
         off += bytes__;                                                           \
     } while (0)
     TAKE(vertices, Vertex, s.header.vertex_count);

@@ -315,7 +315,7 @@ static uint16_t gen_next(uint16_t gen) { return (uint16_t)(gen >= 4095 ? 1 : gen
 
 /* --------------------------------------------------------- debug naming --- */
 
-static void set_name(vkmin_ctx *c, VkObjectType type, uint64_t handle, const char *fmt, ...) {
+static void VKMIN_PRINTF(4, 5) set_name(vkmin_ctx *c, VkObjectType type, uint64_t handle, const char *fmt, ...) {
     if (!c->fp_set_name || handle == 0) return;
     char buf[128];
     va_list ap;

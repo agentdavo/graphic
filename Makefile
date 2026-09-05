@@ -19,7 +19,7 @@ OPT      ?= -O2 -g
 ifeq ($(SANITIZE),1)
 SAN := -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
-INCLUDES := -Isrc -Idemo -Ithird_party -I$(BUILD)
+INCLUDES := -Isrc -Idemo -Ithird_party -I$(BUILD) $(GLFW_CFLAGS)
 ifeq ($(OS),Windows_NT)
 INCLUDES += -I$(subst \,/,$(VULKAN_SDK))/Include
 endif
@@ -53,6 +53,16 @@ EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
 
 all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
 include Makefile.sndmin
+OMEGA_AUDIO_BACKEND := $(SND_BUILD)/sndmin_miniaudio.o
+OMEGA_AUDIO_LIBS := $(SND_LIVE_LIBS)
+ifeq ($(HEADLESS),1)
+OMEGA_AUDIO_BACKEND := $(SND_BUILD)/sndmin_null.o
+OMEGA_AUDIO_LIBS :=
+endif
+.PHONY: omega
+omega: $(BUILD)/ex_21_omega
+$(BUILD)/ex_21_omega: examples/21_omega.c demo/omega_shared.h demo/omega_score.h $(BUILD)/shaders.h $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND)
+	$(CC) $(CFLAGS) -ffp-contract=off -o $@ $< $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND) $(LDLIBS) $(GLFW_LIBS) $(OMEGA_AUDIO_LIBS)
 all: sndmin
 test: sndmin-test $(BUILD)/sndmin_valley
 test: $(BUILD)/sndmin_unison
@@ -79,7 +89,7 @@ $(BUILD):
 
 # --- shaders: compiled offline, embedded as uint32_t arrays. No runtime
 # --- shader compiler, no file-path failure mode in the binary.
-$(BUILD)/%.spv: shaders/% Makefile $(wildcard shaders/*.glsl shaders/lib/*.glsl) src/shared.h | $(BUILD)
+$(BUILD)/%.spv: shaders/% Makefile $(wildcard shaders/*.glsl shaders/lib/*.glsl) src/shared.h demo/omega_shared.h | $(BUILD)
 	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
 
 $(BUILD)/bin2c: tools/bin2c.c | $(BUILD)
@@ -140,10 +150,10 @@ $(BUILD)/corridor: demo/corridor.c demo/anim.h demo/gamekit.h src/render.h src/s
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/imgdiff: tools/imgdiff.c $(BUILD)/stb_bridge.o | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^) -lm
 
 $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^) -lm
 
 $(BUILD)/mat4_test: tests/mat4_test.c src/vkmin_math.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -172,8 +182,11 @@ font: $(BUILD)/mkfont
 $(BUILD)/cook_image.o: tools/cook_image.c tools/cook_image.h | $(BUILD)
 	$(CC) $(THIRD_PARTY_CFLAGS) -Itools -c -o $@ $<
 
-$(BUILD)/cook: tools/cook.c tools/cook_image.h src/vkm_format.h src/shared.h $(BUILD)/cook_image.o | $(BUILD)
-	$(CC) $(CFLAGS) -Itools -Wno-unused-function -o $@ $< $(BUILD)/cook_image.o -lm
+$(BUILD)/cgltf_bridge.o: tools/cgltf_bridge.c third_party/cgltf.h | $(BUILD)
+	$(CC) $(THIRD_PARTY_CFLAGS) -c -o $@ $<
+
+$(BUILD)/cook: tools/cook.c tools/cook_image.h src/vkm_format.h src/shared.h $(BUILD)/cook_image.o $(BUILD)/cgltf_bridge.o | $(BUILD)
+	$(CC) $(CFLAGS) -Itools -Wno-unused-function -o $@ $< $(BUILD)/cook_image.o $(BUILD)/cgltf_bridge.o -lm
 
 texture: $(BUILD)/mktex
 	./$(BUILD)/mktex tests/assets/grid.png

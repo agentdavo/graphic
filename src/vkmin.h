@@ -39,6 +39,16 @@
 
 #include "shared.h"
 
+#if defined(__GNUC__) && !defined(__clang__)
+/* MinGW's plain printf archetype still describes the older MSVCRT dialect;
+ * this C11 library uses size_t's %zu, supported by its stdio implementation. */
+#define VKMIN_PRINTF(format_index, first_arg) __attribute__((format(gnu_printf, format_index, first_arg)))
+#elif defined(__clang__)
+#define VKMIN_PRINTF(format_index, first_arg) __attribute__((format(printf, format_index, first_arg)))
+#else
+#define VKMIN_PRINTF(format_index, first_arg)
+#endif
+
 /* ---- compile-time configuration; every value has a default ------------- */
 #ifndef VKMIN_MAX_BUFFERS
 #define VKMIN_MAX_BUFFERS 64
@@ -212,7 +222,7 @@ typedef struct {                  /* what a device offers and what vkmin would d
 vkmin_report vkmin_probe(int device_index);                                  // io (a throwaway instance)
 vkmin_ctx *vkmin_init(const vkmin_desc *);                                   // writes ctx, gpu, io
 void vkmin_shutdown(vkmin_ctx *);                                            // writes ctx, gpu, io
-_Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...); // io, aborts
+_Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...) VKMIN_PRINTF(3, 4); // io, aborts
 
 /* ---- frame ------------------------------------------------------------------ */
 /* The loop:  while (vkmin_running(ctx)) { f = vkmin_frame_begin(ctx, clear); ... vkmin_frame_end(ctx); }

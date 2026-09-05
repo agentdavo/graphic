@@ -10,7 +10,6 @@
  * Tools are not core and are not held to the core line budget, but they are
  * held to the same warning set.
  */
-#define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
 
 #include "cook_image.h"

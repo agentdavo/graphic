@@ -1,5 +1,16 @@
 # vkmin / sndmin — v0.6 integration candidate
 
+**New demo: [OMEGA — Through the Blue](docs/omega.md).** A procedural destroyer
+emerges from a blue jump gate and fires its forward cannons, with a rotating
+habitat, escorts, custom shaders, shadows, bloom and synchronized sndmin audio.
+Four finned pylons power an ignition flash and expanding funnel with a dark
+throat; the ship approaches rapidly, brakes near the exit, and the gate closes.
+The 20-second sequence includes a crackling bass-heavy gate startup and an
+original 150 BPM electronic score synthesized with sndmin. The gate's energy
+veils the recessed pylons while leaving the emerging ship clear.
+On Windows, open `OMEGA.cmd`. Both MSYS2 UCRT and Clang builds are supported via
+`tools/build-msys2.ps1`; see the demo guide for controls and verified builds.
+
 Two C11 libraries, one integer simulation timeline and one shared replay file.
 The valley now advances every audio tick even when images are skipped. Its
 two-minute ambient score uses three public synth patches. A small
