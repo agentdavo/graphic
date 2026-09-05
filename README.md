@@ -319,10 +319,13 @@ their rays). By the brief's rule the first two belong in v0.5.
 
 ## Test coverage, in numbers
 
-`make test` runs **42 checks**: a pure-function unit test, the handle-
-generation test, the `--no-readback` refusal, seven example goldens, the
-journal (two recordings replayed at tolerance 0, one across paths), the
-`--probe` report, an amalgamation compile, the GPU-layer smoke test (plus
+`make test` runs **57 checks**: the maths unit test (cameras and rays
+included), the handle-generation and wrong-`push_size` aborts, the
+`--no-readback` refusal, seven example goldens, the journal (recordings of
+`06_cube`, The Corridor and `14_anime` replayed at tolerance 0, two across
+paths), `vkmin_pick` on both paths, the five games replaying their demo files
+to goldens on the default path and bit-identical on the legacy path (the rts
+with `d_check_cull=1`), the `--probe` report, an amalgamation compile, the GPU-layer smoke test (plus
 its BC1 variant), **9 golden images** compared at **2/255 per channel** with a
 diff image written on failure (four Corridor frames, two debug views, the
 overlay, two smoke renders), the same four frames on the modern path at
@@ -332,7 +335,7 @@ compact/stable cull, clustered/brute-force lighting, naive/pipelined sync),
 six debug-view renders, and two windowed runs under Xvfb (one per path)
 compared to the offscreen render at tolerance 0. cppcheck is a prerequisite
 of the target and fails it. From clean on this machine the whole run takes
-**~95 s**, of which the build is about 20.
+about six minutes, most of it the shooter's two Sponza replays under lavapipe.
 
 `.github/workflows/test.yml` runs it on a GPU-less runner under lavapipe. It
 was written here, where GitHub Actions cannot execute; its first real run is
