@@ -26,8 +26,9 @@ The 20-second loop follows the supplied gate-opening sequence:
 | 1–2.65 seconds | Central white ignition flash, with halo, streak and ring, lights the structures |
 | 2–4.5 seconds | A small blue ring with a dark centre expands into the funnel |
 | 4.5–9.55 seconds | Tiny ship cruises rapidly through the distant corridor |
-| 9.55–12 seconds | Rapid perspective growth and braking at the pylon tips |
+| 9.55–13 seconds | Rapid perspective growth; the hull settles to 22 units/second and flies out past the camera |
 | 10.25–16.25 seconds | Two short–short–long bursts, beginning halfway out of the gate |
+| 13–17 seconds | The camera follows the receding hull, then pans back to the gate |
 | 17.5–19.5 seconds | Funnel contracts and pylon power fades |
 | 19.5–20 seconds | Structures remain in space before the sequence restarts |
 
@@ -37,8 +38,12 @@ existing audio tails continue to advance silently.
 
 The camera starts about 11 degrees off the gate axis and slightly above it,
 80 units back, so the splayed pylons reach toward the viewer with the vortex
-opening at their midpoint. The pan begins at 6 seconds and finishes at 11 seconds, swinging to a
-wide three-quarter view and dollying in while staying outside the pylon cage.
+opening at their midpoint. The pan begins at 6 seconds and finishes at 11
+seconds, swinging to a three-quarter view 62 units out and 28 units beside the
+corridor. From 11 to 12.6 seconds the look-at target slides from the gate to
+the hull, which passes about 30 units from the camera; between 14.4 and 17.2
+seconds it eases back to the gate for the closing. The shaders take the view
+direction from the view-projection rows rather than a separate target.
 Each cannon burst has two 0.23-second shots spaced 0.55 seconds apart, followed
 by a 1.3-second sustained beam. Bursts repeat every 3.6 seconds, with a shared
 tick schedule driving the beams, muzzle lighting and short/sustained sounds.
@@ -72,9 +77,10 @@ blue-violet nebula band sits behind the gate. Advected blue strands
 fade into a nearly black cap at the distant throat, with a soft outer edge and
 localized bloom against a black starfield. The ship remains visible
 inside the tunnel. It starts at z=1180 and cruises at 220 units/second until
-z=70 (9.55 seconds), then brakes exponentially toward z=-5. Position and speed
-are continuous at the transition. Speed is about 28 units/second at the mouth
-and 3 units/second by 11 seconds; most apparent growth happens during emergence.
+z=70 (9.55 seconds), then decelerates exponentially to a steady 22 units/second
+and keeps going, crossing the mouth at 10.25 seconds, passing the camera at
+about 12.8 seconds and reaching z=-213 by the end of the loop. Position and
+speed are continuous at the transition.
 Perspective makes the ship grow as it approaches; its geometry is not scaled.
 The mouth sits at z=4.5, midway along the pylons. Its 12.6-unit radius fits
 inside the pylons, whose axes sit 15.8 units from the corridor center at the

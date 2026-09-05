@@ -33,11 +33,16 @@ float coneHit(vec3 eye,vec3 ray,float z0,float z1,float r0,float r1) {
     return hit;
 }
 void main() {
-    vec2 screen=uv*2.-1.; screen.x*=o.scene.y; screen.y=-screen.y;
-    vec3 forward=normalize(vec3(0,o.eye.w,1)-o.eye.xyz);
-    vec3 right=normalize(cross(forward,vec3(0,1,0)));
-    vec3 up=cross(right,forward);
-    vec3 ray=normalize(forward+tan(.392699)* (right*screen.x+up*screen.y));
+    // Exact view ray from the view-projection rows: the direction d whose
+    // clip x/w and y/w equal this pixel's NDC satisfies (r0-x r3).d=0 and
+    // (r1-y r3).d=0. No separate target, FOV or aspect needs passing.
+    vec2 ndc=uv*2.-1.;
+    vec3 r0=vec3(o.vp[0][0],o.vp[1][0],o.vp[2][0]);
+    vec3 r1=vec3(o.vp[0][1],o.vp[1][1],o.vp[2][1]);
+    vec3 r3=vec3(o.vp[0][3],o.vp[1][3],o.vp[2][3]);
+    vec3 ray=cross(r0-ndc.x*r3,r1-ndc.y*r3);
+    if(dot(ray,r3)<0.) ray=-ray;
+    ray=normalize(ray);
     vec2 sky=vec2(atan(ray.x,ray.z),asin(ray.y));
     vec3 color=vec3(0);
     for(int layer=0;layer<2;layer++) {
@@ -51,8 +56,11 @@ void main() {
     }
     // A faint blue-violet nebula band, as behind the gate in the footage.
     float band=exp(-pow((sky.y+.30+.18*sin(sky.x*1.7+.8))*4.,2.));
-    float nebula=fbm(sky*5.5+vec2(3.1,7.9))*fbm(sky*13.+vec2(1.3,2.2));
-    color+=vec3(.05,.08,.34)*band*nebula*.22;
+    // Streaks along the band: stretched, single-octave-weighted noise.
+    vec2 streak=vec2(sky.x*3.+sky.y*9.,sky.y*28.-sky.x*4.);
+    float nebula=fbm(streak+vec2(3.1,7.9));
+    nebula=pow(max(nebula-.25,0.)*1.6,1.6);
+    color+=vec3(.05,.08,.34)*band*nebula*.10;
     vec3 skyColor=color;
     if(o.scene.w>.005) {
         float aperture=o.scene.w,time=o.scene.x;

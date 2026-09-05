@@ -10,7 +10,7 @@ vec3 omegaGateShape() {
     float a=o.scene.w;
     float nearZ=OMEGA_GATE_MOUTH_Z,farZ=OMEGA_GATE_ENTRANCE_Z;
     if(o.scene.x<OMEGA_GATE_CLOSE_START) return vec3(nearZ,mix(nearZ,farZ,a),a);
-    vec3 forward=normalize(vec3(0,o.eye.w,1)-o.eye.xyz);
+    vec3 forward=normalize(vec3(o.vp[0][3],o.vp[1][3],o.vp[2][3])); // clip w row
     float nearDepth=dot(vec3(0,0,nearZ)-o.eye.xyz,forward);
     float farDepth=dot(vec3(0,0,farZ)-o.eye.xyz,forward);
     float scale=a*farDepth/max(nearDepth+a*(farDepth-nearDepth),.001);

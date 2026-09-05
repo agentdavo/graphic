@@ -247,13 +247,16 @@ static omega_mesh make_ship(void) {
 
 static float clamp01(float x) { return fmaxf(0,fminf(1,x)); }
 static float smooth(float a,float b,float t) { const float s=clamp01((t-a)/(b-a)); return s*s*(3-2*s); }
-/* Full-sized ship cruises through a very deep tunnel, then brakes only in the
- * final approach to the pylon tips. Position and speed are continuous. */
+/* Full-sized ship cruises through a very deep tunnel, decelerates through the
+ * mouth to a steady 22 units/second and flies on past the camera, as in the
+ * footage. Position and speed are continuous; the hull centre crosses the
+ * mouth at 10.25 seconds (tick 615). */
 static float ship_position(float t) {
-    const float start=OMEGA_GATE_ENTRANCE_Z-20.f,speed=220.f,brake=70.f,stop=-5.f;
+    const float start=OMEGA_GATE_ENTRANCE_Z-20.f,speed=220.f,brake=70.f,cruise=22.f,rate=3.7f;
     const float travel=fmaxf(0,t-4.5f),brake_time=(start-brake)/speed;
     if(travel<brake_time) return start-speed*travel;
-    return stop+(brake-stop)*expf(-speed/(brake-stop)*(travel-brake_time));
+    const float dt=travel-brake_time;
+    return brake-cruise*dt-(speed-cruise)/rate*(1-expf(-rate*dt));
 }
 /* Shared audiovisual rhythm: two 14-tick taps, then a 78-tick sustained beam.
  * At tick 615 the hull center reaches the mouth: half the ship is out. */
@@ -470,15 +473,19 @@ int main(int argc,char **argv) {
         // Stay inside the mouth's viewing angle so the far throat remains
         // visible throughout the pan, even with the much deeper corridor.
         // Off-axis and above, far enough back that the pylons reach toward
-        // the camera and the vortex sits at their tips; the reveal dollies in
-        // and swings wide so the emerging hull fills the frame.
+        // the camera and the vortex opens at their midpoint. The reveal
+        // dollies in and swings to a three-quarter view; the camera then
+        // follows the hull as it flies past and pans back for the closing.
         const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
-        const float angle=-.195f-.55f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
-        const float radius=80.f-14.f*reveal;
+        const float angle=-.195f-.28f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float radius=80.f-18.f*reveal;
         const vec3 eye={sinf(angle)*radius,6.f+6.f*reveal+elevation,cosf(angle)*-radius};
-        p.eye=(vec4){eye.x,eye.y,eye.z,1.4f*reveal};
+        const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
+        const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
+        const vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
+        p.eye=(vec4){eye.x,eye.y,eye.z,0};
         p.vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),
-            vkmin_mat4_look_at(eye,(vec3){0,p.eye.w,1},(vec3){0,1,0}));
+            vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
         p.scene=(vec4){t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))};
         p.flash=cannon_flash(visual); p.padding=-1; p.texture_id=shadow_index;
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});
