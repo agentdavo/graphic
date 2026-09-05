@@ -24,7 +24,7 @@
     } while (0)
 
 enum {
-    VKR_MAX_OVERLAY_QUADS = 4096,
+    VKR_MAX_QUADS = 16384,      /* per frame, the game's plus the overlay's */
     VKR_MAX_TRANSPARENT = 512,
     VKR_MAX_SHADOW_LIGHTS = 16,
     VKR_LOCAL_TILES = 48,   /* three quadrants of 16 tiles each */
@@ -33,13 +33,13 @@ enum {
 };
 
 const char *const vkr_pass_names[8] = {"cull", "shadows", "prepass", "clusters",
-                                       "opaque", "transparent", "tonemap", "overlay"};
+                                       "opaque", "transparent", "post", "quads"};
 
 /* Every cvar the frame reads, read once at the top and never again. */
 typedef struct {
-    bool shadows, normal_maps, clustered, prepass, gpu_cull, transparent, overlay, freeze, compact;
+    bool shadows, normal_maps, clustered, prepass, gpu_cull, transparent, overlay, freeze, compact, quads, check_cull;
     int cascades, shadow_lights, debug, tonemap;
-    float shadow_bias, normal_bias, cascade_lambda, exposure, shadow_distance;
+    float shadow_bias, normal_bias, cascade_lambda, exposure, shadow_distance, outline, lut;
     uint32_t max_lights;
 } settings;
 
@@ -54,6 +54,10 @@ static settings read_settings(void) {
         .overlay = cvar_get_bool(CV_r_overlay),
         .freeze = cvar_get_bool(CV_r_freeze_cull),
         .compact = cvar_get_bool(CV_r_cull_compact),
+        .quads = cvar_get_bool(CV_r_quads),
+        .check_cull = cvar_get_bool(CV_d_check_cull),
+        .outline = cvar_get(CV_r_outline),
+        .lut = cvar_get(CV_r_lut),
         .cascades = cvar_get_int(CV_r_cascades),
         .shadow_lights = cvar_get_int(CV_r_shadow_lights),
         .debug = cvar_get_int(CV_r_debug),
@@ -77,13 +81,13 @@ struct vkr {
     vkmin_ctx *gpu;
     vkr_desc desc;
 
-    vkmin_image hdr, depth, atlas, font;
-    uint32_t hdr_tex, atlas_shadow_tex, atlas_raw_tex, font_tex;
+    vkmin_image hdr, depth, atlas, font, id, normal, ramp;
+    uint32_t hdr_tex, atlas_shadow_tex, atlas_raw_tex, font_tex, depth_tex, normal_tex, ramp_tex;
 
     vkmin_pipe cull, cluster;
     vkmin_pipe depth_cull, depth_nocull;
     vkmin_pipe fwd_cull, fwd_nocull, fwd_blend;
-    vkmin_pipe tonemap, overlay;
+    vkmin_pipe tonemap, quad_world, quad_screen;
 
     vkmin_buffer vertices, indices, skin_vertices, meshes, materials;
     vkmin_buffer draw_cmds, draw_counts, cluster_lights;
@@ -99,6 +103,13 @@ struct vkr {
      * cull and the transparent sort. A few kilobytes. */
     Mesh *host_meshes;
     Material *host_materials;
+
+    /* d_check_cull: the CPU reference list for the camera view, kept per slot
+     * until the GPU list written that frame has been read back. */
+    DrawCmd *check_cpu[VKR_FRAMES];
+    uint32_t check_cpu_count[VKR_FRAMES];
+    const DrawCmd *check_gpu[VKR_FRAMES];
+    bool check_valid[VKR_FRAMES];
 
     mat4 frozen_view_proj;
     bool frozen;
@@ -140,16 +151,31 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->hdr = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height,
                                                        .format = VKMIN_FMT_R11G11B10_FLOAT,
                                                        .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_SAMPLED, .label = "vkr.hdr"});
-    r->depth = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height,
-                                                         .format = VKMIN_FMT_D32_FLOAT, .usage = VKMIN_IMAGE_DEPTH, .label = "vkr.depth"});
+    r->depth = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height, .format = VKMIN_FMT_D32_FLOAT,
+                                                         .usage = VKMIN_IMAGE_DEPTH | VKMIN_IMAGE_SAMPLED, .label = "vkr.depth"});
+    r->id = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height, .format = VKMIN_FMT_R32_UINT,
+                                                      .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_READBACK, .label = "vkr.id"});
+    r->normal = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height, .format = VKMIN_FMT_RG16_UNORM,
+                                                          .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_SAMPLED, .label = "vkr.normal"});
     r->atlas = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->shadow_atlas, .height = desc->shadow_atlas,
                                                          .format = VKMIN_FMT_D32_FLOAT,
                                                          .usage = VKMIN_IMAGE_DEPTH | VKMIN_IMAGE_SAMPLED, .label = "vkr.shadow_atlas"});
     r->hdr_tex = vkmin_register_texture(gpu, r->hdr, VKMIN_SAMPLER_LINEAR_CLAMP);
     r->atlas_shadow_tex = vkmin_register_texture(gpu, r->atlas, VKMIN_SAMPLER_SHADOW);
     r->atlas_raw_tex = vkmin_register_texture(gpu, r->atlas, VKMIN_SAMPLER_NEAREST_CLAMP);
+    r->depth_tex = vkmin_register_texture(gpu, r->depth, VKMIN_SAMPLER_NEAREST_CLAMP);
+    r->normal_tex = vkmin_register_texture(gpu, r->normal, VKMIN_SAMPLER_NEAREST_CLAMP);
 
-    /* The baked font: coverage in every channel, sampled as .r. */
+    /* The default cel ramp: three steps over N.L, sampled with nearest so the
+     * bands are bands. A game supplies its own for a different look. */
+    const uint8_t ramp_px[8 * 4] = {40, 40, 40, 255, 40, 40, 40, 255, 40, 40, 40, 255, 140, 140, 140, 255,
+                                    140, 140, 140, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+    r->ramp = vkmin_make_image(gpu, &(vkmin_image_desc){.width = 8, .height = 1, .format = VKMIN_FMT_RGBA8_UNORM,
+                                                        .usage = VKMIN_IMAGE_SAMPLED, .label = "vkr.cel_ramp"});
+    vkmin_image_upload(gpu, r->ramp, 0, ramp_px, sizeof ramp_px);
+    r->ramp_tex = vkmin_register_texture(gpu, r->ramp, VKMIN_SAMPLER_NEAREST_CLAMP);
+
+    /* The baked SDF font: distance in every channel, sampled as .r. */
     uint8_t *font_px = malloc((size_t)FONT_ATLAS_W * FONT_ATLAS_H * 4);
     VKR_ASSERT(font_px != NULL, "out of memory");
     for (int i = 0; i < FONT_ATLAS_W * FONT_ATLAS_H; ++i) {
@@ -171,8 +197,15 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->draw_counts = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), .label = "vkr.draw_counts"});
     r->cluster_lights = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_CLUSTER_COUNT * VKMIN_CLUSTER_STRIDE * sizeof(uint32_t), .label = "vkr.cluster_lights"});
 
-    /* Nine pipelines for the whole engine, all created here, all against the
-     * one layout. */
+    /* Ten pipelines for the whole engine, all created here, all against the
+     * one layout. The forward shader is the game's choice: a canonical one
+     * or its own composed from shaders/lib. */
+    const uint32_t *fs = desc->fs ? desc->fs : desc->shading == VKR_SHADE_CEL ? lit_cel_frag_spv
+                                             : desc->shading == VKR_SHADE_UNLIT ? unlit_frag_spv : lit_pbr_frag_spv;
+    const size_t fs_bytes = desc->fs ? desc->fs_bytes : desc->shading == VKR_SHADE_CEL ? sizeof lit_cel_frag_spv
+                                                     : desc->shading == VKR_SHADE_UNLIT ? sizeof unlit_frag_spv : sizeof lit_pbr_frag_spv;
+    const char *fs_path = desc->fs ? NULL : desc->shading == VKR_SHADE_CEL ? "build/lit_cel.frag.spv"
+                                          : desc->shading == VKR_SHADE_UNLIT ? "build/unlit.frag.spv" : "build/lit_pbr.frag.spv";
     r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cull_comp_spv, .cs_bytes = sizeof cull_comp_spv, .label = "vkr.cull"});
     r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cluster_comp_spv, .cs_bytes = sizeof cluster_comp_spv, .label = "vkr.cluster"});
     const vkmin_pipe_desc depth_desc = {.vs = depth_vert_spv, .vs_bytes = sizeof depth_vert_spv,
@@ -188,10 +221,10 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     /* LESS_EQUAL with write on works with and without the prepass: after a
      * prepass it behaves as EQUAL, without one it is the ordinary depth test.
      * One pipeline set instead of two, for a negligible cost. */
-    const vkmin_pipe_desc fwd_desc = {.vs = scene_vert_spv, .vs_bytes = sizeof scene_vert_spv,
-                                      .fs = scene_frag_spv, .fs_bytes = sizeof scene_frag_spv,
-                                      .vs_path = "build/scene.vert.spv", .fs_path = "build/scene.frag.spv",
-                                      .color_format = VKMIN_FMT_R11G11B10_FLOAT, .depth = true, .depth_write = true,
+    const vkmin_pipe_desc fwd_desc = {.vs = scene_vert_spv, .vs_bytes = sizeof scene_vert_spv, .fs = fs, .fs_bytes = fs_bytes,
+                                      .vs_path = "build/scene.vert.spv", .fs_path = fs_path,
+                                      .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
+                                      .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
                                       .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_BACK, .label = "vkr.forward"};
     vkmin_pipe_desc f = fwd_desc;
     r->fwd_cull = vkmin_make_pipeline(gpu, &f);
@@ -208,15 +241,28 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
                                                               .fs = tonemap_frag_spv, .fs_bytes = sizeof tonemap_frag_spv,
                                                               .fs_path = "build/tonemap.frag.spv",
                                                               .color_format = bb, .cull = VKMIN_CULL_NONE, .label = "vkr.tonemap"});
-    r->overlay = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = overlay_vert_spv, .vs_bytes = sizeof overlay_vert_spv,
-                                                              .fs = overlay_frag_spv, .fs_bytes = sizeof overlay_frag_spv,
-                                                              .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.overlay"});
+    /* The batcher twice: world quads into the forward pass (HDR, depth
+     * tested, MRT extras masked by .blend), screen quads onto the backbuffer. */
+    r->quad_world = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = quad_vert_spv, .vs_bytes = sizeof quad_vert_spv,
+                                                                 .fs = quad_frag_spv, .fs_bytes = sizeof quad_frag_spv,
+                                                                 .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
+                                                                 .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
+                                                                 .depth = true, .depth_compare = VKMIN_CMP_LESS_EQUAL,
+                                                                 .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.world"});
+    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = quad_vert_spv, .vs_bytes = sizeof quad_vert_spv,
+                                                                  .fs = quad_frag_spv, .fs_bytes = sizeof quad_frag_spv,
+                                                                  .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.screen"});
+    for (int i = 0; i < VKR_FRAMES; ++i) {
+        r->check_cpu[i] = calloc(2u * desc->max_instances + 2u, sizeof(DrawCmd));
+        VKR_ASSERT(r->check_cpu[i] != NULL, "out of memory");
+    }
     return r;
 }
 
 void vkr_shutdown(vkr *r) {
     /* Every GPU object belongs to the vkmin context and dies with it. */
     if (!r) return;
+    for (int i = 0; i < VKR_FRAMES; ++i) free(r->check_cpu[i]);
     free(r->host_meshes);
     free(r->host_materials);
     free(r);
@@ -264,6 +310,8 @@ uint32_t vkr_upload_materials(vkr *r, const Material *m, uint32_t count) {
 }
 
 vkr_stats vkr_get_stats(const vkr *r) { return r->stats; }
+vkmin_image vkr_id_target(const vkr *r) { return r->id; }
+uint32_t vkr_font_tex(const vkr *r) { return r->font_tex; }
 
 /* ---------------------------------------------------------------- views --- */
 
@@ -525,28 +573,58 @@ static uint32_t sort_transparents(const vkr_frame_desc *f, const Material *mats,
     return n;
 }
 
+/* ------------------------------------------------------- the cull check --- */
+
+static int by_first_instance(const void *a, const void *b) {
+    const DrawCmd *x = a, *y = b;
+    return x->first_instance < y->first_instance ? -1 : x->first_instance > y->first_instance;
+}
+
+/* Ordering-stable comparison of a GPU-written draw list with the CPU one:
+ * the compact cull emits in whatever order the atomics decide, so both are
+ * sorted by instance first. Returns the count of entries that differ. */
+static uint32_t compare_draw_lists(const DrawCmd *gpu, const uint32_t *gpu_counts, DrawCmd *cpu, uint32_t cpu_count) {
+    DrawCmd sorted[VKMIN_MAX_DRAWS];
+    uint32_t live = 0;
+    /* Two lists (culled, double-sided), each `count` long; entries past the
+     * count are stale from earlier frames. The stable mode counts every
+     * instance and leaves the culled ones with instance_count 0. */
+    for (uint32_t list = 0; list < 2; ++list) {
+        for (uint32_t i = 0; i < gpu_counts[list] && i < VKMIN_MAX_DRAWS && live < VKMIN_MAX_DRAWS; ++i) {
+            const DrawCmd *d = &gpu[list * VKMIN_MAX_DRAWS + i];
+            if (d->instance_count) sorted[live++] = *d;
+        }
+    }
+    if (live > 1) qsort(sorted, live, sizeof sorted[0], by_first_instance);
+    if (cpu_count > 1) qsort(cpu, cpu_count, sizeof cpu[0], by_first_instance);
+    uint32_t bad = live > cpu_count ? live - cpu_count : cpu_count - live;
+    const uint32_t n = live < cpu_count ? live : cpu_count;
+    for (uint32_t i = 0; i < n; ++i) bad += memcmp(&sorted[i], &cpu[i], sizeof(DrawCmd)) != 0;
+    return bad;
+}
+
 /* ---------------------------------------------------------------- text ---- */
 
-static uint32_t layout_text(const char *text, OverlayQuad *quads, uint32_t cap) {
+uint32_t vkr_text(const vkr *r, const char *text, float x0, float y0, float px, uint32_t rgba, Quad *out, uint32_t cap) {
     if (!text) return 0;
+    const float k = px / FONT_PX; /* the atlas is baked at FONT_PX; the SDF scales it */
     uint32_t n = 0;
-    float x = 8.0f, y = 8.0f + FONT_LINE_HEIGHT;
-    for (const char *p = text; *p && n + 2 <= cap; ++p) {
+    float x = x0, y = y0 + px * 0.8f; /* baseline: the font's ascent is about 0.8 of its height */
+    for (const char *p = text; *p && n < cap; ++p) {
         if (*p == '\n') {
-            x = 8.0f;
-            y += FONT_LINE_HEIGHT + 2.0f;
+            x = x0;
+            y += px * 1.15f;
             continue;
         }
         const int ch = (unsigned char)*p;
         if (ch < FONT_FIRST || ch >= FONT_FIRST + FONT_COUNT) continue;
         const font_glyph *g = &FONT_GLYPHS[ch - FONT_FIRST];
-        const vec4 uv = {(float)g->x0 / FONT_ATLAS_W, (float)g->y0 / FONT_ATLAS_H, (float)g->x1 / FONT_ATLAS_W, (float)g->y1 / FONT_ATLAS_H};
-        const float w = (float)(g->x1 - g->x0), h = (float)(g->y1 - g->y0);
-        const float gx = x + g->xoff, gy = y + g->yoff;
-        /* drop shadow first, then the glyph, so text reads over anything */
-        quads[n++] = (OverlayQuad){.rect = {gx + 1, gy + 1, gx + w + 1, gy + h + 1}, .uv = uv, .color = 0xff000000u};
-        quads[n++] = (OverlayQuad){.rect = {gx, gy, gx + w, gy + h}, .uv = uv, .color = 0xffffffffu};
-        x += g->xadvance;
+        const float w = (float)(g->x1 - g->x0) * k, h = (float)(g->y1 - g->y0) * k;
+        const float gx = x + g->xoff * k, gy = y + g->yoff * k;
+        out[n++] = (Quad){.pos = {gx + w * 0.5f, gy + h * 0.5f, 0.0f, 0.0f}, .size_uv0 = {w, h, (float)g->x0 / FONT_ATLAS_W, (float)g->y0 / FONT_ATLAS_H},
+                          .uv1 = {(float)g->x1 / FONT_ATLAS_W, (float)g->y1 / FONT_ATLAS_H, 0.0f, 0.0f},
+                          .color = rgba, .texture = r->font_tex, .flags = VKMIN_QUAD_SCREEN | VKMIN_QUAD_SDF};
+        x += g->xadvance * k;
     }
     return n;
 }
@@ -606,6 +684,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
             r->stats.draws_shadow += r->counts_host[slot][v * 2] + r->counts_host[slot][v * 2 + 1];
         }
     }
+    if (r->check_valid[slot] && r->counts_valid[slot]) {
+        r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot]);
+        r->check_valid[slot] = false;
+    }
     r->stats.device_used = gs.device_used;
     r->stats.device_cap = gs.device_cap;
     r->stats.ring_used = gs.ring_used;
@@ -626,6 +708,31 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     mat4 *bones = vkmin_ring_alloc(gpu, (f->bone_count ? f->bone_count : 1) * sizeof(mat4), &bones_addr);
     if (f->bone_count) memcpy(bones, f->bones, f->bone_count * sizeof(mat4));
     Frame *frame = vkmin_ring_alloc(gpu, sizeof(Frame), &frame_addr);
+
+    /* Quads: the game's, then the overlay text, split into the world list
+     * (drawn in the HDR pass, depth tested) and the screen list (after post).
+     * Order within each list is the caller's. */
+    uint64_t quads_addr = 0;
+    Quad *quads = vkmin_ring_alloc(gpu, VKR_MAX_QUADS * sizeof(Quad), &quads_addr);
+    uint32_t world_quads = 0, screen_quads = 0;
+    {
+        const uint32_t user = s.quads && f->quad_count < VKR_MAX_QUADS ? f->quad_count : (s.quads ? VKR_MAX_QUADS : 0u);
+        for (uint32_t i = 0; i < user; ++i) {
+            if (!(f->quads[i].flags & VKMIN_QUAD_SCREEN)) quads[world_quads++] = f->quads[i];
+        }
+        for (uint32_t i = 0; i < user; ++i) {
+            if (f->quads[i].flags & VKMIN_QUAD_SCREEN) quads[world_quads + screen_quads++] = f->quads[i];
+        }
+        if (s.overlay && f->overlay_text) {
+            /* drop shadow first, then the text, so it reads over anything */
+            Quad *at = quads + world_quads + screen_quads;
+            const uint32_t room = VKR_MAX_QUADS - world_quads - screen_quads;
+            const uint32_t shadow = vkr_text(r, f->overlay_text, 9.0f, 9.0f, 15.0f, 0xff000000u, at, room / 2);
+            screen_quads += shadow + vkr_text(r, f->overlay_text, 8.0f, 8.0f, 15.0f, 0xffffffffu, at + shadow, room / 2);
+        }
+    }
+    const vkr_look *look = &f->look;
+    const bool tint_set = look->shadow_tint[0] != 0.0f || look->shadow_tint[1] != 0.0f || look->shadow_tint[2] != 0.0f;
 
     const float cluster_far = fminf(f->far, 200.0f);
     const float log_ratio = logf(cluster_far / f->near);
@@ -661,6 +768,16 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         .draw_cmds = vkmin_address(gpu, r->draw_cmds),
         .draw_counts = vkmin_address(gpu, r->draw_counts),
         .cluster_lights = vkmin_address(gpu, r->cluster_lights),
+        .quads = quads_addr,
+        .cel = {look->rim_strength, look->rim_power, look->spec_step, 0.0f},
+        .shadow_tint = {tint_set ? look->shadow_tint[0] : 0.5f, tint_set ? look->shadow_tint[1] : 0.5f, tint_set ? look->shadow_tint[2] : 0.5f, 0.0f},
+        .fog = {look->fog[0], look->fog[1], look->fog[2], look->fog_density},
+        .post = {look->outline * s.outline, look->outline_depth > 0.0f ? look->outline_depth : 0.05f,
+                 look->lut_tex ? look->lut_strength * s.lut : 0.0f, 0.0f},
+        .cel_ramp_tex = look->cel_ramp_tex ? look->cel_ramp_tex : r->ramp_tex,
+        .lut_tex = look->lut_tex,
+        .normal_tex = r->normal_tex,
+        .depth_tex = r->depth_tex,
     };
     const Push base_push = {.frame = frame_addr};
 
@@ -681,12 +798,17 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         DrawCmd *cmds = vkmin_ring_alloc(gpu, VKR_MAX_TRANSPARENT * sizeof(DrawCmd), &transparent_addr);
         transparent_count = sort_transparents(f, r->host_materials, r->host_meshes, cmds);
     }
-    uint64_t quads_addr = 0;
-    uint32_t quad_count = 0;
-    if (s.overlay && f->overlay_text) {
-        OverlayQuad *quads = vkmin_ring_alloc(gpu, VKR_MAX_OVERLAY_QUADS * sizeof(OverlayQuad), &quads_addr);
-        quad_count = layout_text(f->overlay_text, quads, VKR_MAX_OVERLAY_QUADS);
+    /* The cull check: the CPU list for the camera view now, the GPU list read
+     * back when this slot comes round again. */
+    uint64_t check_addr = 0;
+    if (s.check_cull && s.gpu_cull) {
+        DrawCmd *cpu = r->check_cpu[slot];
+        uint32_t n = cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu, r->host_meshes, 0);
+        n += cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu + n, r->host_meshes, 1);
+        r->check_cpu_count[slot] = n;
+        r->check_gpu[slot] = vkmin_ring_alloc(gpu, 2u * VKMIN_MAX_DRAWS * sizeof(DrawCmd), &check_addr);
     }
+    r->check_valid[slot] = s.check_cull && s.gpu_cull;
     uint64_t counts_addr = 0;
     uint32_t *counts_host = vkmin_ring_alloc(gpu, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), &counts_addr);
     r->counts_host[slot] = counts_host;
@@ -706,6 +828,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_timestamp(gpu, 1);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.compute_to_indirect_draw = true, .compute_to_transfer = true});
     vkmin_copy_to_ring(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), counts_addr);
+    if (check_addr) vkmin_copy_to_ring(gpu, r->draw_cmds, 0, 2u * VKMIN_MAX_DRAWS * sizeof(DrawCmd), check_addr);
 
     /* --- 2. shadow atlas -------------------------------------------------- */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.depth = r->atlas, .clear_depth = true, .label = "shadows"});
@@ -735,9 +858,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const vkmin_transition to_sampled_atlas[] = {{r->atlas, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_atlas, .image_count = 1, .compute_to_fragment = true});
 
-    /* --- 5. forward opaque, 6. forward transparent ------------------------ */
-    /* The clear is the sky: there is no skybox, and Sponza's courtyard is open. */
-    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = r->hdr, .depth = r->depth, .clear_color = true,
+    /* --- 5. forward opaque, 6. forward transparent and world quads --------- */
+    /* The clear is the sky: there is no skybox, and Sponza's courtyard is open.
+     * The id and normal targets clear to zero with it. */
+    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = r->hdr, .extra = {r->id, r->normal}, .depth = r->depth, .clear_color = true,
                                              .clear = {0.30f * 2.5f, 0.50f * 2.5f, 0.95f * 2.5f, 1.0f}, .w = rw, .h = rh, .label = "forward"});
     const bool overdraw = s.debug == VKMIN_DEBUG_OVERDRAW;
     draw_lists(r, 0, overdraw ? r->fwd_blend : r->fwd_cull, overdraw ? r->fwd_blend : r->fwd_nocull, &base_push,
@@ -747,14 +871,21 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         vkmin_draw_indirect(gpu, r->fwd_blend, &base_push, sizeof base_push,
                             &(vkmin_indirect_desc){.indices = r->indices, .host_cmds = transparent_addr, .host_count = transparent_count});
     }
+    if (world_quads) {
+        Push q = base_push;
+        q.aux = quads_addr;
+        vkmin_draw(gpu, r->quad_world, &q, sizeof q, world_quads * 6, 1);
+    }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 6);
 
-    /* --- 7. tonemap, 8. overlay ------------------------------------------- */
-    const vkmin_transition to_sampled_hdr[] = {{r->hdr, VKMIN_USE_SAMPLED}};
-    vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_hdr, .image_count = 1});
+    /* --- 7. post: outline, tonemap, LUT; 8. screen quads ------------------ */
+    /* The id target is left in TRANSFER_SRC for vkmin_pick between frames. */
+    const vkmin_transition to_post[] = {{r->hdr, VKMIN_USE_SAMPLED}, {r->normal, VKMIN_USE_SAMPLED},
+                                        {r->depth, VKMIN_USE_SAMPLED}, {r->id, VKMIN_USE_TRANSFER_SRC}};
+    vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_post, .image_count = 4});
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .depth = vkmin_default_depth(gpu),
-                                             .clear_color = true, .label = "tonemap"});
+                                             .clear_color = true, .label = "post"});
     Push tm = base_push;
     tm.param = r->hdr_tex;
     /* Debug views are diagnostic colours, not radiance: pass them through. */
@@ -762,11 +893,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     tm.param3 = r->atlas_raw_tex;
     vkmin_draw(gpu, r->tonemap, &tm, sizeof tm, 3, 1);
     vkmin_timestamp(gpu, 7);
-    if (quad_count) {
-        Push ov = base_push;
-        ov.aux = quads_addr;
-        ov.param = r->font_tex;
-        vkmin_draw(gpu, r->overlay, &ov, sizeof ov, quad_count * 6, 1);
+    if (screen_quads) {
+        Push q = base_push;
+        q.aux = quads_addr + (uint64_t)world_quads * sizeof(Quad);
+        vkmin_draw(gpu, r->quad_screen, &q, sizeof q, screen_quads * 6, 1);
     }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 8);

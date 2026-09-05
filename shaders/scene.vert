@@ -6,7 +6,7 @@ layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec4 v_tangent;
 layout(location = 3) out vec2 v_uv;
-layout(location = 4) flat out uint v_material;
+layout(location = 4) flat out uint v_instance;
 
 void main() {
     Frame frame = FrameRef(push.frame).frame;
@@ -17,5 +17,5 @@ void main() {
     v_normal = v.normal;
     v_tangent = v.tangent;
     v_uv = v.uv;
-    v_material = inst.material;
+    v_instance = uint(gl_InstanceIndex);
 }

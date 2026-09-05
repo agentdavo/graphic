@@ -32,7 +32,11 @@
     X(r_shadow_distance, 40.0f, "far end of the sun cascades, world units")           \
     X(r_transparent, 1.0f, "render the sorted transparent pass")                     \
     X(r_overlay, 1.0f, "draw the stats overlay")                                     \
-    X(r_debug, 0.0f, "0 off 1 normals 2 clusters 3 cascades 4 overdraw 5 albedo 6 atlas") \
+    X(r_debug, 0.0f, "0 off 1 normals 2 clusters 3 cascades 4 overdraw 5 albedo 6 atlas 7 ids") \
+    X(r_outline, 1.0f, "post: multiply the look's outline strength (0 disables the pass's effect)") \
+    X(r_lut, 1.0f, "post: multiply the look's LUT strength")                            \
+    X(r_quads, 1.0f, "draw the quad batcher's sprites, particles and UI")               \
+    X(d_check_cull, 0.0f, "compare the GPU draw list with the CPU reference each frame; counts mismatches") \
     X(r_freeze_cull, 0.0f, "cull against the frozen camera, render from the live one") \
     X(r_max_lights, 256.0f, "cap on lights uploaded this frame")                     \
     X(r_ambient, 0.10f, "ambient radiance")                                          \

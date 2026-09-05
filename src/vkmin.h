@@ -56,11 +56,13 @@ typedef struct { uint32_t id; } vkmin_pipe;
 typedef enum { VKMIN_PATH_AUTO = 0, VKMIN_PATH_LEGACY, VKMIN_PATH_MODERN } vkmin_path;
 typedef enum { VKMIN_FMT_RGBA8_UNORM = 0, VKMIN_FMT_RGBA8_SRGB, VKMIN_FMT_BGRA8_UNORM, VKMIN_FMT_BC1_SRGB,
                VKMIN_FMT_BC1_UNORM, VKMIN_FMT_BC3_SRGB, VKMIN_FMT_BC4_UNORM, VKMIN_FMT_BC5_UNORM,
-               VKMIN_FMT_R11G11B10_FLOAT, VKMIN_FMT_RGBA16_FLOAT, VKMIN_FMT_D32_FLOAT, VKMIN_FMT_NONE,
+               VKMIN_FMT_R11G11B10_FLOAT, VKMIN_FMT_RGBA16_FLOAT, VKMIN_FMT_D32_FLOAT, VKMIN_FMT_R32_UINT,
+               VKMIN_FMT_RG16_UNORM, VKMIN_FMT_NONE,
                VKMIN_FMT_COUNT } vkmin_format;
 typedef enum { VKMIN_USE_UNDEFINED = 0, VKMIN_USE_TRANSFER_DST, VKMIN_USE_TRANSFER_SRC, VKMIN_USE_SAMPLED,
                VKMIN_USE_COLOR_TARGET, VKMIN_USE_DEPTH_TARGET, VKMIN_USE_PRESENT } vkmin_use;
-typedef enum { VKMIN_IMAGE_SAMPLED = 1, VKMIN_IMAGE_COLOR = 2, VKMIN_IMAGE_DEPTH = 4 } vkmin_image_usage;
+typedef enum { VKMIN_IMAGE_SAMPLED = 1, VKMIN_IMAGE_COLOR = 2, VKMIN_IMAGE_DEPTH = 4,
+               VKMIN_IMAGE_READBACK = 8 /* the host may read it: vkmin_pick */ } vkmin_image_usage;
 typedef enum { VKMIN_CMP_LESS = 0, VKMIN_CMP_LESS_EQUAL, VKMIN_CMP_EQUAL, VKMIN_CMP_ALWAYS } vkmin_compare;
 typedef enum { VKMIN_CULL_BACK = 0, VKMIN_CULL_NONE, VKMIN_CULL_FRONT } vkmin_cull;
 enum { VKMIN_KEY_SPACE = 32, VKMIN_KEY_ESCAPE = 256, VKMIN_KEY_ENTER, VKMIN_KEY_TAB, VKMIN_KEY_RIGHT = 262, VKMIN_KEY_LEFT,
@@ -118,6 +120,8 @@ typedef struct {
     const uint32_t *fs; size_t fs_bytes;     /* 0 = depth-only */
     const uint32_t *cs; size_t cs_bytes;     /* set instead of vs: a compute pipeline */
     vkmin_format color_format;               /* 0 = RGBA8_UNORM (the backbuffer); NONE for depth-only */
+    int extra_colors; vkmin_format extra_format[2]; /* further colour attachments (MRT); a blended
+                                              * pipeline writes only the first attachment */
     bool depth;                              /* depth test against a D32 attachment. Backbuffer pipelines
                                               * always carry the attachment (the default pass has one). */
     bool depth_write;                        /* 0 = off (set with .depth for the usual case) */
@@ -134,6 +138,7 @@ typedef struct { float r, g, b, a; } vkmin_clear;
 
 typedef struct {
     vkmin_image color;            /* 0 = depth-only pass */
+    vkmin_image extra[2];         /* MRT attachments 1 and 2, cleared to zero with the colour */
     vkmin_image depth;            /* 0 = no depth */
     bool clear_color; float clear[4];
     bool clear_depth;             /* to 1.0 */
@@ -154,6 +159,14 @@ typedef struct {                  /* an indexed indirect draw; set exactly one o
     uint32_t max_draws;
     uint64_t host_cmds; uint32_t host_count;            /* DrawCmd records in ring memory */
 } vkmin_indirect_desc;
+
+typedef struct {                  /* heights in, one chunked grid mesh out; sizes from _sizes */
+    const float *heights; int width, height;   /* samples across and down; heights in world units */
+    float cell;                   /* world units between samples; 0 = 1 */
+    int chunk;                    /* cells per chunk side, each chunk one Mesh; 0 = 32 */
+    float uv_per_unit;            /* texture repeats per world unit; 0 = 1 */
+} vkmin_heightfield_desc;
+typedef struct { uint32_t vertices, indices, meshes; } vkmin_heightfield_size;
 
 typedef struct {                  /* plain data, for humans and models to read */
     double gpu_ms[VKMIN_MAX_TIMESTAMPS]; int timestamps;  /* since timestamp 0, last completed frame */
@@ -204,6 +217,10 @@ vkmin_image vkmin_backbuffer(const vkmin_ctx *);   /* the owned image presented 
 vkmin_image vkmin_default_depth(const vkmin_ctx *); /* its depth; passes on the backbuffer attach it */ // reads ctx
 vkmin_format vkmin_backbuffer_format(const vkmin_ctx *);                     // pure (always RGBA8_UNORM)
 vkmin_pipe vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipe_desc *);        // writes ctx, gpu
+uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one texel of the last
+                                        completed frame's ID target, between frames; 0 off-image */ // gpu
+vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *);            // pure
+void vkmin_heightfield(const vkmin_heightfield_desc *, Vertex *, uint32_t *, Mesh *);      // pure
 
 /* ---- recording: in order, into one command buffer, no reordering --------- */
 void vkmin_barrier(vkmin_ctx *, const vkmin_barrier_desc *);                 // gpu

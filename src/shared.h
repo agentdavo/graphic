@@ -80,6 +80,13 @@ typedef struct { float m[16]; } mat4; /* column-major, as GLSL */
 #define VKMIN_DEBUG_OVERDRAW 4u
 #define VKMIN_DEBUG_ALBEDO 5u
 #define VKMIN_DEBUG_SHADOW_ATLAS 6u /* tonemap shows the raw atlas */
+#define VKMIN_DEBUG_IDS 7u          /* instance id hashed to a colour: what vkmin_pick would return */
+
+/* Quad.flags: the batcher draws sprites, particles, billboards and UI alike. */
+#define VKMIN_QUAD_SCREEN 1u        /* pos.xy in pixels from the top left; drawn after tonemap */
+#define VKMIN_QUAD_BILLBOARD 2u     /* world space, faces the camera */
+#define VKMIN_QUAD_GROUND 4u        /* world space, lies in the XZ plane (default: XY, facing +Z) */
+#define VKMIN_QUAD_SDF 8u           /* texture is a signed distance field (text) */
 
 /* Frame.flags */
 #define VKMIN_FRAME_SHADOWS 1u
@@ -136,6 +143,8 @@ VKMIN_STRUCT(Instance) {
     U32 material;
     U32 bone_offset;    /* index of first mat4 in the bone buffer, or VKMIN_NONE */
     U32 flags;
+    U32 id;             /* written to the ID target; what vkmin_pick returns. 0 = unpickable */
+    U32 pad0, pad1, pad2;
 };
 
 VKMIN_STRUCT(Light) {
@@ -203,13 +212,22 @@ VKMIN_STRUCT(Frame) {
     ADDR draw_cmds;     /* DrawCmd[VKMIN_MAX_VIEWS][VKMIN_MAX_DRAWS] */
     ADDR draw_counts;   /* U32[VKMIN_MAX_VIEWS] */
     ADDR cluster_lights; /* U32[VKMIN_CLUSTER_COUNT * VKMIN_CLUSTER_STRIDE] */
-    ADDR pad;
+    ADDR quads;          /* Quad[] for this frame */
+    /* The look, for the shader library: all zero is plain PBR with no post. */
+    vec4 cel;            /* x rim strength, y rim power, z specular step threshold (0 = no specular), w unused */
+    vec4 shadow_tint;    /* rgb multiplied into shadowed cel() colour, w unused */
+    vec4 fog;            /* rgb colour, w density per world unit (0 = none) */
+    vec4 post;           /* x outline strength, y outline depth threshold (view units), z LUT strength, w unused */
+    U32 cel_ramp_tex;    /* 1D ramp sampled by N.L; 0 = white (no quantisation) */
+    U32 lut_tex;         /* 256x16 colour grading strip; 0 = identity */
+    U32 normal_tex;      /* this frame's octahedral normal target */
+    U32 depth_tex;       /* this frame's depth target */
 };
 
 /* The one push constant block for every pipeline. */
 VKMIN_STRUCT(Push) {
     ADDR frame;
-    ADDR aux;           /* pass-specific buffer: overlay quads, transparent list */
+    ADDR aux;           /* pass-specific buffer: quads, transparent list */
     U32 view;           /* which View a depth pass renders / the cull shader culls */
     U32 param;          /* pass-specific scalar */
     U32 param2;
@@ -236,12 +254,16 @@ VKMIN_STRUCT(ExPush) {
     F32 pad;
 };
 
-/* Overlay text: one quad per glyph, written by the CPU into the ring buffer. */
-VKMIN_STRUCT(OverlayQuad) {
-    vec4 rect;          /* x0, y0, x1, y1 in pixels */
-    vec4 uv;            /* u0, v0, u1, v1 */
-    U32 color;          /* rgba8 */
-    U32 pad0, pad1, pad2;
+/* One quad for the batcher: a sprite, a particle, a billboard, a glyph or a
+ * UI rectangle, decided by flags. Six vertices each, one instanced draw. */
+VKMIN_STRUCT(Quad) {
+    vec4 pos;           /* xyz world (or xy pixels for SCREEN); w rotation in radians */
+    vec4 size_uv0;      /* xy size in world units or pixels; zw uv of the top-left corner */
+    vec4 uv1;           /* xy uv of the bottom-right corner; z SDF edge softness in texels (0 = 1); w unused */
+    U32 color;          /* rgba8, straight alpha */
+    U32 texture;        /* bindless index; 0 is the renderer's white */
+    U32 flags;          /* VKMIN_QUAD_* */
+    U32 pad0;
 };
 
 /* --------------------------------------------------- the layout contract --- */
@@ -253,20 +275,21 @@ _Static_assert(sizeof(Mesh) == 32 && offsetof(Mesh, bounds) == 16, "Mesh");
 _Static_assert(sizeof(Material) == 80 && offsetof(Material, albedo_tex) == 32 &&
                    offsetof(Material, metallic) == 48 && offsetof(Material, flags) == 64,
                "Material");
-_Static_assert(sizeof(Instance) == 160 && offsetof(Instance, bounds) == 128 &&
-                   offsetof(Instance, mesh) == 144,
+_Static_assert(sizeof(Instance) == 176 && offsetof(Instance, bounds) == 128 &&
+                   offsetof(Instance, mesh) == 144 && offsetof(Instance, id) == 160,
                "Instance");
 _Static_assert(sizeof(Light) == 64 && offsetof(Light, type) == 48, "Light");
 _Static_assert(sizeof(View) == 208 && offsetof(View, planes) == 64 &&
                    offsetof(View, atlas_rect) == 160 && offsetof(View, flags) == 192,
                "View");
 _Static_assert(sizeof(DrawCmd) == 20, "DrawCmd");
-_Static_assert(sizeof(Frame) == 496 && offsetof(Frame, camera_pos) == 256 &&
+_Static_assert(sizeof(Frame) == 576 && offsetof(Frame, camera_pos) == 256 &&
                    offsetof(Frame, sun) == 352 && offsetof(Frame, light_count) == 368 &&
-                   offsetof(Frame, vertices) == 400 && offsetof(Frame, cluster_lights) == 480,
+                   offsetof(Frame, vertices) == 400 && offsetof(Frame, cluster_lights) == 480 &&
+                   offsetof(Frame, cel) == 496 && offsetof(Frame, cel_ramp_tex) == 560,
                "Frame");
 _Static_assert(sizeof(Push) == 32 && offsetof(Push, view) == 16, "Push");
-_Static_assert(sizeof(OverlayQuad) == 48, "OverlayQuad");
+_Static_assert(sizeof(Quad) == 64 && offsetof(Quad, color) == 48, "Quad");
 _Static_assert(sizeof(ExVertex) == 32, "ExVertex");
 _Static_assert(sizeof(ExPush) == 88 && offsetof(ExPush, vertices) == 64, "ExPush");
 #endif

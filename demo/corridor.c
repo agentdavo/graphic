@@ -446,7 +446,10 @@ int main(int argc, char **argv) {
             if (vkmin_save_png(gpu, path)) printf("wrote %s\n", path);
         }
     }
-    const int status = 0;
+    /* d_check_cull: the GPU draw list must agree with the CPU reference. */
+    const vkr_stats final = vkr_get_stats(r);
+    const int status = final.cull_mismatches ? 1 : 0;
+    if (cvar_get_bool(CV_d_check_cull)) printf("corridor: cull check: %u mismatches\n", final.cull_mismatches);
 
     vkr_shutdown(r);
     vkmin_shutdown(gpu);

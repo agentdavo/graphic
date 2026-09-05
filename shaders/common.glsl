@@ -23,7 +23,7 @@ layout(buffer_reference, scalar) readonly buffer BoneRef { mat4 m[]; };
 layout(buffer_reference, scalar) buffer DrawCmdRef { DrawCmd d[]; };
 layout(buffer_reference, scalar) buffer CountRef { uint n[]; };
 layout(buffer_reference, scalar) buffer ClusterRef { uint lights[]; };
-layout(buffer_reference, scalar) readonly buffer OverlayRef { OverlayQuad q[]; };
+layout(buffer_reference, scalar) readonly buffer QuadRef { Quad q[]; };
 
 // The one descriptor set. Declared as both a colour sampler and a shadow
 // sampler over the same binding; a slot is only ever used as one of them.
@@ -58,5 +58,12 @@ vec4 tangent_decode(uint packed) {
 }
 
 vec2 uv_decode(uint packed) { return unpackHalf2x16(packed); }
+
+// The inverse of oct_decode, for the RG16 normal target.
+vec2 oct_encode(vec3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 e = n.z >= 0.0 ? n.xy : oct_wrap(n.xy);
+    return e * 0.5 + 0.5;
+}
 
 vec4 rgba8_decode(uint c) { return unpackUnorm4x8(c); }

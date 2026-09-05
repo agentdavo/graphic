@@ -45,7 +45,7 @@ $(BUILD):
 
 # --- shaders: compiled offline, embedded as uint32_t arrays. No runtime
 # --- shader compiler, no file-path failure mode in the binary.
-$(BUILD)/%.spv: shaders/% shaders/common.glsl src/shared.h | $(BUILD)
+$(BUILD)/%.spv: shaders/% shaders/common.glsl shaders/scene_vertex.glsl $(wildcard shaders/lib/*.glsl) src/shared.h | $(BUILD)
 	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
 
 $(BUILD)/bin2c: tools/bin2c.c | $(BUILD)
@@ -98,7 +98,7 @@ $(BUILD)/mkfont: tools/mkfont.c | $(BUILD)
 FONT_TTF ?= /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
 .PHONY: font
 font: $(BUILD)/mkfont
-	./$(BUILD)/mkfont $(FONT_TTF) 15 > src/font.h
+	./$(BUILD)/mkfont $(FONT_TTF) 32 > src/font.h
 
 $(BUILD)/cook_image.o: tools/cook_image.c tools/cook_image.h | $(BUILD)
 	$(CC) $(THIRD_PARTY_CFLAGS) -Itools -c -o $@ $<
@@ -117,7 +117,7 @@ test: all analyze $(BUILD)/amalg_check
 # The single-header form is generated, never edited, and must compile alone.
 .PHONY: amalgamate
 amalgamate: $(BUILD)/vkmin_single.h
-$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/vkmin_math.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
+$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
 	./tools/amalgamate.sh > $@
 $(BUILD)/amalg_check: $(BUILD)/vkmin_single.h tests/amalg_check.c
 	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function -I$(BUILD) -Ithird_party -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)

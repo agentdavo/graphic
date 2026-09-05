@@ -6,6 +6,7 @@
  */
 #include "vkmin.h"
 #include "cvar.h"
+#include "pack.h"
 #include "plat.h"
 #include "stb_bridge.h"
 
@@ -351,8 +352,9 @@ enum {
     OP_MAKE_BUFFER = 1, OP_FREE_BUFFER, OP_BUFFER_UPLOAD, OP_MAKE_IMAGE, OP_FREE_IMAGE, OP_IMAGE_UPLOAD,
     OP_INDEX, OP_REGISTER, OP_MAKE_PIPELINE, OP_FRAME_BEGIN, OP_FRAME_END, OP_RING_ALLOC, OP_BARRIER,
     OP_FILL, OP_COPY_TO_RING, OP_PASS_BEGIN, OP_PASS_END, OP_VIEWPORT, OP_DEPTH_BIAS, OP_DRAW,
-    OP_DRAW_INDIRECT, OP_DISPATCH, OP_TIMESTAMP
+    OP_DRAW_INDIRECT, OP_DISPATCH, OP_TIMESTAMP, OP_PICK
 };
+enum { JOURNAL_VERSION = 2 };
 enum { RELOC_ARENA = 1, RELOC_RING = 2, VKMIN_MAX_RELOCS = 4096 };
 
 typedef struct { uint32_t magic, version, width, height; uint64_t arena_base, ring_base; } journal_header;
@@ -361,12 +363,13 @@ typedef struct { uint32_t offset; uint32_t kind; } reloc;
 /* Fixed-size mirrors of the descs, with strings copied and pointers dropped. */
 typedef struct { uint64_t size; uint32_t result, has_data; char label[VKMIN_LABEL]; } rec_buffer;
 typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; } rec_image;
-typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result; char label[VKMIN_LABEL]; } rec_pipe;
+typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result, extra_colors, extra_format[2]; char label[VKMIN_LABEL]; } rec_pipe;
 typedef struct { uint32_t id, mip; uint64_t offset; } rec_upload;
 typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; vkmin_inputs input; } rec_frame;
 typedef struct { uint32_t magic, version, width, height; } demo_header;
 typedef struct { uint32_t frame_index; vkmin_inputs input; } demo_record;
-typedef struct { uint32_t color, depth, clear_color, clear_depth; float clear[4]; int32_t x, y, w, h; } rec_pass;
+typedef struct { uint32_t color, depth, clear_color, clear_depth; float clear[4]; int32_t x, y, w, h; uint32_t extra[2]; } rec_pass;
+typedef struct { uint32_t image, result; int32_t x, y; } rec_pick;
 typedef struct { uint32_t pipe, push_bytes, a, b, cnt; } rec_draw;
 typedef struct { uint32_t pipe, push_bytes, indices, cmds, counts, max_draws, host_count; uint64_t cmd_offset, count_offset, host_cmds; } rec_indirect;
 typedef struct { uint32_t flags, image_count; } rec_barrier;
@@ -650,6 +653,7 @@ static void pick_physical_device(vkmin_ctx *c) {
     NEED(f2.features.depthClamp, "depthClamp");
     NEED(f2.features.shaderInt64, "shaderInt64");
     NEED(f2.features.fragmentStoresAndAtomics, "fragmentStoresAndAtomics");
+    NEED(f2.features.independentBlend, "independentBlend");
 #undef NEED
 
     vkGetPhysicalDeviceMemoryProperties(c->phys, &c->mem_props);
@@ -720,7 +724,8 @@ static void create_device(vkmin_ctx *c) {
                      .samplerAnisotropy = VK_TRUE,
                      .textureCompressionBC = VK_TRUE,
                      .shaderInt64 = VK_TRUE,
-                     .fragmentStoresAndAtomics = VK_TRUE},
+                     .fragmentStoresAndAtomics = VK_TRUE,
+                     .independentBlend = VK_TRUE},
     };
     /* Modern-path features chain in only when that path was chosen; the
      * robustness features chain in for debug builds on either path. On a
@@ -966,6 +971,8 @@ static format_info format_lookup(vkmin_format f) {
     case VKMIN_FMT_R11G11B10_FLOAT: return (format_info){VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_RGBA16_FLOAT: return (format_info){VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_D32_FLOAT: return (format_info){VK_FORMAT_D32_SFLOAT, 4, 1, VK_IMAGE_ASPECT_DEPTH_BIT};
+    case VKMIN_FMT_R32_UINT: return (format_info){VK_FORMAT_R32_UINT, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
+    case VKMIN_FMT_RG16_UNORM: return (format_info){VK_FORMAT_R16G16_UNORM, 4, 1, VK_IMAGE_ASPECT_COLOR_BIT};
     case VKMIN_FMT_NONE:
     case VKMIN_FMT_COUNT: break;
     }
@@ -1235,12 +1242,13 @@ static void create_offscreen(vkmin_ctx *c) {
 static void create_readback_buffers(vkmin_ctx *c) {
     c->readback_size = (VkDeviceSize)c->extent.width * c->extent.height * 4u;
     if (c->path != VKMIN_PATH_LEGACY) return;
+    /* The image, then a 256-byte tail that vkmin_pick copies its texel into. */
     for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) {
-        create_backing_buffer(c, c->readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        create_backing_buffer(c, c->readback_size + 256u, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                               &c->readback_buf[i], &c->readback_mem[i], NULL, "vkmin.readback");
-        VK_CHECK(vkMapMemory(c->dev, c->readback_mem[i], 0, c->readback_size, 0,
+        VK_CHECK(vkMapMemory(c->dev, c->readback_mem[i], 0, c->readback_size + 256u, 0,
                              &c->readback_mapped[i]));
     }
 }
@@ -1563,7 +1571,7 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     if (c->record_path) { /* everything the program does from here is recorded */
         c->rec = fopen(c->record_path, "wb");
         VKMIN_ASSERT(c->rec != NULL, "cannot write journal '%s'", c->record_path);
-        const journal_header jh = {0x4a4d4b56u, 1, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
+        const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
         VKMIN_ASSERT(fwrite(&jh, sizeof jh, 1, c->rec) == 1, "journal write failed");
         fprintf(stderr, "vkmin: recording to %s\n", c->record_path);
     }
@@ -1738,6 +1746,11 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     if (uploadable) usage |= c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (usage_bits & VKMIN_IMAGE_COLOR) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (usage_bits & VKMIN_IMAGE_DEPTH) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    /* Readback mirrors the backbuffer: a transfer source, and on the modern
+     * path a host transfer source too, so vkmin_pick copies from either. */
+    if (usage_bits & VKMIN_IMAGE_READBACK) {
+        usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u);
+    }
 
     const VkImageCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -1996,7 +2009,8 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
         rec_pipe rp = {.vs_bytes = (uint32_t)(desc->vs ? desc->vs_bytes : 0), .fs_bytes = (uint32_t)(desc->fs ? desc->fs_bytes : 0),
                        .cs_bytes = (uint32_t)(desc->cs ? desc->cs_bytes : 0), .color_format = desc->color_format, .depth = desc->depth,
                        .depth_write = desc->depth_write, .compare = desc->depth_compare, .cull = desc->cull,
-                       .blend = desc->blend, .bias = desc->depth_bias, .result = p.id};
+                       .blend = desc->blend, .bias = desc->depth_bias, .result = p.id, .extra_colors = (uint32_t)desc->extra_colors,
+                       .extra_format = {desc->extra_format[0], desc->extra_format[1]}};
         snprintf(rp.label, sizeof rp.label, "%s", label);
         RECORD(c, OP_MAKE_PIPELINE, rp, blob, at);
         free(blob);
@@ -2040,7 +2054,11 @@ static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const
         .depthCompareOp = compare_lookup(desc->depth_compare),
         .maxDepthBounds = 1.0f,
     };
-    const VkPipelineColorBlendAttachmentState blend_attachment = {
+    VKMIN_ASSERT(desc->extra_colors >= 0 && desc->extra_colors <= 2, "extra_colors must be 0..2");
+    /* Attachment 0 blends as asked; the MRT extras (ids, normals) never
+     * blend, and a blended pipeline does not write them at all. */
+    VkPipelineColorBlendAttachmentState blend_attachments[3];
+    blend_attachments[0] = (VkPipelineColorBlendAttachmentState){
         .blendEnable = desc->blend,
         .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, /* premultiplied alpha */
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -2051,22 +2069,29 @@ static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
+    for (int i = 0; i < desc->extra_colors; ++i) {
+        blend_attachments[1 + i] = (VkPipelineColorBlendAttachmentState){
+            .colorWriteMask = desc->blend ? 0u : VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    }
     const bool has_color = desc->color_format != VKMIN_FMT_NONE;
+    const uint32_t color_count = has_color ? 1u + (uint32_t)desc->extra_colors : 0u;
     const VkPipelineColorBlendStateCreateInfo blend = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = has_color ? 1u : 0u,
-        .pAttachments = &blend_attachment};
+        .attachmentCount = color_count,
+        .pAttachments = blend_attachments};
     const VkDynamicState dynamic_states[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                               VK_DYNAMIC_STATE_DEPTH_BIAS};
     const VkPipelineDynamicStateCreateInfo dynamic = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .dynamicStateCount = desc->depth_bias ? 3u : 2u,
         .pDynamicStates = dynamic_states};
-    const VkFormat color_vk = has_color ? format_lookup(desc->color_format).vk : VK_FORMAT_UNDEFINED;
+    VkFormat color_vk[3] = {has_color ? format_lookup(desc->color_format).vk : VK_FORMAT_UNDEFINED};
+    for (int i = 0; i < desc->extra_colors; ++i) color_vk[1 + i] = format_lookup(desc->extra_format[i]).vk;
     const VkPipelineRenderingCreateInfo rendering = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount = has_color ? 1u : 0u,
-        .pColorAttachmentFormats = &color_vk,
+        .colorAttachmentCount = color_count,
+        .pColorAttachmentFormats = color_vk,
         .depthAttachmentFormat = depth_attachment ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED,
     };
     VkPipelineRobustnessCreateInfoEXT robust;
@@ -2460,6 +2485,7 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
     VKMIN_ASSERT(desc->color.id || desc->depth.id, "pass with no attachments");
     {
         const rec_pass rp = {.color = desc->color.id, .depth = desc->depth.id, .clear_color = desc->clear_color,
+                             .extra = {desc->extra[0].id, desc->extra[1].id},
                              .clear_depth = desc->clear_depth, .clear = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]},
                              .x = desc->x, .y = desc->y, .w = desc->w, .h = desc->h};
         RECORD(c, OP_PASS_BEGIN, rp, NULL, 0);
@@ -2467,12 +2493,19 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
     RECORD_ENTER(c);
     VkCommandBuffer cmd = c->cmd[c->slot];
 
-    VkImageMemoryBarrier2 barriers[2];
+    VkImageMemoryBarrier2 barriers[4];
     uint32_t barrier_count = 0;
-    image_slot *color = NULL, *depth = NULL;
+    image_slot *color = NULL, *depth = NULL, *extra[2] = {NULL, NULL};
+    uint32_t color_count = 0;
     if (desc->color.id) {
         VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, desc->color.id, color);
         barriers[barrier_count++] = slot_transition(color, VKMIN_USE_COLOR_TARGET, desc->clear_color);
+        color_count = 1;
+        for (int i = 0; i < 2 && desc->extra[i].id; ++i) {
+            VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, desc->extra[i].id, extra[i]);
+            barriers[barrier_count++] = slot_transition(extra[i], VKMIN_USE_COLOR_TARGET, desc->clear_color);
+            color_count++;
+        }
     }
     if (desc->depth.id) {
         VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, desc->depth.id, depth);
@@ -2493,14 +2526,19 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
     VKMIN_ASSERT(any != NULL, "pass with no attachments");
     const int w = desc->w > 0 ? desc->w : (int)any->w;
     const int h = desc->w > 0 ? desc->h : (int)any->h;
-    const VkRenderingAttachmentInfo color_att = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = color ? color->view : VK_NULL_HANDLE,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = desc->clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = {.color = {.float32 = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]}}},
-    };
+    VkRenderingAttachmentInfo color_att[3];
+    for (uint32_t i = 0; i < color_count; ++i) {
+        const image_slot *att = i == 0 ? color : extra[i - 1];
+        /* Extras clear to zero bits, which reads as 0 in UINT and 0.0 in UNORM alike. */
+        color_att[i] = (VkRenderingAttachmentInfo){
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = att->view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = desc->clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+        if (i == 0) color_att[i].clearValue.color = (VkClearColorValue){.float32 = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]}};
+    }
     const VkRenderingAttachmentInfo depth_att = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = depth ? depth->view : VK_NULL_HANDLE,
@@ -2513,8 +2551,8 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .renderArea = {.offset = {desc->x, desc->y}, .extent = {(uint32_t)w, (uint32_t)h}},
         .layerCount = 1,
-        .colorAttachmentCount = color ? 1u : 0u,
-        .pColorAttachments = color ? &color_att : NULL,
+        .colorAttachmentCount = color_count,
+        .pColorAttachments = color_count ? color_att : NULL,
         .pDepthAttachment = depth ? &depth_att : NULL,
     };
     vkCmdBeginRendering(cmd, &rendering);
@@ -2881,7 +2919,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
     FILE *f = fopen(path, "rb");
     VKMIN_ASSERT(f != NULL, "cannot open journal '%s'", path);
     journal_header jh;
-    VKMIN_ASSERT(fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u && jh.version == 1, "bad journal header");
+    VKMIN_ASSERT(fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u && jh.version == JOURNAL_VERSION, "bad journal header");
     VKMIN_ASSERT((int)jh.width == c->desc.width && (int)jh.height == c->desc.height, "journal size does not match the context");
     uint8_t hdr[256] = {0};
     static reloc relocs[VKMIN_MAX_RELOCS];
@@ -2927,7 +2965,8 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             const uint32_t *cs = rec.cs_bytes ? (const uint32_t *)(void *)(data + rec.vs_bytes + rec.fs_bytes) : NULL;
             const vkmin_pipe p = vkmin_make_pipeline(c, &(vkmin_pipe_desc){.vs = vs, .vs_bytes = rec.vs_bytes, .fs = fs, .fs_bytes = rec.fs_bytes,
                 .cs = cs, .cs_bytes = rec.cs_bytes, .color_format = (vkmin_format)rec.color_format, .depth = rec.depth, .depth_write = rec.depth_write,
-                .depth_compare = (vkmin_compare)rec.compare, .cull = (vkmin_cull)rec.cull, .blend = rec.blend, .depth_bias = rec.bias, .label = rec.label});
+                .depth_compare = (vkmin_compare)rec.compare, .cull = (vkmin_cull)rec.cull, .blend = rec.blend, .depth_bias = rec.bias, .label = rec.label,
+                .extra_colors = (int)rec.extra_colors, .extra_format = {(vkmin_format)rec.extra_format[0], (vkmin_format)rec.extra_format[1]}});
             SAME(p.id, rec.result); break; }
         case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index; c->input = rec.input;
             VKMIN_ASSERT(vkmin_frame_begin(c, rec.has_clear ? &rec.clear : NULL), "replay: frame_begin refused"); break; }
@@ -2944,7 +2983,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         case OP_COPY_TO_RING: { HDR(rec_indirect); uint64_t dst; memcpy(&dst, data, 8);
             vkmin_copy_to_ring(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, dst); break; }
         case OP_PASS_BEGIN: { HDR(rec_pass);
-            vkmin_pass_begin(c, &(vkmin_pass_desc){.color = {rec.color}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
+            vkmin_pass_begin(c, &(vkmin_pass_desc){.color = {rec.color}, .extra = {{rec.extra[0]}, {rec.extra[1]}}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
                 .clear = {rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}, .x = rec.x, .y = rec.y, .w = rec.w, .h = rec.h, .label = "replay"}); break; }
         case OP_PASS_END: vkmin_pass_end(c); break;
         case OP_VIEWPORT: { HDR(rec_pass); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
@@ -2956,6 +2995,8 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
                 .count_offset = rec.count_offset, .max_draws = rec.max_draws, .host_cmds = host, .host_count = rec.host_count}); break; }
         case OP_DISPATCH: { HDR(rec_draw); vkmin_dispatch(c, (vkmin_pipe){rec.pipe}, rec.push_bytes ? data : NULL, rec.push_bytes, rec.a, rec.b, rec.cnt); break; }
         case OP_TIMESTAMP: { HDR(uint32_t); vkmin_timestamp(c, (int)rec); break; }
+        case OP_PICK: { HDR(rec_pick); const uint32_t got = vkmin_pick(c, (vkmin_image){rec.image}, rec.x, rec.y);
+            VKMIN_ASSERT(got == rec.result, "replay diverged at record %u: pick read %u, recorded %u", records, got, rec.result); break; }
         default: VKMIN_FAIL("unknown journal op %u", rh.op);
         }
 #undef HDR
@@ -3001,6 +3042,107 @@ static bool modern_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t byt
     return true;
 }
 /* --- end modern-only ------------------------------------------------------ */
+
+/* ----------------------------------------------------------------- pick ---- */
+
+uint32_t vkmin_pick(vkmin_ctx *c, vkmin_image img, int x, int y) {
+    VKMIN_ASSERT(c && !c->in_frame, "vkmin_pick: call it between frames");
+    image_slot *s = NULL;
+    VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, img.id, s);
+    VKMIN_ASSERT(s->format == VK_FORMAT_R32_UINT, "vkmin_pick: '%s' is not an R32_UINT image", s->label);
+    uint32_t result = 0;
+    if (c->have_submitted && x >= 0 && y >= 0 && (uint32_t)x < s->w && (uint32_t)y < s->h) {
+        VKMIN_ASSERT(s->use == VKMIN_USE_TRANSFER_SRC, "vkmin_pick: leave '%s' in TRANSFER_SRC at the end of the frame", s->label);
+        /* Every frame in flight, so the texel is the last completed frame's. */
+        for (uint32_t i = 0; i < c->frames_in_flight; ++i) {
+            if (!c->fence_pending[i]) continue;
+            VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[i], VK_TRUE, UINT64_MAX));
+            c->fence_pending[i] = false;
+        }
+        const VkImageSubresourceLayers layers = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1};
+        if (c->path == VKMIN_PATH_LEGACY) {
+            /* --- legacy-only: a one-texel copy into the readback tail ------- */
+            VkCommandBuffer cmd = imm_begin(c);
+            const VkBufferImageCopy region = {.bufferOffset = c->readback_size, .imageSubresource = layers,
+                                              .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
+            vkCmdCopyImageToBuffer(cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->readback_buf[c->last_slot], 1, &region);
+            imm_end(c);
+            memcpy(&result, (const uint8_t *)c->readback_mapped[c->last_slot] + c->readback_size, sizeof result);
+            /* --- end legacy-only ------------------------------------------- */
+        } else {
+            /* --- modern-only: host image copy of one texel ----------------- */
+            const VkImageToMemoryCopyEXT region = {.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT, .pHostPointer = &result,
+                                                   .imageSubresource = layers, .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
+            const VkCopyImageToMemoryInfoEXT info = {.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT, .srcImage = s->img,
+                                                     .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .regionCount = 1, .pRegions = &region};
+            VK_CHECK(c->fp_copy_image_to_memory(c->dev, &info));
+            /* --- end modern-only ------------------------------------------- */
+        }
+    }
+    const rec_pick rp = {.image = img.id, .result = result, .x = x, .y = y};
+    RECORD(c, OP_PICK, rp, NULL, 0);
+    return result;
+}
+
+/* ----------------------------------------------------------- heightfield --- */
+
+vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *d) {
+    VKMIN_ASSERT(d && d->heights && d->width >= 2 && d->height >= 2, "vkmin_heightfield: need a grid of at least 2x2 samples");
+    const uint32_t chunk = d->chunk > 0 ? (uint32_t)d->chunk : 32u;
+    const uint32_t cx = ((uint32_t)d->width - 1u + chunk - 1u) / chunk, cz = ((uint32_t)d->height - 1u + chunk - 1u) / chunk;
+    return (vkmin_heightfield_size){.vertices = (uint32_t)d->width * (uint32_t)d->height,
+                                    .indices = ((uint32_t)d->width - 1u) * ((uint32_t)d->height - 1u) * 6u, .meshes = cx * cz};
+}
+
+/* One shared vertex grid (x along width, z along height, y up); each chunk
+ * owns a contiguous index range and a bounding sphere, so a chunk is a Mesh
+ * the cull rejects like any other. Normals by central differences. */
+void vkmin_heightfield(const vkmin_heightfield_desc *d, Vertex *verts, uint32_t *indices, Mesh *meshes) {
+    const vkmin_heightfield_size n = vkmin_heightfield_sizes(d);
+    VKMIN_ASSERT(verts && indices && meshes, "vkmin_heightfield: null output");
+    const uint32_t w = (uint32_t)d->width, h = (uint32_t)d->height;
+    const float cell = d->cell > 0.0f ? d->cell : 1.0f, uvs = d->uv_per_unit > 0.0f ? d->uv_per_unit : 1.0f;
+    const uint32_t chunk = d->chunk > 0 ? (uint32_t)d->chunk : 32u;
+    for (uint32_t z = 0; z < h; ++z) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint32_t xl = x > 0 ? x - 1 : 0, xr = x + 1 < w ? x + 1 : w - 1;
+            const uint32_t zd = z > 0 ? z - 1 : 0, zu = z + 1 < h ? z + 1 : h - 1;
+            const float dx = (d->heights[z * w + xr] - d->heights[z * w + xl]) / ((float)(xr - xl) * cell);
+            const float dz = (d->heights[zu * w + x] - d->heights[zd * w + x]) / ((float)(zu - zd) * cell);
+            const float len = sqrtf(dx * dx + 1.0f + dz * dz);
+            const float px = (float)x * cell, pz = (float)z * cell;
+            verts[z * w + x] = (Vertex){.px = px, .py = d->heights[z * w + x], .pz = pz,
+                                        .normal = oct_encode(-dx / len, 1.0f / len, -dz / len),
+                                        .tangent = pack_tangent(1.0f, 0.0f, 0.0f, 1.0f), .uv = pack_half2(px * uvs, pz * uvs)};
+        }
+    }
+    const uint32_t cx = (w - 1u + chunk - 1u) / chunk;
+    uint32_t at = 0;
+    for (uint32_t m = 0; m < n.meshes; ++m) {
+        const uint32_t x0 = (m % cx) * chunk, z0 = (m / cx) * chunk;
+        const uint32_t x1 = x0 + chunk < w - 1u ? x0 + chunk : w - 1u, z1 = z0 + chunk < h - 1u ? z0 + chunk : h - 1u;
+        float ymin = INFINITY, ymax = -INFINITY;
+        const uint32_t first = at;
+        for (uint32_t z = z0; z < z1; ++z) {
+            for (uint32_t x = x0; x < x1; ++x) {
+                const uint32_t a = z * w + x, b = a + 1, c2 = a + w, e = c2 + 1;
+                /* counter-clockwise seen from above (+y) */
+                indices[at++] = a; indices[at++] = c2; indices[at++] = b;
+                indices[at++] = b; indices[at++] = c2; indices[at++] = e;
+            }
+        }
+        for (uint32_t z = z0; z <= z1; ++z) {
+            for (uint32_t x = x0; x <= x1; ++x) {
+                ymin = fminf(ymin, d->heights[z * w + x]);
+                ymax = fmaxf(ymax, d->heights[z * w + x]);
+            }
+        }
+        const float ex = (float)(x1 - x0) * cell * 0.5f, ez = (float)(z1 - z0) * cell * 0.5f, ey = (ymax - ymin) * 0.5f;
+        meshes[m] = (Mesh){.first_index = first, .index_count = at - first, .vertex_offset = 0, .skin_offset = VKMIN_NONE,
+                           .bounds = {(float)x0 * cell + ex, ymin + ey, (float)z0 * cell + ez, sqrtf(ex * ex + ey * ey + ez * ez)}};
+    }
+    VKMIN_ASSERT(at == n.indices, "heightfield index count mismatch");
+}
 
 bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     VKMIN_ASSERT(c && path && !c->in_frame, "vkmin_save_png: call it between frames");
