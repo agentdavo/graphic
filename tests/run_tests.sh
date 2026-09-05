@@ -56,6 +56,29 @@ compare() {
     fi
 }
 
+# compare_hash <file>: SHA-256 of tests/out/<file> against tests/golden/<file>.sha256,
+# for outputs that are bytes rather than pixels (audio).
+compare_hash() {
+    name=$1
+    checks=$((checks + 1))
+    if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum "$OUT/$name" | cut -c1-64)
+    else digest=$(shasum -a 256 "$OUT/$name" | cut -c1-64); fi
+    if [ "${VKMIN_WRITE_GOLDEN:-0}" = "1" ]; then
+        printf '%s\n' "$digest" > "$GOLDEN/$name.sha256" || fail "cannot write golden $name.sha256"
+        note "golden updated: $name.sha256"
+        return
+    fi
+    if [ ! -f "$GOLDEN/$name.sha256" ]; then
+        fail "no golden for $name (run 'make golden' to create one)"
+        return
+    fi
+    if [ "$digest" = "$(cut -c1-64 "$GOLDEN/$name.sha256")" ]; then
+        note "match: $name"
+    else
+        fail "$name differs from its golden hash ($digest)"
+    fi
+}
+
 # same <a> <b> <tolerance> <what>: two outputs that must agree
 same() {
     checks=$((checks + 1))
@@ -177,6 +200,27 @@ for g in 10_shooter 11_rts 12_topdown 13_platformer 14_anime; do
     checks=$((checks + 1))
     awk -v game="$g" -f tests/check_gameplay.awk "$OUT/$g.state" || fail "$g: gameplay outcome"
 done
+
+begin "== OMEGA: procedural demo golden, renderer journal replay, 20-second score =="
+OMEGA="./$BUILD/ex_21_omega --headless --size 320 180"
+checks=$((checks + 1))
+if $OMEGA --frame 300 --record "$OUT/omega.vkj" --out "$OUT/omega.png" >/dev/null 2>"$OUT/omega.log"; then
+    checks=$((checks - 1))
+    compare omega
+    checks=$((checks + 1))
+    if ./$BUILD/ex_07_replay --replay "$OUT/omega.vkj" --frame 300 --path=legacy --out "$OUT/omega_replay.png" >"$OUT/omega_replay.log" 2>&1; then
+        same omega omega_replay 0 "OMEGA: renderer journal replays on the legacy path"
+    else fail "OMEGA: journal replay"; sed -n '1,8p' "$OUT/omega_replay.log"; fi
+else
+    fail "OMEGA render"; sed -n '1,8p' "$OUT/omega.log"
+fi
+checks=$((checks + 1))
+if ./$BUILD/ex_21_omega --audio-only --audio-out "$OUT/omega.wav" >/dev/null 2>"$OUT/omega_audio.log"; then
+    checks=$((checks - 1))
+    compare_hash omega.wav
+else
+    fail "OMEGA score render"; sed -n '1,8p' "$OUT/omega_audio.log"
+fi
 
 begin "== hot reload: incomplete file retains pixels, retry replaces, journal preserves both =="
 checks=$((checks + 1))

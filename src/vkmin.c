@@ -89,7 +89,8 @@ enum {
     VKMIN_HANDLE_INDEX_BITS = 20,
     VKMIN_BACKBUFFER_SLOT = 0,      /* image slot reserved for the presentable image */
     VKMIN_ARENA_ALIGN = 256,
-    VKMIN_RING_ALIGN = 64
+    VKMIN_RING_ALIGN = 64,
+    VKMIN_MAX_RING_ALLOCS = 1024 /* per frame; every one is registered for journal relocation */
 };
 
 _Static_assert(sizeof(DrawCmd) == sizeof(VkDrawIndexedIndirectCommand), "DrawCmd mirrors Vulkan");
@@ -201,7 +202,7 @@ struct vkmin_ctx {
     bool rec_shared;
     bool replaying;
     uint64_t rec_arena_base, rec_ring_base; /* bases in the recording being replayed */
-    VkDeviceSize ring_issued[256];          /* ring offsets handed out this frame */
+    VkDeviceSize ring_issued[VKMIN_MAX_RING_ALLOCS]; /* ring offsets handed out this frame */
     int ring_issued_count;
     const char *record_path, *replay_path;
 
@@ -2462,7 +2463,13 @@ void *vkmin_ring_alloc(vkmin_ctx *c, size_t bytes, uint64_t *addr_out) {
     c->ring_head[c->slot] = off + bytes;
     const VkDeviceSize base = c->slot * c->ring_region + off;
     if (addr_out) *addr_out = c->ring_addr + base;
-    if (c->ring_issued_count < 256) c->ring_issued[c->ring_issued_count++] = base;
+    /* Every allocation is registered, recording or not, so a journal can never
+     * carry an unrelocatable ring address. Running out is a fatal limit with a
+     * number in it, on every path, never a silent gap that only replay sees. */
+    VKMIN_ASSERT(c->ring_issued_count < VKMIN_MAX_RING_ALLOCS,
+                 "more than %u ring allocations in one frame; raise VKMIN_MAX_RING_ALLOCS",
+                 (unsigned)VKMIN_MAX_RING_ALLOCS);
+    c->ring_issued[c->ring_issued_count++] = base;
     const rec_upload ra = {.offset = bytes};
     RECORD(c, OP_RING_ALLOC, ra, NULL, 0);
     return c->ring_mapped + base;

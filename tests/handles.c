@@ -37,14 +37,22 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "image")) (void)vkmin_index(c, i0);
         else if (!strcmp(argv[1], "push"))
             (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push) + 16});
+        else if (!strcmp(argv[1], "ring")) {
+            /* The journal relocates only ring addresses vkmin registered. Passing
+             * the per-frame limit must abort here, not stop registering quietly. */
+            (void)vkmin_running(c);
+            (void)vkmin_frame_begin(c, &(vkmin_clear){0});
+            for (int k = 0; k < 4096; ++k) (void)vkmin_ring_alloc(c, 16, NULL);
+        }
         vkmin_shutdown(c);
         return 0;
     }
     (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push), .label = "right push"});
     vkmin_shutdown(c);
-    if (!test_aborts(argv[0], "stale") || !test_aborts(argv[0], "image") || !test_aborts(argv[0], "push")) {
+    if (!test_aborts(argv[0], "stale") || !test_aborts(argv[0], "image") || !test_aborts(argv[0], "push") ||
+        !test_aborts(argv[0], "ring")) {
         puts("handles: FAIL a negative case did not abort"); return 1;
     }
-    puts("handles: ok (stale buffer/image and wrong push size rejected)");
+    puts("handles: ok (stale buffer/image, wrong push size and ring allocation overflow rejected)");
     return 0;
 }

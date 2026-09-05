@@ -209,3 +209,38 @@ library budgets hold; the earlier v0.3 2,500-line target was exceeded.
 Local evidence: `build/plan-audit/baseline-test.log`, `improvement-test.log`,
 `verified-test.log`, `reload-test.log`, `heightfield-check.log`, and
 `baseline-images/`; final per-case outputs and diffs are in `tests/out/`.
+
+## Corridor golden resolution — 5 September 2026, evening
+
+The six historical Corridor comparisons (frames 0/120/240/360, overlay,
+cascade debug view) were reproduced on this machine and then bisected against
+the renderer at the commit that produced each golden, rebuilt here with the
+same MSYS2 GCC, glslang and lavapipe (LLVM 22.1.8):
+
+| Case | current vs golden | golden-commit renderer, built here, vs golden | golden-commit renderer vs current |
+|---|---|---|---|
+| corridor_0 | 801 px, worst 166 | 801 px, worst 166 | identical |
+| corridor_120 | 525 px, worst 49 | 525 px, worst 49 | 3 px, worst 2 |
+| corridor_240 | 530 px, worst 39 | 530 px, worst 39 | identical |
+| corridor_360 | 978 px, worst 24 | 945 px, worst 21 | 50 px, worst 24 |
+| overlay | 842 px, worst 166 | 842 px, worst 166 (at 3619299) | identical (at 3619299) |
+| debug_3 | 180 px, worst 103 | 180 px, worst 103 | identical |
+
+The renderer that made the goldens, compiled and run in this environment,
+misses its own goldens by the same scattered texture and shadow texels the
+current renderer does, and matches the current renderer bit for bit on four
+of six cases. The goldens therefore recorded the original Linux Mesa and
+shader-compiler output, not renderer behaviour. The residual differences on
+frames 120 and 360 appear only after commit 3619299 and are the shadow and
+outline polish documented above (50 pixels, worst 24, of 57,600).
+
+Action: the six goldens were regenerated from the current build with the
+harness's own command lines, consistent with the game and valley goldens
+already produced on this lavapipe. The examples and smoke goldens, which
+predate this environment and still match exactly, were left untouched.
+Goldens remain environment-specific; a Linux run must regenerate its own.
+
+The same pass added OMEGA to the harness (golden frame 300 at 320x180,
+renderer journal replay on the legacy path, SHA-256 of the 20-second score)
+and made the per-frame ring allocation limit fatal instead of silently
+unregistering addresses from journal relocation, with a negative test.

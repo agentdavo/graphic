@@ -61,6 +61,7 @@ OMEGA_AUDIO_LIBS :=
 endif
 .PHONY: omega
 omega: $(BUILD)/ex_21_omega
+all: omega
 $(BUILD)/ex_21_omega: examples/21_omega.c demo/omega_shared.h demo/omega_score.h $(BUILD)/shaders.h $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND)
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ $< $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND) $(LDLIBS) $(GLFW_LIBS) $(OMEGA_AUDIO_LIBS)
 all: sndmin
