@@ -22,15 +22,13 @@
 
 typedef struct vkr vkr;
 
-typedef enum { VKR_SHADE_PBR = 0, VKR_SHADE_CEL, VKR_SHADE_UNLIT } vkr_shading;
-
 typedef struct {
     int width, height;         /* maximum render size; targets are made once, at this size */
     int shadow_atlas;          /* texels on a side, power of two */
     size_t max_vertices, max_indices, max_skin_vertices;
     uint32_t max_meshes, max_materials, max_instances;
-    vkr_shading shading;       /* which canonical forward shader; 0 = PBR */
-    vkmin_bytes fs;            /* or the game's own SPIR-V, composed from shaders/lib */
+    vkmin_bytes fs;            /* game's SPIR-V composed from shaders/lib; empty = canonical PBR */
+    const char *fs_path;       /* optional compiled shader path for hot reload */
 } vkr_desc;
 
 /* The look: everything the shader library reads that is not geometry. All
@@ -88,6 +86,7 @@ uint32_t vkr_upload_geometry(vkr *r, const vkr_geometry *g);     /* returns firs
 uint32_t vkr_upload_materials(vkr *r, const Material *m, uint32_t count); /* returns first material index */
 void vkr_frame(vkr *r, const vkr_frame_desc *f);
 vkr_stats vkr_get_stats(const vkr *r);
+vkr_stats vkr_finish(vkr *r); /* between frames: wait and check the final pending cull results */
 /* Lays text out as SDF screen quads: top-left at (x, y) pixels, `px` tall,
  * '\n' starts a line. Returns the quad count. Pure but for the font slot. */
 uint32_t vkr_text(const vkr *r, const char *text, float x, float y, float px, uint32_t rgba, Quad *out, uint32_t cap);

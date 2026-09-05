@@ -4,11 +4,10 @@
  *
  *   A / D run, Space jumps.
  *
- * Physics runs at 60 Hz from the frame index. The character's one clip
- * (CesiumMan's walk) plays while running, holds its first pose standing, and
- * holds a mid-stride pose in the air: three states from one animation, which
- * is honest about the asset rather than about the design. */
-#include "gamekit.h"
+ * Physics runs at 60 Hz. Idle/jump pose tracks and the imported run clip
+ * share the character showcase's animation sampler. */
+#include "play.h"
+#include "shaders.h"
 
 enum { HZ = 60, PLATFORMS = 14, MOVING = 2, LAYERS = 3, MAX_QUADS = 256 };
 
@@ -29,7 +28,7 @@ typedef struct {
     float x, y, vx, vy;
     bool grounded, facing_right;
     float run_time;      /* seconds of the run clip played */
-    uint32_t tick, jumps;
+    uint32_t tick, jumps, landed, jump_tick, landing_tick, falls;
 } player;
 
 static void player_tick(player *p, const vkmin_inputs *in) {
@@ -39,7 +38,8 @@ static void player_tick(player *p, const vkmin_inputs *in) {
     if (want == 0.0f) p->vx *= 0.8f;
     p->vx = fminf(fmaxf(p->vx, -max_speed), max_speed);
     if (want != 0.0f) p->facing_right = want > 0.0f;
-    if (p->grounded && vkmin_key_pressed(in, VKMIN_KEY_SPACE)) { p->vy = 0.36f; p->grounded = false; p->jumps++; }
+    const bool was_grounded = p->grounded;
+    if (p->grounded && vkmin_key_pressed(in, VKMIN_KEY_SPACE)) { p->vy = 0.36f; p->jumps++; p->jump_tick = p->tick; }
     p->vy -= gravity;
     /* Carried by a moving platform: its delta this tick. */
     const float feet_before = p->y;
@@ -56,7 +56,8 @@ static void player_tick(player *p, const vkmin_inputs *in) {
             p->x += b.x - prev.x;
         }
     }
-    if (p->y < -12.0f) { p->x = 0.0f; p->y = 2.0f; p->vy = 0.0f; } /* fell off: back to the start */
+    if (p->grounded && !was_grounded) { ++p->landed; p->landing_tick = p->tick; }
+    if (p->y < -12.0f) { p->x = 0; p->y = 2; p->vx = 0; p->vy = 0; ++p->falls; }
     if (p->grounded && fabsf(p->vx) > 0.01f) p->run_time += 1.0f / HZ;
     p->tick++;
 }
@@ -86,8 +87,9 @@ int main(int argc, char **argv) {
     vkmin_size(gpu, &width, &height);
     vkr *r = vkr_init(gpu, &(vkr_desc){.width = width, .height = height, .shadow_atlas = cvar_get_int(CV_r_shadow_atlas),
                                        .max_vertices = 16384, .max_indices = 65536, .max_skin_vertices = 8192, .max_meshes = 16,
-                                       .max_materials = 8, .max_instances = 32, .shading = VKR_SHADE_CEL});
+                                       .max_materials = 8, .max_instances = 32, .fs = VKMIN_BYTES(lit_cel_frag_spv)});
     const gk_shapes shapes = gk_upload_shapes(r);
+    const uint32_t disc = gk_disc_texture(gpu, 32), grade = gk_grade(gpu, .08f, 1.08f);
     const scene hero = scene_load("assets/cesium/scene.vkm");
     uint32_t hero_mat0 = 0;
     const uint32_t hero_mesh0 = gk_load_scene(r, gpu, &hero, &hero_mat0);
@@ -98,10 +100,13 @@ int main(int argc, char **argv) {
                                      skyline_texture(gpu, 128, 14, gk_rgba(0.20f, 0.32f, 0.22f, 1), 47)};
 
     player p = {.x = 0.0f, .y = 2.0f, .facing_right = true};
+    player previous = p;
+    gk_clock clock = {0};
+    bool help = true;
+    FILE *trace = gk_trace_open(argc, argv, "tick jumps landings falls x y animation");
     Instance instances[PLATFORMS + 1];
     Quad quads[MAX_QUADS];
     mat4 bones[ANIM_MAX_JOINTS];
-    uint32_t ticks_done = 0;
     char hud[64];
     while (vkmin_running(gpu)) {
         const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
@@ -110,29 +115,33 @@ int main(int argc, char **argv) {
         width = fr.width;
         height = fr.height;
         if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
-        const uint32_t due = gk_ticks_due(frame, HZ, &ticks_done);
-        for (uint32_t k = 0; k < due; ++k) player_tick(&p, in);
+        if (vkmin_key_pressed(in, VKMIN_KEY_F1)) help = !help;
+        if (vkmin_key_pressed(in, 'R')) { p = (player){.y = 2, .facing_right = true}; previous = p; clock = (gk_clock){.origin = frame}; }
+        const gk_step step = gk_step_frame(&clock, frame, HZ, *in);
+        for (uint32_t k = 0; k < step.due; ++k) { previous = p; const vkmin_inputs tick_input = gk_tick_input(step, k); player_tick(&p, &tick_input); }
+        const float rx = gk_lerp(previous.x, p.x, step.alpha), ry = gk_lerp(previous.y, p.y, step.alpha);
 
         const float aspect = (float)width / (float)height, half_h = 5.0f;
-        const vkmin_camera cam = vkmin_camera_side((vec3){p.x + 2.0f, 2.5f, 0.0f}, half_h, aspect, 30.0f);
+        const vkmin_camera cam = vkmin_camera_side((vec3){rx + 2.0f, 2.5f, 0.0f}, half_h, aspect, 30.0f);
 
         /* --- platforms as cubes, the hero as a skinned instance ----------- */
         uint32_t n = 0;
         for (uint32_t i = 0; i < PLATFORMS; ++i) {
-            const box b = platform_at(i, p.tick);
+            box b = platform_at(i, p.tick);
+            const box before = platform_at(i, previous.tick);
+            b.x = gk_lerp(before.x, b.x, step.alpha); b.y = gk_lerp(before.y, b.y, step.alpha);
             const mat4 t = vkmin_mat4_mul(vkmin_mat4_translate((vec3){b.x + b.w * 0.5f, b.y + b.h * 0.5f, 0.0f}),
                                           vkmin_mat4_scale((vec3){b.w * 0.5f, b.h * 0.5f, 1.5f}));
             instances[n++] = (Instance){.transform = t, .prev_transform = t, .bounds = gk_world_bounds(t, (vec4){0, 0, 0, 1.7321f}),
                                         .mesh = shapes.cube, .material = mat0 + (i >= PLATFORMS - MOVING ? 1u : 0u), .bone_offset = VKMIN_NONE, .id = i + 1u};
         }
-        /* Idle holds the clip's first pose; the air holds a mid-stride one. */
-        const float clip = hero.header.anim_duration;
-        const float anim_time = !p.grounded ? clip * 0.3f : fabsf(p.vx) > 0.01f ? p.run_time * 1.6f : 0.0f;
-        const mat4 placement = vkmin_mat4_mul(vkmin_mat4_translate((vec3){p.x, p.y, 0.0f}),
+        const uint32_t animation = !p.grounded ? ANIM_JUMP : fabsf(p.vx) > .01f ? ANIM_RUN : ANIM_IDLE;
+        const float anim_time = animation == ANIM_RUN ? gk_lerp(previous.run_time, p.run_time, step.alpha) : (float)p.tick / HZ;
+        const mat4 placement = vkmin_mat4_mul(vkmin_mat4_translate((vec3){rx, ry, 0.0f}),
                                               vkmin_mat4_mul(vkmin_mat4_rotate_y(p.facing_right ? 1.5708f : -1.5708f), vkmin_mat4_scale((vec3){1.1f, 1.1f, 1.1f})));
         instances[n] = gk_scene_instance(&hero, 0, hero_mesh0, hero_mat0, placement);
         instances[n].id = 100;
-        const uint32_t bone_count = anim_bones(&hero, anim_time, gk_node_transform(&hero, 0), bones, ANIM_MAX_JOINTS);
+        const uint32_t bone_count = anim_character(&hero, anim_time, animation, (float)(p.tick - p.jump_tick) / HZ, gk_node_transform(&hero, 0), bones, ANIM_MAX_JOINTS);
         n++;
 
         /* --- parallax: each layer is a row of quads that follows the camera
@@ -149,19 +158,29 @@ int main(int argc, char **argv) {
                                      .color = 0xffffffffu, .texture = layers[l]};
             }
         }
-        snprintf(hud, sizeof hud, "x %.1f  jumps %u", (double)p.x, p.jumps);
-        nq += vkr_text(r, hud, 6.0f, 6.0f, 12.0f, 0xff202020u, quads + nq, MAX_QUADS - nq);
+        const float dust_age = (float)(p.tick - p.landing_tick);
+        if (p.landed && dust_age < 24) for (uint32_t i = 0; i < 6; ++i) {
+            const float side = (float)i - 2.5f;
+            quads[nq++] = (Quad){.pos = {rx + side * dust_age * .025f, ry + .1f + dust_age * .008f, 1.6f, 0},
+                .size_uv0 = {.35f, .2f, 0, 0}, .uv1 = {1, 1, 0, 0}, .texture = disc,
+                .color = gk_rgba(.85f, .7f, .45f, (1-dust_age/24)*.6f)};
+        }
+        snprintf(hud, sizeof hud, "%s  jumps %u  landings %u", p.x > 88 ? "COURSE CLEAR" : "Reach the far platform", p.jumps, p.landed);
+        nq += gk_card(r, width, "SKYWAY / platformer", hud, "A/D run  SPACE jump  R restart  F1 help", help, quads + nq, MAX_QUADS - nq);
+        const uint32_t words[] = {p.tick, p.jumps, p.landed, p.falls, gk_float_bits(p.x), gk_float_bits(p.y), animation};
+        gk_trace(trace, frame, words, sizeof words / sizeof words[0]);
 
         const Light sun = gk_sun((vec3){-0.4f, -1.0f, -0.6f}, 3.5f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 0.1f, .far = 60.0f, .instances = instances, .instance_count = n, .lights = &sun, .light_count = 1,
                                        .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame = fr,
                                        .look = {.rim_strength = 0.3f, .rim_power = 3.0f, .shadow_tint = {0.55f, 0.55f, 0.7f},
-                                                .outline = 0.7f, .outline_depth = 0.04f}});
+                                                .outline = 0.7f, .outline_depth = 0.04f, .lut_tex = grade, .lut_strength = .55f}});
         vkmin_frame_end(gpu);
     }
     vkr_shutdown(r);
     vkmin_shutdown(gpu);
     scene_free((scene *)&hero);
+    if (trace) fclose(trace);
     return 0;
 }

@@ -10,7 +10,7 @@ set -u
 
 BUILD=${BUILD:-build}
 GOLDEN=tests/golden
-OUT=tests/out
+OUT=${VKMIN_TEST_OUT:-tests/out}
 TOLERANCE=${VKMIN_TOLERANCE:-2}
 CORRIDOR="./$BUILD/corridor --profile lavapipe --headless"
 FRAMES="0 120 240 360"
@@ -23,7 +23,14 @@ if [ -n "$LVP" ]; then
     VK_DRIVER_FILES=$LVP
     export VK_ICD_FILENAMES VK_DRIVER_FILES
 fi
+if [ -z "${VK_DRIVER_FILES:-${VK_ICD_FILENAMES:-}}" ]; then
+    printf 'FAIL: select a lavapipe ICD with VK_DRIVER_FILES\n' >&2
+    exit 1
+fi
 mkdir -p "$OUT" "$GOLDEN"
+# Every expected output belongs to this run. A failed render cannot inherit
+# success from an old PNG or journal in the same directory.
+find "$OUT" -maxdepth 1 -type f \( -name '*.png' -o -name '*.vkj' -o -name '*.log' \) -exec rm -f {} +
 
 note()  { printf '  %s\n' "$*"; }
 fail()  { printf '  FAIL: %s\n' "$*"; failures=$((failures + 1)); }
@@ -69,6 +76,15 @@ render() { # <output name> [args...]
 begin "== pure functions =="
 checks=$((checks + 1))
 ./$BUILD/mat4_test || fail "mat4_test"
+checks=$((checks + 1))
+./$BUILD/play_test || fail "queued input edges and fixed-step interpolation"
+checks=$((checks + 2))
+./$BUILD/spirv_test "$BUILD/layout.comp.spv" || fail "SPIR-V reflection"
+./$BUILD/heightfield || fail "heightfield"
+
+begin "== frame lifecycle: repeated running queries preserve the input stream =="
+checks=$((checks + 1))
+./$BUILD/lifecycle --play tests/journals/10_shooter.vkd --frame 2 >"$OUT/lifecycle.log" 2>&1 || fail "lifecycle"
 
 begin "== handles: a freed slot's old handle aborts, the new one works =="
 checks=$((checks + 1))
@@ -95,6 +111,7 @@ compare smoke_bc1
 begin "== which paths can this device run? =="
 ./$BUILD/corridor --probe > "$OUT/probe.txt" 2>&1 || fail "probe"
 cat "$OUT/probe.txt" | sed 's/^/  /'
+grep -qi 'llvmpipe\|lavapipe' "$OUT/probe.txt" || { fail "test driver is not lavapipe"; exit 1; }
 MODERN=0
 grep -q "hostImageCopy=1 maintenance5=1" "$OUT/probe.txt" && MODERN=1
 
@@ -113,7 +130,7 @@ begin "== the ID target: vkmin_pick reads the instance under a texel, both paths
 for p in legacy modern; do
     [ "$p" = "modern" ] && [ "$MODERN" != "1" ] && continue
     checks=$((checks + 1))
-    ./$BUILD/pick --headless --frame 1 --path=$p >/dev/null 2>"$OUT/pick_$p.log" || { fail "pick ($p)"; sed -n '1,6p' "$OUT/pick_$p.log"; }
+    ./$BUILD/pick --headless --frames 0,1 --path=$p >/dev/null 2>"$OUT/pick_$p.log" || { fail "pick ($p)"; sed -n '1,6p' "$OUT/pick_$p.log"; }
 done
 
 begin "== the five games: each replays its demo file to a golden frame =="
@@ -124,7 +141,7 @@ game() {
     g=$1; frame=$2; shift 2
     checks=$((checks + 1))
     if ./$BUILD/ex_$g --profile lavapipe --headless --play "tests/journals/$g.vkd" --frame "$frame" \
-            --out "$OUT/ex_$g.png" "$@" >/dev/null 2>"$OUT/ex_$g.log"; then
+            --out "$OUT/ex_$g.png" --state-trace "$OUT/$g.state" --record "$OUT/$g.vkj" "$@" >/dev/null 2>"$OUT/ex_$g.log"; then
         checks=$((checks - 1))
         compare "ex_$g"
     else
@@ -133,33 +150,52 @@ game() {
     if [ "$MODERN" = "1" ]; then
         checks=$((checks + 1))
         if ./$BUILD/ex_$g --profile lavapipe --headless --play "tests/journals/$g.vkd" --frame "$frame" --path=legacy \
-                --out "$OUT/ex_${g}_legacy.png" "$@" >/dev/null 2>"$OUT/ex_${g}_legacy.log"; then
+                --out "$OUT/ex_${g}_legacy.png" --state-trace "$OUT/${g}_legacy.state" "$@" >/dev/null 2>"$OUT/ex_${g}_legacy.log"; then
             checks=$((checks - 1))
             same "ex_$g" "ex_${g}_legacy" 0 "$g: legacy path == modern path"
+            checks=$((checks + 1))
+            diff -u "$OUT/$g.state" "$OUT/${g}_legacy.state" >"$OUT/$g.state.diff" || fail "$g: game state differs across paths"
         else
             fail "game $g (legacy)"; sed -n '1,8p' "$OUT/ex_${g}_legacy.log"
         fi
     fi
+    checks=$((checks + 1))
+    if ./$BUILD/ex_07_replay --replay "$OUT/$g.vkj" --frame "$frame" --path=legacy --out "$OUT/${g}_replay.png" >"$OUT/${g}_replay.log" 2>&1; then
+        same "ex_$g" "${g}_replay" 0 "$g: renderer journal replay"
+    else fail "$g: renderer journal replay"; fi
 }
 game 10_shooter 150
 game 11_rts 300 d_check_cull=1
 game 12_topdown 300
 game 13_platformer 300
-game 14_anime 240
+game 14_anime 390
 
-begin "== a game's journal: record 14_anime playing its demo, replay it, same pixels =="
+begin "== gameplay outcomes from input demos =="
+for g in 10_shooter 11_rts 12_topdown 13_platformer 14_anime; do
+    checks=$((checks + 1))
+    awk -v game="$g" -f tests/check_gameplay.awk "$OUT/$g.state" || fail "$g: gameplay outcome"
+done
+
+begin "== hot reload: incomplete file retains pixels, retry replaces, journal preserves both =="
 checks=$((checks + 1))
-./$BUILD/ex_14_anime --profile lavapipe --headless --play tests/journals/14_anime.vkd --frame 240 --record "$OUT/anime.vkj" >/dev/null 2>"$OUT/record_anime.log" || fail "record 14_anime"
-checks=$((checks + 1))
-if ./$BUILD/ex_07_replay --replay "$OUT/anime.vkj" --frame 240 --path=legacy --out "$OUT/anime_replay.png" >/dev/null 2>"$OUT/replay_anime.log"; then
-    same ex_14_anime anime_replay 0 "14_anime's journal, recorded on one path, replays on the other"
-else
-    fail "replay 14_anime"; sed -n '1,8p' "$OUT/replay_anime.log"
-fi
+if ./$BUILD/reload "$OUT/reload" "$BUILD/reload.frag.spv" --frames 0,1,2,3 --record "$OUT/reload.vkj" r_hotreload=1 >"$OUT/reload.log" 2>&1; then
+    same reload-0 reload-1 0 "invalid shader retains the working pipeline"
+    same reload-0 reload-3 0 "restoring the original shader restores its pixels"
+    checks=$((checks + 1))
+    if ./$BUILD/imgdiff "$OUT/reload-0.png" "$OUT/reload-2.png" 0 >"$OUT/reload-change.log" 2>&1; then
+        fail "valid shader replacement did not change the frame"
+    fi
+    checks=$((checks + 1))
+    if ./$BUILD/ex_07_replay --replay "$OUT/reload.vkj" --frame 2 --path=legacy --out "$OUT/reload-replay.png" >"$OUT/reload-replay.log" 2>&1; then
+        same reload-2 reload-replay 0 "replacement shader replays across paths"
+    else fail "reload journal replay"; fi
+else fail "hot reload"; sed -n '1,10p' "$OUT/reload.log"; fi
 
 begin "== the journal: record 06_cube, replay it without the program, same pixels =="
 checks=$((checks + 1))
 ./$BUILD/ex_06_cube --headless --size 256 256 --frame 60 --record "$OUT/cube.vkj" >/dev/null 2>"$OUT/record.log" || { fail "record"; sed -n '1,6p' "$OUT/record.log"; }
+checks=$((checks + 1))
+./$BUILD/journal "$OUT/cube.vkj" "$OUT/corrupt.vkj" >"$OUT/corrupt.log" 2>&1 || fail "corrupt journal rejection"
 checks=$((checks + 1))
 if ./$BUILD/ex_07_replay --replay "$OUT/cube.vkj" --frame 60 --out "$OUT/ex_07_replay.png" >/dev/null 2>"$OUT/replay.log"; then
     same ex_06_cube ex_07_replay 0 "replayed journal == the recording program's frame"

@@ -8,7 +8,7 @@
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
-static void fail(const char *path, const char *why) {
+static _Noreturn void fail(const char *path, const char *why) {
     fprintf(stderr, "ktx2: %s: %s\n", path, why);
     abort();
 }
@@ -16,12 +16,13 @@ static void fail(const char *path, const char *why) {
 vkmin_image ktx2_load(vkmin_ctx *c, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) fail(path, "cannot open");
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) fail(path, "cannot seek");
     const long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_SET) != 0) fail(path, "cannot seek");
     if (size < 80) fail(path, "too small to be KTX2");
     uint8_t *data = malloc((size_t)size);
-    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) fail(path, "read failed");
+    if (!data) fail(path, "allocation failed");
+    if (fread(data, 1, (size_t)size, f) != (size_t)size) fail(path, "read failed");
     fclose(f);
 
     static const uint8_t identifier[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
@@ -32,6 +33,8 @@ vkmin_image ktx2_load(vkmin_ctx *c, const char *path) {
     const uint32_t levels = rd32(data + 40), supercompression = rd32(data + 44);
     if (depth > 1 || layers > 1 || faces != 1 || supercompression != 0) fail(path, "unsupported KTX2 layout");
     if (levels == 0 || levels > 16) fail(path, "bad level count");
+    if ((uint64_t)size < 80 + 24 * (uint64_t)levels) fail(path, "truncated level index");
+    if (width == 0 || height == 0 || width > 32768 || height > 32768) fail(path, "bad dimensions");
 
     vkmin_format fmt;
     switch (vk_format) {
@@ -48,7 +51,7 @@ vkmin_image ktx2_load(vkmin_ctx *c, const char *path) {
     for (uint32_t l = 0; l < levels; ++l) {
         const uint8_t *entry = data + 80 + 24 * l;
         const uint64_t offset = rd64(entry), bytes = rd64(entry + 8);
-        if (offset + bytes > (uint64_t)size) fail(path, "level data runs past the end of the file");
+        if (offset > (uint64_t)size || bytes > (uint64_t)size - offset) fail(path, "level data runs past the end of the file");
         vkmin_image_upload(c, img, (int)l, (vkmin_bytes){data + offset, (size_t)bytes});
     }
     free(data);

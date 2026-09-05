@@ -291,7 +291,7 @@ int main(int argc, char **argv) {
         }
     }
     /* d_check_cull: the GPU draw list must agree with the CPU reference. */
-    const vkr_stats final = vkr_get_stats(r);
+    const vkr_stats final = vkr_finish(r);
     const int status = final.cull_mismatches ? 1 : 0;
     if (cvar_get_bool(CV_d_check_cull)) printf("corridor: cull check: %u mismatches\n", final.cull_mismatches);
 

@@ -1,9 +1,10 @@
-/* anim.h -- skeletal animation sampling, as pure functions. Frame index in,
- * bone matrices out; nothing here reads a clock. */
+/* anim.h -- deterministic skeletal animation sampling. Caller-owned bone
+ * matrices out; nothing here reads a clock or changes the source scene. */
 #ifndef VKMIN_ANIM_H
 #define VKMIN_ANIM_H
 
 #include "vkmin_math.h"
+#include "vkmin.h"
 #include "scene.h"
 
 enum { ANIM_MAX_JOINTS = 128 };
@@ -84,6 +85,44 @@ static inline uint32_t anim_bones(const scene *s, float time, mat4 mesh_world, m
         out[j] = vkmin_mat4_mul(inv_mesh, vkmin_mat4_mul(global[j], inv_bind));
     }
     return n;
+}
+
+/* Authored pose tracks for the supplied CesiumMan rig (19 named joints).
+ * Run uses its imported walk clip. Idle and jump have independent keyframed
+ * torso, knee and arm offsets; these are demo art, not renderer policy. */
+enum { ANIM_IDLE, ANIM_RUN, ANIM_JUMP };
+static inline uint32_t anim_character(const scene *s, float time, uint32_t state, float phase,
+                                      mat4 mesh_world, mat4 *out, uint32_t cap) {
+    if (state == ANIM_RUN || s->header.joint_count != 19) return anim_bones(s, time * 1.6f, mesh_world, out, cap);
+    typedef struct { float time, torso, knee, arm; } pose_key;
+    static const pose_key idle[] = {{0, -.015f, 0, -.025f}, {1.5f, .015f, .02f, .025f}, {3, -.015f, 0, -.025f}};
+    static const pose_key jump[] = {{0, .15f, .25f, -.3f}, {.18f, -.12f, .85f, -.8f}, {.48f, .05f, .45f, -.5f}, {.8f, .18f, .15f, -.15f}};
+    const pose_key *track = state == ANIM_JUMP ? jump : idle;
+    const uint32_t count = state == ANIM_JUMP ? 4 : 3;
+    const float t = state == ANIM_JUMP ? fminf(fmaxf(phase, 0), .8f) : fmodf(time, 3);
+    uint32_t hi = 1;
+    while (hi + 1 < count && track[hi].time < t) ++hi;
+    const pose_key a = track[hi - 1], b = track[hi];
+    const float f = (t - a.time) / (b.time - a.time);
+    const float torso = a.torso + (b.torso-a.torso)*f, knee = a.knee + (b.knee-a.knee)*f, arm = a.arm + (b.arm-a.arm)*f;
+    vkm_channel channels[ANIM_MAX_JOINTS * 3];
+    vkm_key keys[ANIM_MAX_JOINTS * 3];
+    VKMIN_ASSERT(s->header.channel_count <= ANIM_MAX_JOINTS * 3, "too many character channels");
+    for (uint32_t c = 0; c < s->header.channel_count; ++c) {
+        channels[c] = s->channels[c]; channels[c].first_key = c; channels[c].key_count = 1;
+        keys[c].time = 0;
+        anim_sample_channel(&s->channels[c], s->keys, 0, keys[c].value);
+        if (channels[c].path != VKM_PATH_ROTATION) continue;
+        const uint32_t j = channels[c].joint;
+        const float angle = j == 1 ? torso : j == 13 || j == 14 ? knee : j == 5 || j == 6 ? arm : 0;
+        const float sn = sinf(angle * .5f), cs = cosf(angle * .5f);
+        const vec4 q = {keys[c].value[0], keys[c].value[1], keys[c].value[2], keys[c].value[3]};
+        keys[c].value[0] = q.w*sn + q.x*cs; keys[c].value[1] = q.y*cs + q.z*sn;
+        keys[c].value[2] = q.z*cs - q.y*sn; keys[c].value[3] = q.w*cs - q.x*sn;
+    }
+    scene pose = *s;
+    pose.channels = channels; pose.keys = keys; pose.header.anim_duration = 0;
+    return anim_bones(&pose, 0, mesh_world, out, cap);
 }
 
 #endif

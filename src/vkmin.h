@@ -9,8 +9,11 @@
  * (vkmin_bytes), and a frame reads the outside world at exactly one point:
  * the vkmin_frame that frame_begin returns. Desc structs configure everything
  * and a zero field is always the sensible default. The library never calls
- * user code, never allocates after init, and reads no clock: frame N is the
- * same pixels every run.
+ * user code. Resource creation, loading, reload and replay can allocate host
+ * memory; ordinary draws use preallocated arenas. Game time comes from the
+ * frame index. Replay equality requires the same inputs, assets and settings
+ * on a compatible implementation; floating-point pixels are not portable
+ * across arbitrary drivers.
  *
  * Every function carries a state contract in its trailing comment:
  *   pure        reads only its arguments
@@ -24,13 +27,13 @@
  */
 #ifndef VKMIN_H
 #define VKMIN_H
+#include "shared.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
-#include "shared.h"
 
 /* ---- compile-time configuration; every value has a default ------------- */
 #ifndef VKMIN_MAX_BUFFERS
@@ -214,6 +217,7 @@ _Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...); // 
 bool vkmin_running(vkmin_ctx *);                                             // writes ctx, io
 vkmin_frame vkmin_frame_begin(vkmin_ctx *, const vkmin_clear *clear);        // writes ctx, gpu, io
 void vkmin_frame_end(vkmin_ctx *);                                           // writes ctx, gpu, io
+void vkmin_wait(vkmin_ctx *);  /* between frames: complete all submitted GPU work */ // gpu
 void vkmin_size(const vkmin_ctx *, int *w, int *h);  /* before the loop, to size targets */ // reads ctx
 void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame host memory */ // writes ctx
 
@@ -235,7 +239,8 @@ vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipeline_desc *); //
 uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one texel of the last
                                         completed frame's ID target, between frames; 0 off-image */ // gpu
 vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *);            // pure
-void vkmin_heightfield(const vkmin_heightfield_desc *, Vertex *, uint32_t *, Mesh *);      // pure
+/* Output arrays must hold the counts from sizes(); zero scale/chunk selects defaults. */
+void vkmin_heightfield(const vkmin_heightfield_desc *, Vertex *, uint32_t *, Mesh *);      // writes outputs
 
 /* ---- recording: in order, into one command buffer, no reordering --------- */
 void vkmin_barrier(vkmin_ctx *, const vkmin_barrier_desc *);                 // gpu

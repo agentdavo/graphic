@@ -12,7 +12,7 @@ layout(location = 4) out float v_softness;
 
 void main() {
     Frame frame = FrameRef(push.frame).frame;
-    Quad q = QuadRef(push.aux).q[gl_VertexIndex / 6u];
+    Quad q = QuadRef(push.aux).q[push.param + gl_VertexIndex / 6u];
     uint corner = uint(gl_VertexIndex) % 6u;
     // 0,1,2 then 2,1,3 over the corners (0,0) (1,0) (0,1) (1,1)
     uint c = corner < 3u ? corner : (corner == 3u ? 2u : corner == 4u ? 1u : 3u);

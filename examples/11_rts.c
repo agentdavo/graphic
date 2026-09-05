@@ -7,10 +7,10 @@
  *   selection to march there. Hover highlights what vkmin_pick returns.
  *
  * Simulation runs at 30 Hz from the frame index; rendering interpolates
- * nothing because units move per tick and ticks are cheap. Every number
+ * between the previous and current tick positions. Every number
  * below is a function of (tick, index) or of recorded input, so a demo file
  * replays the same battle. */
-#include "gamekit.h"
+#include "play.h"
 
 enum { UNITS = 2000, TERRAIN_N = 181, TERRAIN_CHUNK = 30, HZ = 30, MAX_QUADS = 6000 };
 #define CELL 8.0f
@@ -34,6 +34,7 @@ typedef struct {
 
 typedef struct {
     unit units[UNITS];
+    pos2 previous[UNITS];
     uint32_t tick;
     pos2 cam_target;
     float cam_distance;
@@ -42,6 +43,8 @@ typedef struct {
     float drag_x0, drag_y0;
     uint32_t hovered;    /* unit id from the ID target, 0 = none */
     uint32_t selected_count, dead_count;
+    pos2 rally;
+    uint32_t orders, order_tick;
 } game;
 
 static pos2 unit_position(const unit *u, uint32_t i, uint32_t tick) {
@@ -50,7 +53,7 @@ static pos2 unit_position(const unit *u, uint32_t i, uint32_t tick) {
     const float t = (float)tick / (float)HZ;
     const float radius = 20.0f + 30.0f * gk_hash(7, i), speed = (0.05f + 0.1f * gk_hash(9, i)) * (u->team ? -1.0f : 1.0f);
     const float a = t * speed + 6.2831853f * gk_hash(11, i);
-    return (pos2){u->target.x + radius * cosf(a), u->target.z + radius * sinf(a)};
+    return (pos2){u->home.x + radius * cosf(a), u->home.z + radius * sinf(a)};
 }
 
 static void game_init(game *g) {
@@ -62,6 +65,7 @@ static void game_init(game *g) {
         const float cz = TERRAIN_SIZE * 0.5f + (gk_hash(2, i) - 0.5f) * 500.0f;
         u->home = u->target = (pos2){cx, cz};
         u->hp = 1.0f;
+        g->previous[i] = unit_position(u, i, 0);
     }
     g->cam_target = (pos2){TERRAIN_SIZE * 0.5f, TERRAIN_SIZE * 0.5f};
     g->cam_distance = 260.0f;
@@ -69,6 +73,7 @@ static void game_init(game *g) {
 
 /* One tick: the march, and attrition where the armies meet. */
 static void game_tick(game *g) {
+    for (uint32_t i = 0; i < UNITS; ++i) g->previous[i] = unit_position(&g->units[i], i, g->tick);
     g->tick++;
     for (uint32_t i = 0; i < UNITS; ++i) {
         unit *u = &g->units[i];
@@ -136,6 +141,7 @@ int main(int argc, char **argv) {
     const uint32_t terrain_mesh0 = vkr_upload_geometry(r, &(vkr_geometry){.vertices = tv, .vertex_count = hs.vertices, .indices = ti,
                                                                           .index_count = hs.indices, .meshes = tm, .mesh_count = hs.meshes});
     const gk_shapes shapes = gk_upload_shapes(r);
+    const uint32_t disc = gk_disc_texture(gpu, 32);
 
     const uint32_t grass = gk_checker_texture(gpu, 64, 8, gk_rgba(0.34f, 0.46f, 0.20f, 1), gk_rgba(0.24f, 0.36f, 0.15f, 1));
     Material mats[5] = {gk_material(1, 1, 1, 0.0f, 0.9f, 0), gk_material(0.20f, 0.35f, 0.95f, 0.1f, 0.5f, 0),
@@ -157,7 +163,9 @@ int main(int argc, char **argv) {
     }
     free(heights); free(tv); free(ti); free(tm);
 
-    uint32_t ticks_done = 0;
+    gk_clock clock = {0};
+    bool help = true;
+    FILE *trace = gk_trace_open(argc, argv, "tick orders selected fallen hovered unit0x unit0z");
     char hud[256];
     while (vkmin_running(gpu)) {
         const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
@@ -166,6 +174,8 @@ int main(int argc, char **argv) {
         width = fr.width;
         height = fr.height;
         if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+        if (vkmin_key_pressed(in, VKMIN_KEY_F1)) help = !help;
+        if (vkmin_key_pressed(in, 'R')) { memset(g, 0, sizeof *g); game_init(g); clock = (gk_clock){.origin = frame}; }
 
         /* --- input to camera and orders -------------------------------- */
         const float pan = 3.0f * g->cam_distance / 260.0f;
@@ -194,6 +204,7 @@ int main(int argc, char **argv) {
         if (in->buttons_pressed & VKMIN_MOUSE_RIGHT) {
             pos2 hit;
             if (terrain_hit(vkmin_ray_from_pixel(cam.view, cam.proj, in->mouse_x, in->mouse_y, (float)width, (float)height), &hit)) {
+                g->rally = hit; g->order_tick = g->tick; ++g->orders;
                 for (uint32_t i = 0; i < UNITS; ++i) {
                     if (g->units[i].selected) g->units[i].target = (pos2){hit.x + (gk_hash(3, i) - 0.5f) * 60.0f, hit.z + (gk_hash(4, i) - 0.5f) * 60.0f};
                 }
@@ -201,8 +212,8 @@ int main(int argc, char **argv) {
         }
 
         /* --- simulate ---------------------------------------------------- */
-        const uint32_t due = gk_ticks_due(frame, HZ, &ticks_done);
-        for (uint32_t k = 0; k < due; ++k) game_tick(g);
+        const gk_step step = gk_step_frame(&clock, frame, HZ, *in);
+        for (uint32_t k = 0; k < step.due; ++k) game_tick(g);
 
         /* --- instances, lights, quads ------------------------------------ */
         uint32_t n = hs.meshes, nq = 0;
@@ -210,7 +221,8 @@ int main(int argc, char **argv) {
         g->dead_count = 0;
         for (uint32_t i = 0; i < UNITS; ++i) {
             const unit *u = &g->units[i];
-            const pos2 p = unit_position(u, i, g->tick);
+            const pos2 now = unit_position(u, i, g->tick);
+            const pos2 p = {gk_lerp(g->previous[i].x, now.x, step.alpha), gk_lerp(g->previous[i].z, now.z, step.alpha)};
             const float y = terrain_height(p.x, p.z);
             const bool dead = u->hp <= 0.0f;
             const float s = dead ? 1.2f : 1.5f;
@@ -220,6 +232,10 @@ int main(int argc, char **argv) {
             instances[n++] = (Instance){.transform = t, .prev_transform = t, .bounds = gk_world_bounds(t, (vec4){0, 0, 0, 1.7321f}),
                                         .mesh = shapes.cube, .material = mat0 + mat, .bone_offset = VKMIN_NONE, .id = i + 1u};
             g->dead_count += dead;
+            if (!dead && i % 48 == 0 && nq < MAX_QUADS && fabsf(u->target.x-u->home.x) + fabsf(u->target.z-u->home.z) > 2) {
+                quads[nq++] = (Quad){.pos = {p.x-3, y+1, p.z, 0}, .size_uv0 = {8, 5, 0, 0}, .uv1 = {1, 1, 0, 0},
+                    .texture = disc, .color = 0x60a0b8c8u, .flags = VKMIN_QUAD_BILLBOARD};
+            }
             if (u->selected && !dead && nq + 3 <= MAX_QUADS) {
                 /* health bar: dark back, coloured front, and a marker on the ground */
                 g->selected_count++;
@@ -243,8 +259,13 @@ int main(int argc, char **argv) {
             e[3].pos = (vec4){x1, cy, 0, 0}; e[3].size_uv0 = (vec4){1, h, 0, 0};
             for (int k = 0; k < 4 && nq < MAX_QUADS; ++k) quads[nq++] = e[k];
         }
-        snprintf(hud, sizeof hud, "units %u  fallen %u  selected %u  hover %u", UNITS, g->dead_count, g->selected_count, g->hovered);
-        nq += vkr_text(r, hud, 6.0f, (float)height - 18.0f, 12.0f, 0xffffffffu, quads + nq, MAX_QUADS - nq);
+        if (g->orders && g->tick - g->order_tick < 90 && nq < MAX_QUADS) {
+            const float pulse = 12 + 4*sinf((float)(g->tick-g->order_tick)*.2f);
+            quads[nq++] = (Quad){.pos = {g->rally.x, terrain_height(g->rally.x,g->rally.z)+1, g->rally.z, 0},
+                .size_uv0 = {pulse,pulse,0,0}, .uv1 = {1,1,0,0}, .texture = disc, .color = 0xc050f0ffu, .flags = VKMIN_QUAD_GROUND};
+        }
+        snprintf(hud, sizeof hud, "2000 units / %u selected / %u orders", g->selected_count, g->orders);
+        nq += gk_card(r, width, "RIDGELINE / command", hud, "Drag select  RMB order  WASD pan  R reset  F1 help", help, quads + nq, MAX_QUADS - nq);
 
         const Light sun = gk_sun((vec3){0.4f, -1.0f, 0.3f}, 4.0f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
@@ -254,11 +275,14 @@ int main(int argc, char **argv) {
         vkmin_frame_end(gpu);
         /* Picking reads the frame just finished, so the highlight is one frame late. */
         g->hovered = vkmin_pick(gpu, vkr_id_target(r), (int)in->mouse_x, (int)in->mouse_y);
+        const uint32_t words[] = {g->tick,g->orders,g->selected_count,g->dead_count,g->hovered,gk_float_bits(g->units[0].home.x),gk_float_bits(g->units[0].home.z)};
+        gk_trace(trace, frame, words, sizeof words / sizeof words[0]);
     }
-    const vkr_stats st = vkr_get_stats(r);
+    const vkr_stats st = vkr_finish(r);
     if (cvar_get_bool(CV_d_check_cull)) printf("11_rts: cull check: %u mismatches\n", st.cull_mismatches);
     vkr_shutdown(r);
     vkmin_shutdown(gpu);
     free(g); free(instances); free(quads);
+    if (trace) fclose(trace);
     return st.cull_mismatches ? 1 : 0;
 }

@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     vkmin_ctx *ctx = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "07_replay"});
-    vkmin_replay(ctx, journal);
+    const bool ok = vkmin_replay(ctx, journal);
     vkmin_shutdown(ctx);
-    return 0;
+    return ok ? 0 : 1;
 }

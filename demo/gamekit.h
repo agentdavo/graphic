@@ -147,7 +147,7 @@ static inline mat4 gk_mat4_from_array(const float *a) {
  * mesh index and writes the first material index. Node transforms are the
  * caller's to instance (see gk_scene_instance). */
 static inline uint32_t gk_load_scene(vkr *r, vkmin_ctx *gpu, const scene *s, uint32_t *first_material) {
-    uint32_t *slots = malloc((s->header.texture_count + 1) * sizeof(uint32_t));
+    uint32_t *slots = calloc((size_t)s->header.texture_count + 1, sizeof(uint32_t));
     Material *mats = malloc((s->header.material_count + 1) * sizeof(Material));
     if (!slots || !mats) gk_die("out of memory");
     for (uint32_t i = 0; i < s->header.texture_count; ++i) {
@@ -159,7 +159,10 @@ static inline uint32_t gk_load_scene(vkr *r, vkmin_ctx *gpu, const scene *s, uin
         mats[i] = s->materials[i];
         uint32_t *fields[4] = {&mats[i].albedo_tex, &mats[i].normal_tex, &mats[i].mr_tex, &mats[i].emissive_tex};
         for (int k = 0; k < 4; ++k) {
-            if (*fields[k] != VKMIN_NONE) *fields[k] = slots[*fields[k]];
+            if (*fields[k] != VKMIN_NONE) {
+                if (*fields[k] >= s->header.texture_count) gk_die("material texture index out of range");
+                *fields[k] = slots[*fields[k]];
+            }
         }
     }
     *first_material = vkr_upload_materials(r, mats, s->header.material_count);
@@ -259,7 +262,7 @@ typedef struct {
 /* Reads the game's flags and the cvars; leaves vkmin's flags for vkmin_init.
  * `--profile lavapipe` sets small settings for CI without a GPU, without
  * overriding any cvar the user named. */
-static inline gk_options gk_parse(int argc, char **argv, const char *usage) {
+static inline gk_options gk_parse(int argc, char **argv, const char *help_text) {
     gk_options o = {0};
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -267,7 +270,7 @@ static inline gk_options gk_parse(int argc, char **argv, const char *usage) {
         if (!strcmp(a, "--headless") || !strcmp(a, "--frame") || !strcmp(a, "--frames") || !strcmp(a, "--replay")) o.headless = true;
         else if (!strcmp(a, "--profile") && next) o.profile = argv[++i];
         else if (!strcmp(a, "--device") && next) o.device = atoi(argv[++i]);
-        else if (!strcmp(a, "--help")) { fprintf(stderr, "%s", usage); exit(0); }
+        else if (!strcmp(a, "--help")) { fprintf(stderr, "%s", help_text); exit(0); }
         else if (a[0] != '-' && strchr(a, '=')) { if (!cvar_parse_assignment(a)) exit(2); }
     }
     if (o.profile) {

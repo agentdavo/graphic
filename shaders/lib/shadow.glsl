@@ -9,14 +9,17 @@ float shadow_sample(Frame frame, uint view_index, vec3 world_pos, vec3 N, float 
     if (clip.w <= 0.0) return 1.0;
     vec3 ndc = clip.xyz / clip.w;
     vec2 uv = ndc.xy * 0.5 + 0.5;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || ndc.z > 1.0) return 1.0;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || ndc.z < 0.0 || ndc.z > 1.0) return 1.0;
     vec2 atlas_uv = sv.atlas_rect.xy + uv * sv.atlas_rect.zw;
     float ref = ndc.z - sv.texel.y;
     float texel = sv.texel.x;
+    vec2 lo = sv.atlas_rect.xy + vec2(0.5 * texel);
+    vec2 hi = sv.atlas_rect.xy + sv.atlas_rect.zw - vec2(0.5 * texel);
     float lit = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            lit += texture(SHADOW_TEX(frame.shadow_atlas_tex), vec3(atlas_uv + vec2(x, y) * texel, ref));
+            vec2 tap = clamp(atlas_uv + vec2(x, y) * texel, lo, hi);
+            lit += texture(SHADOW_TEX(frame.shadow_atlas_tex), vec3(tap, ref));
         }
     }
     return lit / 9.0;

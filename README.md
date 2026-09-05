@@ -1,10 +1,25 @@
 # vkmin v0.4 — a Doom 3-class world in a small C11 codebase, and five games on it
 
+**Current verification:** the isolated v0.4 Windows/lavapipe build for `main` completed 80
+checks, with six historical Corridor golden mismatches still open. All five
+game journals replay exactly across Vulkan paths; gameplay traces and outcomes,
+static analysis, shader validation and runtime/reference checks passed. The
+five changed demo goldens were inspected and replaced. Concurrent v0.5 and audio
+work was excluded from this commit; this is not yet v0.4 acceptance. See the
+[executed report](docs/verification-2026-09-05.md) and
+[remaining upgrade plan](DESIGN-v0.4.md). Native reproduction with the local
+w64devkit, Vulkan SDK, Mesa and cppcheck: `./tools/test-windows.ps1`.
+
+For the API's ownership model, the different kinds of numeric IDs, and runnable
+record/replay commands, read [Using vkmin](docs/using-vkmin.md). The five games
+share **R** to restart and **F1** to toggle controls. Add `--state-trace FILE`
+to record named gameplay checkpoints alongside the input demo or GPU journal.
+
 A Vulkan 1.3 renderer whose whole design is subtraction: no render passes, no
 framebuffers, no vertex input state, no per-draw descriptor binding, no
 material scripts, no runtime shader compilation, no allocator. What is left is
 one context, one device arena, one bindless texture set bound once per frame,
-nine pipelines created at init, and a frame that is a single function written
+ten pipelines created at init, and a frame that is a single function written
 in the order the GPU executes it:
 
 ```
@@ -45,8 +60,8 @@ make SANITIZE=1 BUILD=build_san build_san/corridor    # ASan + UBSan build
 | `src/mat4.h`, `src/pack.h`, `src/plat*.c` | ~310 | pure maths, attribute packing, the GLFW backend |
 | `shaders/` | 563 | ten GLSL files, one shared preamble, one shared vertex fetch |
 | `demo/corridor.c`, `demo/anim.h` | 498 + 89 | the demo and its skeletal animation sampler |
-| `tools/cook.c`, `tools/cook_image.c` | ~800 | glTF → `.vkm` + BCn `.ktx2`, offline |
-| `tools/imgdiff.c`, `tools/mkfont.c`, … | | golden comparison, font baking, small checks |
+| `tools/cook.c`, `tools/cook_image.c` | ~800 | glTF â†’ `.vkm` + BCn `.ktx2`, offline |
+| `tools/imgdiff.c`, `tools/mkfont.c`, â€¦ | | golden comparison, font baking, small checks |
 
 Core (`src/`, excluding the baked font and the stb bridge) is **4056 lines**,
 about 3200 without comments and blanks. The budget was four to five thousand.
@@ -86,15 +101,15 @@ append (fast) and stable slot-per-instance (fixed draw order, bit-exact
 goldens). `r_gpu_cull=0` is the CPU reference cull. `make test` requires all
 three to agree at tolerance 0, and at frame 240 they do.
 
-**6. Clustered forward lighting.** A 16×9×24 froxel grid filled by
+**6. Clustered forward lighting.** A 16Ã—9Ã—24 froxel grid filled by
 `cluster.comp`, one thread per cluster, no atomics. `r_clustered=0` is the
 brute-force reference (every light, every pixel); the harness requires the two
 to agree within 2/255. `r_debug=2` shows lights-per-cluster as a heat map.
 
-**7. Shadows.** One depth atlas (4096², 1024² in the software profile). Sun
-cascades share quadrant 0; local lights get 512² tiles from the other three,
+**7. Shadows.** One depth atlas (4096Â², 1024Â² in the software profile). Sun
+cascades share quadrant 0; local lights get 512Â² tiles from the other three,
 ranked by projected size, six tiles for a point light, one for a spot. Shadow
-rendering reuses the indirect draw path with the depth-only pipelines. 3×3 PCF
+rendering reuses the indirect draw path with the depth-only pipelines. 3Ã—3 PCF
 through the compare sampler, normal-offset plus slope-scaled bias. `r_debug=6`
 shows the raw atlas, `r_debug=3` colours by cascade.
 
@@ -124,8 +139,8 @@ and committed as `src/font.h`, so the binary has nothing to fail to find.
 
 The three operations where 1.3 and 1.4 differ are implemented twice, as two
 complete functions each, and the path is chosen **once at init** into
-`ctx->path` from the features the device reports — a 1.3 device exposing the
-promoted extensions is "modern" — then never consulted again except at those
+`ctx->path` from the features the device reports â€” a 1.3 device exposing the
+promoted extensions is "modern" â€” then never consulted again except at those
 three call sites. `--path=legacy|modern` forces it; a forced path the device
 cannot do fails at init naming the missing feature. `--probe` prints what a
 device offers and what would be chosen, creating nothing else.
@@ -156,7 +171,7 @@ is reported as skipped by name.
 header comment states the shape (one context, typed handles, zero-default
 descs, no callbacks, no allocation after init, no clock, single-threaded,
 failure fatal) and every function carries a state contract in its trailing
-comment — `pure`, `reads ctx`, `writes ctx`, `gpu`, `io`. The compile-time
+comment â€” `pure`, `reads ctx`, `writes ctx`, `gpu`, `io`. The compile-time
 block at the top (`VKMIN_MAX_BUFFERS/IMAGES/PIPES`, `VKMIN_FAIL`,
 `VKMIN_ASSERT`, `VKMIN_NO_PLATFORM`) has a default for every value.
 
@@ -190,8 +205,8 @@ as `name=value`.
 is appended as a record `{op, header, payload, relocation list}`, including
 the bytes of every upload, shader and push block. `vkmin_replay` re-issues the
 stream in a fresh process: `07_replay` is the replay of `06_cube`, without the
-cube's code, shaders or texture. Device addresses are the difficulty — the
-replayed process gets different ones — so the journal header stores the
+cube's code, shaders or texture. Device addresses are the difficulty â€” the
+replayed process gets different ones â€” so the journal header stores the
 recording's arena and ring base addresses and every 8-byte word of a payload
 that *exactly equals* an address issued during recording (an arena allocation
 or a ring allocation of the current frame) is relocated. That is a heuristic,
@@ -212,7 +227,7 @@ and `vkmin_probe` (device report, creates nothing else). `make amalgamate`
 produces `build/vkmin_single.h`; `make test` compiles it as a check. The
 examples are the tests: `01_clear` (12 lines), `02_triangle` (18),
 `03_buffer` (25), `04_texture` (26), `05_compute` (29), `06_cube` (33),
-`07_replay` (24); each renders frame 60 at 256² against a golden.
+`07_replay` (24); each renders frame 60 at 256Â² against a golden.
 
 **Budgets, honestly.** The brief's budget for the core was 2500 lines with
 both paths, written for the cube lineage; at the end of v0.3 `src/vkmin.c`
@@ -221,8 +236,8 @@ journal, hot reload, stats and dump, and with the renderer (`render.c`, 776)
 and the rest of `src/` the core was about 4800 (v0.4's numbers are below). It is over the number and I
 have not cut it to fit; the journal alone is ~400 lines, and taking it out
 would remove the one feature that turns every bug into a batch job. The
-brief's other acceptance test — hand the header to someone and time them to a
-cube — cannot be run here; `06_cube` is my own answer to it, and it is 33
+brief's other acceptance test â€” hand the header to someone and time them to a
+cube â€” cannot be run here; `06_cube` is my own answer to it, and it is 33
 lines.
 
 ## v0.4: what games need
@@ -242,7 +257,7 @@ is nine things, and the table below is where each lives and who uses it.
 | cameras as pure functions (`camera_fps/rts/ortho_topdown/side`) | `vkmin_math.h` | all five |
 | rays (`ray_from_pixel`, ray-AABB, ray-triangle) | `vkmin_math.h` | shooter (hit test), rts (march orders), topdown (ground cursor) |
 | `ticks_for_frame` fixed-step time | `vkmin_math.h` | all five |
-| `vkmin_input` snapshot, journalled; `--demo`/`--play` | `vkmin.h` | all five |
+| returned `vkmin_frame.input` snapshot, journalled; `--demo`/`--play` | `vkmin.h` | all five |
 | instancing + GPU cull with the CPU reference (`d_check_cull`) | `render.c`, `cull.comp` | all five (rts: 2000 units + terrain chunks) |
 | quad batcher: sprites, particles, billboards, UI, parallax | `render.c`, `quad.vert/frag` | shooter (particles, HUD), rts (selection, health bars), topdown (sprites), platformer (parallax), anime (title) |
 | SDF text (`vkr_text`) | `render.c`, `tools/mkfont` | shooter, rts, topdown, platformer, anime |
@@ -251,20 +266,20 @@ is nine things, and the table below is where each lives and who uses it.
 | lighting library the user's shader includes | `shaders/lib/` | `lit_pbr.frag`: shooter, rts, topdown; `lit_cel.frag`: platformer, anime |
 | clustered lights | `cluster.comp`, `lib/lights.glsl` | shooter (25 lights), topdown (2); the rest pay nothing |
 | ID target + `vkmin_pick` | `vkmin.c`, `render.c` | rts (hover), topdown (click); `tests/pick.c` |
-| `vkmin_heightfield` | `vkmin.c` | rts (2 km² terrain), topdown (the tile floor) |
-| post: normal target, outline, LUT, tonemap | `tonemap.frag` | outline: platformer, anime; LUT: anime; fog: shooter, rts |
+| `vkmin_heightfield` | `vkmin.c` | rts (2 kmÂ² terrain), topdown (the tile floor) |
+| post: normal target, outline, LUT, tonemap | `tonemap.frag` | outline and LUT: platformer, anime; fog: shooter, rts |
 | glTF via cgltf, KTX2 | `tools/cook.c`, `src/scene.c`, `src/ktx2.c` | shooter (Sponza + CesiumMan), platformer, anime (CesiumMan) |
 
-Nothing was used by one game only, so nothing was removed. The colour LUT
-has one user (anime); it is one function in a pass every game runs and was
-kept as part of "post" rather than counted alone -- say so if you disagree.
+The nine rendering primitives each have at least two consumers. Colour grading
+now has two explicit consumers as well: the platformer and anime showcase.
 
-**The journal is a demo file.** `vkmin_input` is read at one point in
-`vkmin_frame_begin`, edges are computed there against the previous snapshot,
-and it travels in the frame-begin journal record. `--demo FILE` writes the
+**Input demos and renderer journals.** `vkmin_running` gathers one input snapshot
+and computes edges against the previous snapshot. `vkmin_frame_begin` returns
+it and writes the frame-begin journal record. `--demo FILE` writes the
 snapshots alone (frame index + inputs, ~150 bytes a frame); `--play FILE`
 feeds them back one frame per record. Every game simulates at a fixed rate
-from the frame index and reads no clock, so a demo replays the same game and
+from the frame index and reads no clock, so with the same logic, assets and
+settings a demo replays the same game and
 the goldens are taken from replayed demos. `tests/journals/*.vkd` are
 **scripted by `tools/mkdemo.c`, not recorded by a person** -- CI has no
 hands -- and a demo recorded in a window is the same file format.
@@ -280,10 +295,10 @@ depth prepass, so it survives `r_prepass=0`. A blended pipeline masks the id
 and normal attachments off, so one shader serves opaque and transparent
 draws. Inverted-hull outlines and compute pre-skinning remain the noted
 parallel implementations, not built. glTF goes through the offline cooker
-(cgltf, from v0.1), not a runtime loader. The platformer's "idle, run and
-jump" are one clip -- CesiumMan's walk -- held, played and held mid-stride;
-that is honest about the one skinned asset in the tree, not about the
-design. Picking is one frame late by construction (it reads the frame just
+(cgltf, from v0.1), not a runtime loader. The platformer and anime showcase use
+the imported CesiumMan walk clip for running and demo-authored keyframed idle
+and jump pose offsets. These are not three imported animation clips.
+Picking is one frame late by construction (it reads the frame just
 submitted). `vkr_look`, the cel ramp, rim, shadow tint, fog, outline and
 LUT parameters, travel in the frame desc; the cvars `r_outline` and `r_lut`
 are live multipliers.
@@ -299,15 +314,14 @@ now exists so the right matrix has a name.
 **A lavapipe quirk.** A pipeline whose extra attachments are masked off still
 needs its fragment shader to declare those outputs: undeclared, the normal
 target came out stippled under the parallax quads and the outline pass drew
-the stipple. Declared and written, the mask does its job. `quad.frag` says
-so.
+the stipple. Declared and written, the mask does its job. World and screen
+fragment entry points share `quad.glsl`; the screen entry point declares only
+colour because its render pass has no ID or normal attachments.
 
 **Numbers.** Core (`src/*.c`, `src/*.h` less the stb bridge and the baked
-font): **5582 lines** with both paths, against a budget of 7000. The shader
-library is 259 lines (budget 1000); every shader in the tree, library
-included, is 877. `vkmin.h` is 271 lines. The games: `10_shooter` 193,
-`11_rts` 262, `12_topdown` 150, `13_platformer` 165, `14_anime` 113 (budget
-500 each), sharing `demo/gamekit.h` (303: mesh builders, scene upload,
+font): **5868 lines** with both paths, against a budget of 7000. The shader
+library is 262 lines (budget 1000). `vkmin.h` is 273 lines. Every individual
+game remains below 500 lines, sharing `demo/gamekit.h` (mesh builders, scene upload,
 procedural textures, the lavapipe profile, option parsing) and `demo/anim.h`
 (89). The Corridor now uses the same kit and lost 190 lines. The game
 developer's test -- someone who has shipped a game reads the header, the
@@ -319,7 +333,9 @@ their rays). By the brief's rule the first two belong in v0.5.
 
 ## Test coverage, in numbers
 
-`make test` runs **57 checks**: the maths unit test (cameras and rays
+The upstream harness reported **57 checks**; the current native run reports
+**62**, with the result and added regression tests listed in the verification
+report above. The original coverage includes the maths unit test (cameras and rays
 included), the handle-generation and wrong-`push_size` aborts, the
 `--no-readback` refusal, seven example goldens, the journal (recordings of
 `06_cube`, The Corridor and `14_anime` replayed at tolerance 0, two across
@@ -352,7 +368,7 @@ Synchronization validation found five real defects during this work, all in
 frame-to-frame hazards that a single-frame test can never see: the backbuffer
 losing its readback copy as a source scope; a draw-count fill racing the
 previous frame's indirect read (syncval files `vkCmdFillBuffer` under COPY,
-the spec under CLEAR — the barrier now names all transfer stages); the same
+the spec under CLEAR â€” the barrier now names all transfer stages); the same
 fill racing the previous frame's count-readback copy; the count readback
 overwriting its own ring bytes two frames apart; and, in v0.0, a swapchain
 image read after present. Each fix is a comment at the barrier it changed.
@@ -365,7 +381,7 @@ twice and requires bit-identical output, and requires `--sync-naive` (one frame
 in flight, wait idle per submit) to match the two-frames-in-flight path
 exactly. Headless overlays omit timings for the same reason.
 
-Golden images are rendered under `--profile lavapipe` (320×180, 8 lights, one
+Golden images are rendered under `--profile lavapipe` (320Ã—180, 8 lights, one
 cascade, 1024 atlas, no transparents, no overlay) at frames 0, 120, 240, 360,
 one process per frame, compared at 2/255 per channel with a diff image written
 beside any failure. Under lavapipe this manages about five frames a second,
@@ -373,7 +389,7 @@ which is what it is for.
 
 ## Deviations from the design note, stated plainly
 
-- **The vertex is 24 bytes, not 20** — see system 4.
+- **The vertex is 24 bytes, not 20** â€” see system 4.
 - **Instances, lights and bones are re-uploaded every frame** through the host
   ring rather than living in device memory and being patched. At this scene's
   size that is ~80 KB a frame and it keeps "who owns what moves" trivially

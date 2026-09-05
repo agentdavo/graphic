@@ -3,6 +3,7 @@
 CC      ?= cc
 BUILD   ?= build
 GLSLANG ?= glslangValidator
+SPIRV_VAL ?= spirv-val
 
 # Maximum practical warning level, warnings as errors, static analysis in the
 # normal build. If any of this is ever quietly turned off, defects accumulate
@@ -19,8 +20,14 @@ ifeq ($(SANITIZE),1)
 SAN := -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
 INCLUDES := -Isrc -Idemo -Ithird_party -I$(BUILD)
-CFLAGS   := $(OPT) $(WARN) $(ANALYZER) $(SAN) $(INCLUDES)
+ifeq ($(OS),Windows_NT)
+INCLUDES += -I$(subst \,/,$(VULKAN_SDK))/Include
+endif
+CFLAGS   = $(OPT) $(WARN) $(ANALYZER) $(SAN) $(INCLUDES) -MMD -MP -MT $@
 LDLIBS   := -lvulkan -lm
+ifeq ($(OS),Windows_NT)
+LDLIBS := $(subst \,/,$(VULKAN_SDK))/Lib/vulkan-1.lib -lm
+endif
 GLFW_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw)
 
 # Third-party code is quarantined in its own translation units and compiled
@@ -30,22 +37,34 @@ THIRD_PARTY_CFLAGS := -std=c11 $(OPT) -w $(SAN) $(INCLUDES)
 
 SHADER_SRC := $(wildcard shaders/*.vert shaders/*.frag shaders/*.comp)
 SPV        := $(patsubst shaders/%,$(BUILD)/%.spv,$(SHADER_SRC))
-GLSL_FLAGS := -V --target-env vulkan1.3 -Isrc -Ishaders -P"\#extension GL_GOOGLE_include_directive : require"
+# SPIR-V 1.5 keeps discard as OpKill; newer compilers otherwise introduce
+# the optional shaderDemoteToHelperInvocation feature without asking us.
+GLSL_FLAGS := -V --target-env vulkan1.3 --target-env spirv1.5 -Isrc -Ishaders -P"\#extension GL_GOOGLE_include_directive : require"
 
 CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD)/cvar.o $(BUILD)/ktx2.o $(BUILD)/scene.o $(BUILD)/render.o
+ifeq ($(HEADLESS),1)
+CFLAGS += -DVKMIN_NO_PLATFORM
+CORE_OBJS := $(filter-out $(BUILD)/plat_glfw.o,$(CORE_OBJS))
+GLFW_LIBS :=
+endif
 
-.PHONY: all clean test golden texture analyze tools
+.PHONY: all clean test golden texture analyze tools validate-shaders
 EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
 
 all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
-tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles
+# Keep transitive includes honest, including standalone tools and examples.
+# This follows the default target so dependency files cannot change it.
+-include $(wildcard $(BUILD)/*.d)
+tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles $(BUILD)/spirv_test $(BUILD)/layout.comp.spv $(BUILD)/lifecycle $(BUILD)/heightfield
+tools: $(BUILD)/reload $(BUILD)/reload.frag.spv $(BUILD)/journal
+tools: $(BUILD)/play_test
 
 $(BUILD):
 	@mkdir -p $(BUILD)
 
 # --- shaders: compiled offline, embedded as uint32_t arrays. No runtime
 # --- shader compiler, no file-path failure mode in the binary.
-$(BUILD)/%.spv: shaders/% shaders/common.glsl shaders/scene_vertex.glsl $(wildcard shaders/lib/*.glsl) src/shared.h | $(BUILD)
+$(BUILD)/%.spv: shaders/% Makefile $(wildcard shaders/*.glsl shaders/lib/*.glsl) src/shared.h | $(BUILD)
 	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
 
 $(BUILD)/bin2c: tools/bin2c.c | $(BUILD)
@@ -61,7 +80,7 @@ $(BUILD)/shaders.h: $(SPV) $(BUILD)/bin2c
 	@printf '#endif\n' >> $@
 
 # --- objects
-$(BUILD)/%.o: src/%.c src/vkmin.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h src/render.h src/vkmin_math.h src/font.h $(BUILD)/shaders.h | $(BUILD)
+$(BUILD)/%.o: src/%.c src/vkmin.h src/spirv.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h src/render.h src/vkmin_math.h src/font.h $(BUILD)/shaders.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
@@ -73,12 +92,33 @@ $(BUILD)/smoke: tests/smoke.c $(BUILD)/shaders.h $(CORE_OBJS)
 $(BUILD)/pick: tests/pick.c demo/gamekit.h src/render.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
-$(BUILD)/handles: tests/handles.c $(BUILD)/shaders.h $(CORE_OBJS)
+$(BUILD)/handles: tests/handles.c tests/process.h $(BUILD)/shaders.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/spirv_test: tests/spirv_test.c src/spirv.h $(BUILD)/shaders.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD)/layout.comp.spv: tests/layout.comp Makefile | $(BUILD)
+	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
+
+$(BUILD)/lifecycle: tests/lifecycle.c $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/heightfield: tests/heightfield.c tests/process.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/reload: tests/reload.c $(BUILD)/shaders.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(BUILD)/reload.frag.spv: tests/reload.frag Makefile | $(BUILD)
+	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
+
+$(BUILD)/journal: tests/journal.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 # The examples are the tutorial and the tests: each builds alone against the
 # header, and each produces a golden image in make test.
-$(BUILD)/ex_%: examples/%.c examples/cube_data.h demo/gamekit.h demo/anim.h src/vkmin.h src/vkmin_math.h src/render.h $(BUILD)/shaders.h $(CORE_OBJS)
+$(BUILD)/ex_%: examples/%.c examples/cube_data.h demo/gamekit.h demo/play.h demo/anim.h src/vkmin.h src/vkmin_math.h src/render.h $(BUILD)/shaders.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/corridor: demo/corridor.c demo/anim.h demo/gamekit.h src/render.h src/scene.h src/vkmin_math.h $(CORE_OBJS)
@@ -91,6 +131,9 @@ $(BUILD)/mktex: tools/mktex.c $(BUILD)/stb_bridge.o | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/mat4_test: tests/mat4_test.c src/vkmin_math.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+$(BUILD)/play_test: tests/play.c demo/play.h demo/gamekit.h demo/anim.h $(BUILD)/shaders.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(BUILD)/mkdemo: tools/mkdemo.c src/vkmin.h | $(BUILD)
@@ -122,16 +165,19 @@ texture: $(BUILD)/mktex
 
 # Static analysis is part of the test run, not a target someone remembers:
 # a finding fails the build.
-test: all analyze $(BUILD)/amalg_check
+test: all analyze validate-shaders $(BUILD)/amalg_check
 	./tests/run_tests.sh
+
+validate-shaders: $(SPV) $(BUILD)/layout.comp.spv $(BUILD)/reload.frag.spv
+	@for s in $^; do $(SPIRV_VAL) --target-env vulkan1.3 --scalar-block-layout $$s || exit 1; done
 
 # The single-header form is generated, never edited, and must compile alone.
 .PHONY: amalgamate
 amalgamate: $(BUILD)/vkmin_single.h
-$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
+$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/spirv.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
 	./tools/amalgamate.sh > $@
 $(BUILD)/amalg_check: $(BUILD)/vkmin_single.h tests/amalg_check.c
-	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function -I$(BUILD) -Ithird_party -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
+	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function $(INCLUDES) $(filter -DVKMIN_NO_PLATFORM,$(CFLAGS)) -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
 
 golden: all
 	VKMIN_WRITE_GOLDEN=1 ./tests/run_tests.sh
@@ -144,7 +190,7 @@ analyze:
 	    --inline-suppr --error-exitcode=1 --quiet \
 	    --suppress=missingIncludeSystem --suppress=missingInclude \
 	    -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c -UVKMIN_NO_PLATFORM \
-	    src demo tools tests
+	    src demo tools tests examples
 
 clean:
 	rm -rf $(BUILD) tests/out

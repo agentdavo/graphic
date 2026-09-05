@@ -1,0 +1,7 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(push_constant, std430, row_major) uniform Test {
+    mat3 basis;                       // MatrixStride 16: 48 bytes, not 36
+    layout(offset = 64) uvec2 values[2]; // ArrayStride 8, end at 80
+} pc;
+void main() {}

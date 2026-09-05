@@ -63,15 +63,20 @@ int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "usage: mkdemo <out-dir>\n"); return 2; }
     const char *dir = argv[1];
 
-    /* 10_shooter: walk in, look around, fire twice, strafe. Short, because
-     * Sponza under lavapipe is the slow one. */
+    /* 10_shooter: open the gate, stop, aim and clear both targets.
+     * Aim is authored input using known fixture positions, not a camera override. */
     begin(170);
-    hold('W', 10, 110);
-    mouse(0, 90, W / 2.0f, H / 2.0f, W / 2.0f + 140.0f, H / 2.0f - 10.0f);
-    button(VKMIN_MOUSE_LEFT, 100, 104);
-    button(VKMIN_MOUSE_LEFT, 130, 134);
-    hold('A', 120, 160);
-    mouse(120, 165, W / 2.0f + 140.0f, H / 2.0f - 10.0f, W / 2.0f + 60.0f, H / 2.0f + 6.0f);
+    hold('W', 10, 40);
+    hold('E', 41, 43);
+    for (int f = 80; f < 170; ++f) {
+        const int e = f < 125 ? 0 : 1;
+        const float z = 2 * sinf((float)f / 60 * .45f + (float)e * 3.14159f);
+        const float dx = 3 + (float)e * 4 + 7.2f;
+        const float yaw = atan2f(-dx, -z), pitch = atan2f(-.7f, sqrtf(dx*dx + z*z));
+        frames[f].mouse_x = W/2.0f + (-1.5708f - yaw) / .004f;
+        frames[f].mouse_y = H/2.0f - pitch / .004f;
+    }
+    for (int f = 90; f <= 150; f += 12) button(VKMIN_MOUSE_LEFT, f, f + 1);
     write_demo(dir, "10_shooter");
 
     /* 11_rts: box-select the blue army, order it east, pan and zoom to watch. */
@@ -114,7 +119,7 @@ int main(int argc, char **argv) {
     write_demo(dir, "13_platformer");
 
     /* 14_anime: the camera orbits on its own; the mouse nudges the orbit. */
-    begin(300);
+    begin(600);
     mouse(0, 150, W / 2.0f, H / 2.0f, W / 2.0f + 60.0f, H / 2.0f - 20.0f);
     button(VKMIN_MOUSE_LEFT, 40, 150);
     write_demo(dir, "14_anime");

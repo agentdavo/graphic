@@ -200,10 +200,8 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     /* Ten pipelines for the whole engine, all created here, all against the
      * one layout. The forward shader is the game's choice: a canonical one
      * or its own composed from shaders/lib. */
-    const vkmin_bytes fs = desc->fs.data ? desc->fs : desc->shading == VKR_SHADE_CEL ? VKMIN_BYTES(lit_cel_frag_spv)
-                                          : desc->shading == VKR_SHADE_UNLIT ? VKMIN_BYTES(unlit_frag_spv) : VKMIN_BYTES(lit_pbr_frag_spv);
-    const char *fs_path = desc->fs.data ? NULL : desc->shading == VKR_SHADE_CEL ? "build/lit_cel.frag.spv"
-                                          : desc->shading == VKR_SHADE_UNLIT ? "build/unlit.frag.spv" : "build/lit_pbr.frag.spv";
+    const vkmin_bytes fs = desc->fs.data ? desc->fs : VKMIN_BYTES(lit_pbr_frag_spv);
+    const char *fs_path = desc->fs_path ? desc->fs_path : desc->fs.data ? NULL : "build/lit_pbr.frag.spv";
     const uint32_t push = sizeof(Push); /* every renderer pipeline pushes the one Push block */
     r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cull_comp_spv), .push_size = push, .label = "vkr.cull"});
     r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cluster_comp_spv), .push_size = push, .label = "vkr.cluster"});
@@ -245,7 +243,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
                                                                  .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
                                                                  .depth = true, .depth_compare = VKMIN_CMP_LESS_EQUAL,
                                                                  .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.world"});
-    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv), .push_size = push,
+    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_screen_frag_spv), .push_size = push,
                                                                   .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.screen"});
     for (int i = 0; i < VKR_FRAMES; ++i) {
         r->check_cpu[i] = calloc(2u * desc->max_instances + 2u, sizeof(DrawCmd));
@@ -627,6 +625,17 @@ uint32_t vkr_text(const vkr *r, const char *text, float x0, float y0, float px, 
     return n;
 }
 
+vkr_stats vkr_finish(vkr *r) {
+    vkmin_wait(r->gpu);
+    for (uint32_t slot = 0; slot < VKR_FRAMES; ++slot) {
+        if (r->check_valid[slot] && r->counts_valid[slot]) {
+            r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot]);
+            r->check_valid[slot] = false;
+        }
+    }
+    return r->stats;
+}
+
 /* ---------------------------------------------------------------- frame --- */
 
 static void draw_lists(vkr *r, uint32_t view, vkmin_pipeline culled, vkmin_pipeline double_sided, const Push *base,
@@ -808,7 +817,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     }
     r->check_valid[slot] = s.check_cull && s.gpu_cull;
     uint64_t counts_addr = 0;
-    uint32_t *counts_host = vkmin_ring_alloc(gpu, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), &counts_addr);
+    const uint32_t *counts_host = vkmin_ring_alloc(gpu, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), &counts_addr);
     r->counts_host[slot] = counts_host;
     r->counts_views[slot] = vs.count;
     r->counts_valid[slot] = s.gpu_cull;
@@ -893,7 +902,9 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_timestamp(gpu, 7);
     if (screen_quads) {
         Push q = base_push;
-        q.aux = quads_addr + (uint64_t)world_quads * sizeof(Quad);
+        /* Keep the issued base address intact for journal relocation. */
+        q.aux = quads_addr;
+        q.param = world_quads;
         vkmin_draw(gpu, r->quad_screen, &q, screen_quads * 6, 1);
     }
     vkmin_pass_end(gpu);

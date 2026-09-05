@@ -23,6 +23,9 @@ vec3 to_srgb(vec3 c) {
 // View-space depth from the depth target, for a threshold in world units.
 float linear_depth(Frame frame, vec2 uv) {
     float z = texture(TEX(frame.depth_tex), uv).r;
+    // Orthographic depth is affine. Invert the actual projection, including
+    // its near plane, rather than applying the perspective reciprocal.
+    if (frame.proj[3][3] == 1.0) return (frame.proj[3][2] - z) / frame.proj[2][2];
     // Inverts the perspective depth mapping using the near/far the clusters use.
     float n = frame.cluster_params.z, f = frame.cluster_params.w;
     return n * f / max(f - z * (f - n), 1e-6);

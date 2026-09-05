@@ -4,9 +4,9 @@
  * picking through the ID target: click a prop and it lights up.
  *
  *   WASD moves, the mouse points, left click picks. */
-#include "gamekit.h"
+#include "play.h"
 
-enum { FLOOR_N = 65, FLOOR_CHUNK = 16, PROPS = 40, ENEMIES = 24, HZ = 30, MAX_QUADS = 512 };
+enum { FLOOR_N = 65, FLOOR_CHUNK = 64, PROPS = 40, ENEMIES = 24, HZ = 30, MAX_QUADS = 512 };
 #define FLOOR_SIZE ((float)(FLOOR_N - 1))
 
 static float floor_height(float x, float z) { return 0.6f * sinf(x * 0.35f) * cosf(z * 0.27f) + 0.3f * sinf(z * 0.9f); }
@@ -15,7 +15,7 @@ typedef struct {
     float px, pz;        /* player */
     uint32_t tick;
     uint32_t picked;     /* prop id under the last click, 0 = none */
-    uint32_t hovered;
+    uint32_t hovered, selections;
 } game;
 
 /* A character sprite: a filled disc with a dark rim and an eye-dot, so its
@@ -80,7 +80,10 @@ int main(int argc, char **argv) {
     free(fv); free(fi); free(fm);
 
     game g = {.px = FLOOR_SIZE * 0.5f, .pz = FLOOR_SIZE * 0.5f};
-    uint32_t ticks_done = 0;
+    float previous_x = g.px, previous_z = g.pz;
+    gk_clock clock = {0};
+    bool help = true;
+    FILE *trace = gk_trace_open(argc, argv, "tick selections picked hovered x z");
     Light lights[2];
     char hud[128];
     while (vkmin_running(gpu)) {
@@ -92,8 +95,15 @@ int main(int argc, char **argv) {
         if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
 
         /* --- simulate: the player walks, the enemies are functions of the tick --- */
-        const uint32_t due = gk_ticks_due(frame, HZ, &ticks_done);
-        for (uint32_t k = 0; k < due; ++k) {
+        if (vkmin_key_pressed(in, VKMIN_KEY_F1)) help = !help;
+        if (vkmin_key_pressed(in, 'R')) {
+            g = (game){.px = 32, .pz = 32};
+            previous_x = g.px; previous_z = g.pz;
+            clock = (gk_clock){.origin = frame};
+        }
+        const gk_step step = gk_step_frame(&clock, frame, HZ, *in);
+        for (uint32_t k = 0; k < step.due; ++k) {
+            previous_x = g.px; previous_z = g.pz;
             const float speed = 0.22f;
             g.px += (vkmin_key_down(in, 'D') ? speed : 0.0f) - (vkmin_key_down(in, 'A') ? speed : 0.0f);
             g.pz += (vkmin_key_down(in, 'S') ? speed : 0.0f) - (vkmin_key_down(in, 'W') ? speed : 0.0f);
@@ -101,8 +111,9 @@ int main(int argc, char **argv) {
             g.pz = fminf(fmaxf(g.pz, 1.0f), FLOOR_SIZE - 1.0f);
             g.tick++;
         }
-        const float py = floor_height(g.px, g.pz);
-        const vkmin_camera cam = vkmin_camera_ortho_topdown((vec3){g.px, py, g.pz}, 9.0f, (float)width / (float)height, 40.0f);
+        const float rx = gk_lerp(previous_x, g.px, step.alpha), rz = gk_lerp(previous_z, g.pz, step.alpha);
+        const float py = floor_height(rx, rz);
+        const vkmin_camera cam = vkmin_camera_ortho_topdown((vec3){rx, py, rz}, 9.0f, (float)width / (float)height, 40.0f);
 
         /* The ground cursor: the pixel ray meets the floor's mean plane. */
         const vkmin_ray ray = vkmin_ray_from_pixel(cam.view, cam.proj, in->mouse_x, in->mouse_y, (float)width, (float)height);
@@ -112,7 +123,8 @@ int main(int argc, char **argv) {
         /* --- props: the same forty every frame, one lit up when picked ------ */
         uint32_t n = hs.meshes, nq = 0;
         for (uint32_t i = 0; i < PROPS; ++i) {
-            const float x = 2.0f + gk_hash(21, i) * (FLOOR_SIZE - 4.0f), z = 2.0f + gk_hash(22, i) * (FLOOR_SIZE - 4.0f);
+            const float x = i < 8 ? 27.0f + (float)(i % 4) * 3 : 2.0f + gk_hash(21, i) * (FLOOR_SIZE - 4.0f);
+            const float z = i < 8 ? 27.0f + (float)(i / 4) * 10 : 2.0f + gk_hash(22, i) * (FLOOR_SIZE - 4.0f);
             const bool cube = (i % 3) != 0;
             const float s = 0.35f + 0.35f * gk_hash(23, i);
             const mat4 t = vkmin_mat4_mul(vkmin_mat4_translate((vec3){x, floor_height(x, z) + s, z}),
@@ -124,7 +136,7 @@ int main(int argc, char **argv) {
         /* --- sprites: the player and the enemies, as billboards ------------- */
         quads[nq++] = (Quad){.pos = {cursor.x, py + 0.05f, cursor.z, (float)frame * 0.05f}, .size_uv0 = {1.2f, 1.2f, 0, 0}, .uv1 = {1, 1, 0, 0},
                              .color = 0x80ffffffu, .texture = sprite, .flags = VKMIN_QUAD_GROUND};
-        quads[nq++] = (Quad){.pos = {g.px, py + 0.9f, g.pz, 0.0f}, .size_uv0 = {1.4f, 1.4f, 0, 0}, .uv1 = {1, 1, 0, 0},
+        quads[nq++] = (Quad){.pos = {rx, py + 0.9f, rz, 0.0f}, .size_uv0 = {1.4f, 1.4f, 0, 0}, .uv1 = {1, 1, 0, 0},
                              .color = 0xff60d080u, .texture = sprite, .flags = VKMIN_QUAD_BILLBOARD};
         for (uint32_t i = 0; i < ENEMIES; ++i) {
             const float a = (float)g.tick / HZ * (0.3f + 0.4f * gk_hash(31, i)) + 6.2831853f * gk_hash(32, i);
@@ -133,18 +145,24 @@ int main(int argc, char **argv) {
             quads[nq++] = (Quad){.pos = {x, floor_height(x, z) + 0.8f, z, 0.0f}, .size_uv0 = {1.2f, 1.2f, 0, 0}, .uv1 = {1, 1, 0, 0},
                                  .color = 0xff5050f0u, .texture = sprite, .flags = VKMIN_QUAD_BILLBOARD};
         }
-        snprintf(hud, sizeof hud, "picked %u  under cursor %u", g.picked, g.hovered);
-        nq += vkr_text(r, hud, 6.0f, 6.0f, 12.0f, 0xffffffffu, quads + nq, MAX_QUADS - nq);
+        snprintf(hud, sizeof hud, "selected %u   inspections %u", g.picked, g.selections);
+        nq += gk_card(r, width, "LANTERN / night courtyard", hud, "WASD move   click inspect   R restart   F1 help", help, quads + nq, MAX_QUADS - nq);
 
-        lights[0] = gk_sun((vec3){0.2f, -1.0f, 0.1f}, 0.6f);
-        lights[1] = gk_point_light((vec3){g.px, py + 2.5f, g.pz}, 9.0f, (vec3){1.0f, 0.85f, 0.6f}, 14.0f);
+        lights[0] = gk_sun((vec3){0.2f, -1.0f, 0.1f}, 0.12f);
+        lights[1] = gk_point_light((vec3){rx, py + 2.5f, rz}, 9.0f, (vec3){1.0f, 0.65f, 0.3f}, 20.0f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 0.1f, .far = 80.0f, .instances = instances, .instance_count = n, .lights = lights, .light_count = 2,
                                        .quads = quads, .quad_count = nq, .frame = fr});
         vkmin_frame_end(gpu);
         g.hovered = vkmin_pick(gpu, vkr_id_target(r), (int)in->mouse_x, (int)in->mouse_y);
-        if (in->buttons_pressed & VKMIN_MOUSE_LEFT) g.picked = g.hovered;
+        if ((in->buttons_pressed & VKMIN_MOUSE_LEFT) && in->mouse_y > (help ? 50 : 34)) {
+            g.picked = g.hovered;
+            if (g.picked) g.selections++;
+        }
+        const uint32_t state[] = {g.tick, g.selections, g.picked, g.hovered, gk_float_bits(g.px), gk_float_bits(g.pz)};
+        gk_trace(trace, frame, state, sizeof state / sizeof state[0]);
     }
+    if (trace && fclose(trace)) gk_die("state trace close failed");
     vkr_shutdown(r);
     vkmin_shutdown(gpu);
     free(instances);

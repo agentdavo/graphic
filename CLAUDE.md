@@ -5,7 +5,15 @@ writing: his id Software `.plan` files (1996–2010), the 2007 "inlining code" e
 2011–2012 #AltDevBlogADay essays on static code analysis and functional programming in C++,
 his QuakeCon keynotes, and his more recent public comments on tooling and AI-assisted
 development. Sources are listed at the end. Where his views changed over time, the later
-position wins.
+position wins when the sources address the same tradeoff.
+
+This is vkmin's policy inspired by those sources, not a verbatim statement of
+Carmack's rules or his endorsement of this project. In particular, our ban on
+silencing warnings is a deliberately stricter project rule: his
+[static-analysis essay](https://www.gamedeveloper.com/programming/in-depth-static-code-analysis)
+describes prioritising consequential findings and configuring warning sets.
+Apply the judgement and cost section to design choices; source attribution must
+distinguish his documented experience from our own conventions.
 
 The point of adopting one person's methodology is not reverence. It is that this particular
 set of habits was arrived at empirically, by someone who tracked his own bug rates, changed

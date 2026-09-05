@@ -1,22 +1,21 @@
 /* handles.c -- the generation test. Free a resource, create another that lands
  * in the same slot, and prove the old handle is rejected rather than aliasing
- * the new one. The rejection is an abort, so the test forks: the child must
- * die, the parent checks how. */
+ * the new one. Each rejection runs in a fresh child process: no Vulkan
+ * threads or driver locks are inherited by a child that uses the driver. */
 #include "vkmin.h"
 #include "shaders.h"
 
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <string.h>
+#include "process.h"
 
 static vkmin_ctx *make_ctx(void) {
     return vkmin_init(&(vkmin_desc){.headless = true, .width = 16, .height = 16,
                                     .device_arena_bytes = 4u << 20, .host_ring_bytes = 1u << 20});
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     const uint8_t px[4] = {1, 2, 3, 4};
     vkmin_ctx *c = make_ctx();
     const vkmin_buffer_desc bd = {.size = 64, .data = {px, sizeof px}, .label = "handles.buffer"};
@@ -33,32 +32,19 @@ int main(void) {
     if ((i0.id & 0xfffff) != (i1.id & 0xfffff) || i0.id == i1.id) { puts("handles: FAIL image slot/gen"); return 1; }
     (void)vkmin_address(c, b1); /* the live handle works */
 
-    /* The stale handle must abort. */
-    fflush(stdout);
-    const pid_t pid = fork();
-    if (pid == 0) {
-        if (!freopen("/dev/null", "w", stderr)) _exit(2);
-        (void)vkmin_address(c, b0);
-        _exit(0); /* reached only if the stale handle was accepted */
+    if (argc == 2) {
+        if (!strcmp(argv[1], "stale")) (void)vkmin_address(c, b0);
+        else if (!strcmp(argv[1], "image")) (void)vkmin_index(c, i0);
+        else if (!strcmp(argv[1], "push"))
+            (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push) + 16});
+        vkmin_shutdown(c);
+        return 0;
     }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
-    if (!aborted) { puts("handles: FAIL stale buffer handle was accepted"); return 1; }
-
-    /* A pipeline whose push_size disagrees with its SPIR-V must abort too. */
-    fflush(stdout);
-    const pid_t pid2 = fork();
-    if (pid2 == 0) {
-        if (!freopen("/dev/null", "w", stderr)) _exit(2);
-        (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push) + 16, .label = "wrong push"});
-        _exit(0);
-    }
-    waitpid(pid2, &status, 0);
-    const bool push_aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
     (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push), .label = "right push"});
     vkmin_shutdown(c);
-    if (!push_aborted) { puts("handles: FAIL a wrong push_size was accepted"); return 1; }
-    puts("handles: ok (stale handle aborted, slot reused with a new generation, wrong push_size aborted)");
+    if (!test_aborts(argv[0], "stale") || !test_aborts(argv[0], "image") || !test_aborts(argv[0], "push")) {
+        puts("handles: FAIL a negative case did not abort"); return 1;
+    }
+    puts("handles: ok (stale buffer/image and wrong push size rejected)");
     return 0;
 }
