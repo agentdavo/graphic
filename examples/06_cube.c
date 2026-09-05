@@ -16,16 +16,17 @@ static mat4 cube_mvp(uint32_t frame, float aspect) { // pure
 
 int main(int argc, char **argv) {
     vkmin_ctx *ctx = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "06_cube"});
-    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = cube_verts, .size = sizeof cube_verts});
+    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = VKMIN_BYTES(cube_verts)});
     vkmin_image tex = vkmin_load_png(ctx, "tests/assets/grid.png", false);
-    vkmin_pipe pipe = vkmin_make_pipeline(ctx, &(vkmin_pipe_desc){
-        .vs = ex_vertex_vert_spv, .vs_bytes = sizeof ex_vertex_vert_spv,
-        .fs = ex_textured_frag_spv, .fs_bytes = sizeof ex_textured_frag_spv,
-        .depth = true, .depth_write = true, .cull = VKMIN_CULL_BACK});
-    while (vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f})) {
-        const ExPush push = {.mvp = cube_mvp(vkmin_frame_index(ctx), vkmin_aspect(ctx)),
-                             .vertices = vkmin_address(ctx, vb), .texture = vkmin_index(ctx, tex)};
-        vkmin_draw(ctx, pipe, &push, sizeof push, 36, 1);
+    vkmin_pipeline pipe = vkmin_make_pipeline(ctx, &(vkmin_pipeline_desc){
+        .vs = VKMIN_BYTES(ex_vertex_vert_spv), .fs = VKMIN_BYTES(ex_textured_frag_spv),
+        .push_size = sizeof(ExPush), .depth = true, .depth_write = true, .cull = VKMIN_CULL_BACK});
+    const uint64_t verts = vkmin_address(ctx, vb); /* stable for the buffer's lifetime */
+    const uint32_t grid = vkmin_index(ctx, tex);
+    while (vkmin_running(ctx)) {
+        const vkmin_frame f = vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f});
+        const mat4 mvp = cube_mvp(f.index, f.aspect); /* pure */
+        vkmin_draw(ctx, pipe, &(ExPush){.mvp = mvp, .vertices = verts, .texture = grid}, CUBE_VERTS, 1);
         vkmin_frame_end(ctx);
     }
     vkmin_shutdown(ctx);

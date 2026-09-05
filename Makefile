@@ -73,7 +73,7 @@ $(BUILD)/smoke: tests/smoke.c $(BUILD)/shaders.h $(CORE_OBJS)
 $(BUILD)/pick: tests/pick.c demo/gamekit.h src/render.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
-$(BUILD)/handles: tests/handles.c $(CORE_OBJS)
+$(BUILD)/handles: tests/handles.c $(BUILD)/shaders.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 # The examples are the tutorial and the tests: each builds alone against the

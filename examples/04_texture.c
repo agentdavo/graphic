@@ -11,14 +11,16 @@ int main(int argc, char **argv) {
         {0.8f, 0.8f, 0, 0xffffffffu, 1, 0, 0, 0},   {-0.8f, -0.8f, 0, 0xffffffffu, 0, 1, 0, 0},
         {0.8f, 0.8f, 0, 0xffffffffu, 1, 0, 0, 0},   {-0.8f, 0.8f, 0, 0xffffffffu, 0, 0, 0, 0},
     };
-    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = quad, .size = sizeof quad, .label = "quad"});
+    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = VKMIN_BYTES(quad), .label = "quad"});
     vkmin_image tex = vkmin_load_png(ctx, "tests/assets/grid.png", false);
-    vkmin_pipe pipe = vkmin_make_pipeline(ctx, &(vkmin_pipe_desc){
-        .vs = ex_vertex_vert_spv, .vs_bytes = sizeof ex_vertex_vert_spv,
-        .fs = ex_textured_frag_spv, .fs_bytes = sizeof ex_textured_frag_spv, .cull = VKMIN_CULL_NONE, .label = "textured"});
-    while (vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f})) {
-        const ExPush push = {.mvp = vkmin_mat4_ortho(-1, 1, -1, 1, 0, 1) /* y up */, .vertices = vkmin_address(ctx, vb), .texture = vkmin_index(ctx, tex)};
-        vkmin_draw(ctx, pipe, &push, sizeof push, 6, 1);
+    vkmin_pipeline pipe = vkmin_make_pipeline(ctx, &(vkmin_pipeline_desc){
+        .vs = VKMIN_BYTES(ex_vertex_vert_spv), .fs = VKMIN_BYTES(ex_textured_frag_spv),
+        .push_size = sizeof(ExPush), .cull = VKMIN_CULL_NONE, .label = "textured"});
+    const uint64_t verts = vkmin_address(ctx, vb);
+    const uint32_t grid = vkmin_index(ctx, tex);
+    while (vkmin_running(ctx)) {
+        vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f});
+        vkmin_draw(ctx, pipe, &(ExPush){.mvp = vkmin_mat4_ortho(-1, 1, -1, 1, 0, 1) /* y up */, .vertices = verts, .texture = grid}, 6, 1);
         vkmin_frame_end(ctx);
     }
     vkmin_shutdown(ctx);

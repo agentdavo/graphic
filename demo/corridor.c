@@ -266,17 +266,17 @@ int main(int argc, char **argv) {
     char overlay[2048];
     const float near = 0.1f, far = 120.0f;
     int shot = 0;
-    while (vkmin_frame_begin(gpu, NULL)) {
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
-        if (vkmin_key_hit(gpu, VKMIN_KEY_SPACE)) cvar_set(CV_d_frame_step, cvar_get(CV_d_frame_step) > 0 ? 0.0f : 1.0f);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_F1)) cvar_set(CV_r_debug, (float)((cvar_get_int(CV_r_debug) + 1) % 7));
-        const int frame = (int)vkmin_frame_index(gpu);
-        int ww = 0, wh = 0;
-        vkmin_size(gpu, &ww, &wh);
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL);
+        if (vkmin_key_pressed(&fr.input, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+        if (vkmin_key_pressed(&fr.input, VKMIN_KEY_SPACE)) cvar_set(CV_d_frame_step, cvar_get(CV_d_frame_step) > 0 ? 0.0f : 1.0f);
+        if (vkmin_key_pressed(&fr.input, VKMIN_KEY_F1)) cvar_set(CV_r_debug, (float)((cvar_get_int(CV_r_debug) + 1) % 8));
+        const int frame = (int)fr.index;
+        const int ww = fr.width, wh = fr.height;
         world_animate(w, frame);
         vkr_frame_desc fd = {.instances = w->instances, .instance_count = w->instance_count, .lights = w->lights,
                              .light_count = POINT_LIGHTS + 1, .bones = w->bones, .bone_count = w->bone_count,
-                             .near = near, .far = far, .frame_index = (uint32_t)frame};
+                             .near = near, .far = far, .frame = fr};
         camera_at(frame, ww, wh, &fd.view, &fd.proj, &fd.camera_pos, near, far);
         /* Headless overlays omit timings so the image is reproducible. */
         const vkr_stats st = vkr_get_stats(r);
@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
         fd.overlay_text = overlay;
         vkr_frame(r, &fd);
         vkmin_frame_end(gpu);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_F12)) {
+        if (vkmin_key_pressed(&fr.input, VKMIN_KEY_F12)) {
             char path[64];
             snprintf(path, sizeof path, "shot_%04d.png", shot++);
             if (vkmin_save_png(gpu, path)) printf("wrote %s\n", path);

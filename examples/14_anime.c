@@ -24,7 +24,7 @@ static uint32_t lut_texture(vkmin_ctx *gpu) {
     }
     const vkmin_image img = vkmin_make_image(gpu, &(vkmin_image_desc){.width = 256, .height = 16, .format = VKMIN_FMT_RGBA8_UNORM,
                                                                       .usage = VKMIN_IMAGE_SAMPLED, .sampler = VKMIN_SAMPLER_LINEAR_CLAMP, .label = "anime.lut"});
-    vkmin_image_upload(gpu, img, 0, px, sizeof px);
+    vkmin_image_upload(gpu, img, 0, VKMIN_BYTES(px));
     return vkmin_index(gpu, img);
 }
 
@@ -35,7 +35,7 @@ static uint32_t ramp_texture(vkmin_ctx *gpu) {
     for (int i = 0; i < 16; ++i) px[i] = gk_rgba(steps[i] / 255.0f, steps[i] / 255.0f, steps[i] / 255.0f, 1.0f);
     const vkmin_image img = vkmin_make_image(gpu, &(vkmin_image_desc){.width = 16, .height = 1, .format = VKMIN_FMT_RGBA8_UNORM,
                                                                       .usage = VKMIN_IMAGE_SAMPLED, .sampler = VKMIN_SAMPLER_NEAREST_CLAMP, .label = "anime.ramp"});
-    vkmin_image_upload(gpu, img, 0, px, sizeof px);
+    vkmin_image_upload(gpu, img, 0, VKMIN_BYTES(px));
     return vkmin_index(gpu, img);
 }
 
@@ -63,11 +63,13 @@ int main(int argc, char **argv) {
     mat4 bones[ANIM_MAX_JOINTS];
     float yaw_offset = 0.0f, prev_mouse_x = 0.0f;
     bool dragging = false;
-    while (vkmin_frame_begin(gpu, NULL)) {
-        const vkmin_inputs *in = vkmin_input(gpu);
-        const uint32_t frame = vkmin_frame_index(gpu);
-        vkmin_size(gpu, &width, &height);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
+        const vkmin_inputs *in = &fr.input;
+        const uint32_t frame = fr.index;
+        width = fr.width;
+        height = fr.height;
+        if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
         if (dragging && (in->buttons & VKMIN_MOUSE_LEFT)) yaw_offset += (in->mouse_x - prev_mouse_x) * 0.01f;
         dragging = (in->buttons & VKMIN_MOUSE_LEFT) != 0u;
         prev_mouse_x = in->mouse_x;
@@ -100,7 +102,7 @@ int main(int argc, char **argv) {
         Light lights[2] = {gk_sun((vec3){-0.5f, -1.0f, -0.4f}, 1.4f), gk_point_light((vec3){3.0f * cosf(t), 2.5f, 3.0f * sinf(t)}, 6.0f, (vec3){1.0f, 0.5f, 0.8f}, 4.0f)};
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 0.1f, .far = 60.0f, .instances = instances, .instance_count = n, .lights = lights, .light_count = 2,
-                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame_index = frame,
+                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame = fr,
                                        .look = {.cel_ramp_tex = ramp, .rim_strength = 0.45f, .rim_power = 4.0f, .spec_step = 0.5f,
                                                 .shadow_tint = {0.55f, 0.45f, 0.75f}, .outline = 1.0f, .outline_depth = 0.03f,
                                                 .lut_tex = lut, .lut_strength = 0.8f}});

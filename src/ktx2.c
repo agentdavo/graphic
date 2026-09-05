@@ -49,7 +49,7 @@ vkmin_image ktx2_load(vkmin_ctx *c, const char *path) {
         const uint8_t *entry = data + 80 + 24 * l;
         const uint64_t offset = rd64(entry), bytes = rd64(entry + 8);
         if (offset + bytes > (uint64_t)size) fail(path, "level data runs past the end of the file");
-        vkmin_image_upload(c, img, (int)l, data + offset, (size_t)bytes);
+        vkmin_image_upload(c, img, (int)l, (vkmin_bytes){data + offset, (size_t)bytes});
     }
     free(data);
     return img;

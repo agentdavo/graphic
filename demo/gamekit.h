@@ -215,7 +215,7 @@ static inline uint32_t gk_rgba(float r, float g, float b, float a) {
 static inline uint32_t gk_texture(vkmin_ctx *gpu, int size, const uint32_t *pixels, uint32_t sampler, const char *label) {
     const vkmin_image img = vkmin_make_image(gpu, &(vkmin_image_desc){.width = size, .height = size, .format = VKMIN_FMT_RGBA8_UNORM,
                                                                       .usage = VKMIN_IMAGE_SAMPLED, .sampler = sampler, .label = label});
-    vkmin_image_upload(gpu, img, 0, pixels, (size_t)size * size * 4u);
+    vkmin_image_upload(gpu, img, 0, (vkmin_bytes){pixels, (size_t)size * size * 4u});
     return vkmin_index(gpu, img);
 }
 

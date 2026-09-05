@@ -4,9 +4,13 @@
  * handles (zero invalid). A shader reaches a texture by its bindless index and
  * a buffer by its device address; both travel in the push block you define in
  * shared.h, so there is no binding model: a draw is a pipeline, a push block
- * and a count. Desc structs configure everything and a zero field is always
- * the sensible default. The library never calls user code, never allocates
- * after init, and reads no clock: frame N is the same pixels every run.
+ * and a count. The push block's size belongs to the pipeline and is checked
+ * against the SPIR-V at creation. A pointer never travels without its size
+ * (vkmin_bytes), and a frame reads the outside world at exactly one point:
+ * the vkmin_frame that frame_begin returns. Desc structs configure everything
+ * and a zero field is always the sensible default. The library never calls
+ * user code, never allocates after init, and reads no clock: frame N is the
+ * same pixels every run.
  *
  * Every function carries a state contract in its trailing comment:
  *   pure        reads only its arguments
@@ -50,8 +54,10 @@ enum { VKMIN_MAX_TIMESTAMPS = 32, VKMIN_PUSH_BYTES = 128 };
 typedef struct vkmin_ctx vkmin_ctx;
 typedef struct { uint32_t id; } vkmin_buffer;
 typedef struct { uint32_t id; } vkmin_image;
-typedef struct { uint32_t id; } vkmin_pipe;
+typedef struct { uint32_t id; } vkmin_pipeline;
 #define vkmin_valid(h) ((h).id != 0u) /* any handle type */
+typedef struct { const void *data; size_t size; } vkmin_bytes; /* a pointer and its size, never apart */
+#define VKMIN_BYTES(x) ((vkmin_bytes){(x), sizeof(x)})         /* of an array or object, not a pointer */
 
 typedef enum { VKMIN_PATH_AUTO = 0, VKMIN_PATH_LEGACY, VKMIN_PATH_MODERN } vkmin_path;
 typedef enum { VKMIN_FMT_RGBA8_UNORM = 0, VKMIN_FMT_RGBA8_SRGB, VKMIN_FMT_BGRA8_UNORM, VKMIN_FMT_BC1_SRGB,
@@ -100,14 +106,14 @@ typedef struct {
 } vkmin_desc;
 
 typedef struct {
-    size_t size;                  /* required */
-    const void *data;             /* 0 = uninitialised */
+    vkmin_bytes data;             /* initial contents; .data 0 = uninitialised */
+    size_t size;                  /* 0 = data.size */
     const char *label;            /* 0 = "buffer" */
 } vkmin_buffer_desc;
 
 typedef struct {
     int width, height;            /* required */
-    const void *pixels;           /* 0 = no upload; tightly packed, mip 0 */
+    vkmin_bytes pixels;           /* .data 0 = no upload; tightly packed, mip 0 */
     int mip_levels;               /* 0 = 1 */
     vkmin_format format;          /* 0 = RGBA8_UNORM */
     uint32_t usage;               /* 0 = SAMPLED */
@@ -116,9 +122,11 @@ typedef struct {
 } vkmin_image_desc;
 
 typedef struct {
-    const uint32_t *vs; size_t vs_bytes;     /* required for graphics */
-    const uint32_t *fs; size_t fs_bytes;     /* 0 = depth-only */
-    const uint32_t *cs; size_t cs_bytes;     /* set instead of vs: a compute pipeline */
+    vkmin_bytes vs;                          /* SPIR-V; required for graphics */
+    vkmin_bytes fs;                          /* .data 0 = depth-only */
+    vkmin_bytes cs;                          /* set instead of vs: a compute pipeline */
+    uint32_t push_size;                      /* bytes of the push block every draw passes; must equal the
+                                              * push-constant block the SPIR-V declares, or creation aborts */
     vkmin_format color_format;               /* 0 = RGBA8_UNORM (the backbuffer); NONE for depth-only */
     int extra_colors; vkmin_format extra_format[2]; /* further colour attachments (MRT); a blended
                                               * pipeline writes only the first attachment */
@@ -132,9 +140,17 @@ typedef struct {
     const char *label;                       /* 0 = "pipeline" */
     const char *vs_path, *fs_path, *cs_path; /* SPIR-V files to watch when cvar r_hotreload is 1;
                                               * 0 = this pipeline never reloads */
-} vkmin_pipe_desc;
+} vkmin_pipeline_desc;
 
 typedef struct { float r, g, b, a; } vkmin_clear;
+
+typedef struct {                  /* everything a frame reads from outside, gathered at one point */
+    uint32_t index;               /* the logical frame: the animation's clock, and the journal's */
+    uint32_t slot;                /* 0 or 1: which frame in flight */
+    int width, height;            /* the render size this frame */
+    float aspect;
+    vkmin_inputs input;           /* this frame's snapshot; zero when headless without a demo */
+} vkmin_frame;
 
 typedef struct {
     vkmin_image color;            /* 0 = depth-only pass */
@@ -189,34 +205,33 @@ void vkmin_shutdown(vkmin_ctx *);                                            // 
 _Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...); // io, aborts
 
 /* ---- frame ------------------------------------------------------------------ */
-/* Begins the frame; with a clear, also begins the default pass (backbuffer +
- * depth). Returns false when the loop should end: window closed, --exit-after
- * reached, or every --frame rendered. Then frame_end saves --out if asked. */
-bool vkmin_frame_begin(vkmin_ctx *, const vkmin_clear *clear);               // writes ctx, gpu, io
+/* The loop:  while (vkmin_running(ctx)) { f = vkmin_frame_begin(ctx, clear); ... vkmin_frame_end(ctx); }
+ * running polls the window and the demo file and decides the next frame;
+ * false ends the loop: window closed, --exit-after reached, every --frame
+ * rendered, demo finished. frame_begin then opens the frame (with a clear,
+ * also the default pass: backbuffer + depth) and returns everything the
+ * frame may read from outside. frame_end submits and saves --out if asked. */
+bool vkmin_running(vkmin_ctx *);                                             // writes ctx, io
+vkmin_frame vkmin_frame_begin(vkmin_ctx *, const vkmin_clear *clear);        // writes ctx, gpu, io
 void vkmin_frame_end(vkmin_ctx *);                                           // writes ctx, gpu, io
-uint32_t vkmin_frame_index(const vkmin_ctx *);   /* the logical frame being rendered */   // reads ctx
-uint32_t vkmin_frame_slot(const vkmin_ctx *);    /* 0 or 1: which frame in flight */      // reads ctx
-void vkmin_size(const vkmin_ctx *, int *w, int *h);                          // reads ctx
-float vkmin_aspect(const vkmin_ctx *);                                       // reads ctx
+void vkmin_size(const vkmin_ctx *, int *w, int *h);  /* before the loop, to size targets */ // reads ctx
 void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame host memory */ // writes ctx
-const vkmin_inputs *vkmin_input(const vkmin_ctx *);  /* this frame's snapshot; zero headless */  // reads ctx
-bool vkmin_key_hit(const vkmin_ctx *, int key);  /* vkmin_key_pressed on the snapshot */         // reads ctx
 
 /* ---- resources -------------------------------------------------------------- */
 vkmin_buffer vkmin_make_buffer(vkmin_ctx *, const vkmin_buffer_desc *);      // writes ctx, gpu
 void vkmin_free_buffer(vkmin_ctx *, vkmin_buffer);                           // writes ctx, gpu
 uint64_t vkmin_address(vkmin_ctx *, vkmin_buffer);  /* device address, for the push block */ // reads ctx
-void vkmin_buffer_upload(vkmin_ctx *, vkmin_buffer, size_t offset, const void *, size_t); // gpu
+void vkmin_buffer_upload(vkmin_ctx *, vkmin_buffer, size_t offset, vkmin_bytes);        // gpu
 vkmin_image vkmin_make_image(vkmin_ctx *, const vkmin_image_desc *);         // writes ctx, gpu
 void vkmin_free_image(vkmin_ctx *, vkmin_image);                             // writes ctx, gpu
-void vkmin_image_upload(vkmin_ctx *, vkmin_image, int mip, const void *, size_t); // gpu
+void vkmin_image_upload(vkmin_ctx *, vkmin_image, int mip, vkmin_bytes);          // gpu
 uint32_t vkmin_index(vkmin_ctx *, vkmin_image);     /* bindless index with the desc's sampler */ // writes ctx, gpu
 uint32_t vkmin_register_texture(vkmin_ctx *, vkmin_image, uint32_t sampler); /* a second sampler */ // writes ctx, gpu
 vkmin_image vkmin_load_png(vkmin_ctx *, const char *path, bool srgb);        // writes ctx, gpu, io
 vkmin_image vkmin_backbuffer(const vkmin_ctx *);   /* the owned image presented each frame */ // reads ctx
 vkmin_image vkmin_default_depth(const vkmin_ctx *); /* its depth; passes on the backbuffer attach it */ // reads ctx
 vkmin_format vkmin_backbuffer_format(const vkmin_ctx *);                     // pure (always RGBA8_UNORM)
-vkmin_pipe vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipe_desc *);        // writes ctx, gpu
+vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipeline_desc *); // writes ctx, gpu
 uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one texel of the last
                                         completed frame's ID target, between frames; 0 off-image */ // gpu
 vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *);            // pure
@@ -230,12 +245,10 @@ void vkmin_pass_begin(vkmin_ctx *, const vkmin_pass_desc *);                 // 
 void vkmin_pass_end(vkmin_ctx *);                                            // writes ctx, gpu
 void vkmin_set_viewport(vkmin_ctx *, int x, int y, int w, int h);            // gpu
 void vkmin_set_depth_bias(vkmin_ctx *, float constant, float slope);         // gpu
-void vkmin_draw(vkmin_ctx *, vkmin_pipe, const void *push, uint32_t push_bytes,
-                uint32_t vertices, uint32_t instances);                      // gpu
-void vkmin_draw_indirect(vkmin_ctx *, vkmin_pipe, const void *push, uint32_t push_bytes,
-                         const vkmin_indirect_desc *);                       // gpu
-void vkmin_dispatch(vkmin_ctx *, vkmin_pipe, const void *push, uint32_t push_bytes,
-                    uint32_t x, uint32_t y, uint32_t z);                     // gpu
+/* The push block is push_size bytes, as the pipeline declared; 0 = none. */
+void vkmin_draw(vkmin_ctx *, vkmin_pipeline, const void *push, uint32_t vertices, uint32_t instances); // gpu
+void vkmin_draw_indirect(vkmin_ctx *, vkmin_pipeline, const void *push, const vkmin_indirect_desc *); // gpu
+void vkmin_dispatch(vkmin_ctx *, vkmin_pipeline, const void *push, uint32_t x, uint32_t y, uint32_t z); // gpu
 void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, read via stats */ // gpu
 
 /* ---- the journal ------------------------------------------------------------ */

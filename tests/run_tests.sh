@@ -121,23 +121,23 @@ begin "== the five games: each replays its demo file to a golden frame =="
 # on the default path, compare the frame to its golden; then the same frame
 # on the legacy path must be bit-identical.
 game() {
-    name=$1; frame=$2; shift 2
+    g=$1; frame=$2; shift 2
     checks=$((checks + 1))
-    if ./$BUILD/ex_$name --profile lavapipe --headless --play "tests/journals/$name.vkd" --frame "$frame" \
-            --out "$OUT/ex_$name.png" "$@" >/dev/null 2>"$OUT/ex_$name.log"; then
+    if ./$BUILD/ex_$g --profile lavapipe --headless --play "tests/journals/$g.vkd" --frame "$frame" \
+            --out "$OUT/ex_$g.png" "$@" >/dev/null 2>"$OUT/ex_$g.log"; then
         checks=$((checks - 1))
-        compare "ex_$name"
+        compare "ex_$g"
     else
-        fail "game $name"; sed -n '1,8p' "$OUT/ex_$name.log"
+        fail "game $g"; sed -n '1,8p' "$OUT/ex_$g.log"
     fi
     if [ "$MODERN" = "1" ]; then
         checks=$((checks + 1))
-        if ./$BUILD/ex_$name --profile lavapipe --headless --play "tests/journals/$name.vkd" --frame "$frame" --path=legacy \
-                --out "$OUT/ex_${name}_legacy.png" "$@" >/dev/null 2>"$OUT/ex_${name}_legacy.log"; then
+        if ./$BUILD/ex_$g --profile lavapipe --headless --play "tests/journals/$g.vkd" --frame "$frame" --path=legacy \
+                --out "$OUT/ex_${g}_legacy.png" "$@" >/dev/null 2>"$OUT/ex_${g}_legacy.log"; then
             checks=$((checks - 1))
-            same "ex_$name" "ex_${name}_legacy" 0 "$name: legacy path == modern path"
+            same "ex_$g" "ex_${g}_legacy" 0 "$g: legacy path == modern path"
         else
-            fail "game $name (legacy)"; sed -n '1,8p' "$OUT/ex_${name}_legacy.log"
+            fail "game $g (legacy)"; sed -n '1,8p' "$OUT/ex_${g}_legacy.log"
         fi
     fi
 }

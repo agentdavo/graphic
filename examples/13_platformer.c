@@ -103,11 +103,13 @@ int main(int argc, char **argv) {
     mat4 bones[ANIM_MAX_JOINTS];
     uint32_t ticks_done = 0;
     char hud[64];
-    while (vkmin_frame_begin(gpu, NULL)) {
-        const vkmin_inputs *in = vkmin_input(gpu);
-        const uint32_t frame = vkmin_frame_index(gpu);
-        vkmin_size(gpu, &width, &height);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
+        const vkmin_inputs *in = &fr.input;
+        const uint32_t frame = fr.index;
+        width = fr.width;
+        height = fr.height;
+        if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
         const uint32_t due = gk_ticks_due(frame, HZ, &ticks_done);
         for (uint32_t k = 0; k < due; ++k) player_tick(&p, in);
 
@@ -153,7 +155,7 @@ int main(int argc, char **argv) {
         const Light sun = gk_sun((vec3){-0.4f, -1.0f, -0.6f}, 3.5f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 0.1f, .far = 60.0f, .instances = instances, .instance_count = n, .lights = &sun, .light_count = 1,
-                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame_index = frame,
+                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame = fr,
                                        .look = {.rim_strength = 0.3f, .rim_power = 3.0f, .shadow_tint = {0.55f, 0.55f, 0.7f},
                                                 .outline = 0.7f, .outline_depth = 0.04f}});
         vkmin_frame_end(gpu);

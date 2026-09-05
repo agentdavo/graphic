@@ -84,10 +84,10 @@ struct vkr {
     vkmin_image hdr, depth, atlas, font, id, normal, ramp;
     uint32_t hdr_tex, atlas_shadow_tex, atlas_raw_tex, font_tex, depth_tex, normal_tex, ramp_tex;
 
-    vkmin_pipe cull, cluster;
-    vkmin_pipe depth_cull, depth_nocull;
-    vkmin_pipe fwd_cull, fwd_nocull, fwd_blend;
-    vkmin_pipe tonemap, quad_world, quad_screen;
+    vkmin_pipeline cull, cluster;
+    vkmin_pipeline depth_cull, depth_nocull;
+    vkmin_pipeline fwd_cull, fwd_nocull, fwd_blend;
+    vkmin_pipeline tonemap, quad_world, quad_screen;
 
     vkmin_buffer vertices, indices, skin_vertices, meshes, materials;
     vkmin_buffer draw_cmds, draw_counts, cluster_lights;
@@ -122,7 +122,7 @@ static uint32_t register_solid(vkr *r, uint8_t red, uint8_t green, uint8_t blue,
     const uint8_t px[4] = {red, green, blue, 255};
     const vkmin_image img = vkmin_make_image(r->gpu, &(vkmin_image_desc){.width = 1, .height = 1, .format = VKMIN_FMT_RGBA8_UNORM,
                                                                           .usage = VKMIN_IMAGE_SAMPLED, .label = label});
-    vkmin_image_upload(r->gpu, img, 0, px, sizeof px);
+    vkmin_image_upload(r->gpu, img, 0, VKMIN_BYTES(px));
     return vkmin_register_texture(r->gpu, img, VKMIN_SAMPLER_LINEAR_REPEAT);
 }
 
@@ -172,7 +172,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
                                     140, 140, 140, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
     r->ramp = vkmin_make_image(gpu, &(vkmin_image_desc){.width = 8, .height = 1, .format = VKMIN_FMT_RGBA8_UNORM,
                                                         .usage = VKMIN_IMAGE_SAMPLED, .label = "vkr.cel_ramp"});
-    vkmin_image_upload(gpu, r->ramp, 0, ramp_px, sizeof ramp_px);
+    vkmin_image_upload(gpu, r->ramp, 0, VKMIN_BYTES(ramp_px));
     r->ramp_tex = vkmin_register_texture(gpu, r->ramp, VKMIN_SAMPLER_NEAREST_CLAMP);
 
     /* The baked SDF font: distance in every channel, sampled as .r. */
@@ -183,7 +183,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     }
     r->font = vkmin_make_image(gpu, &(vkmin_image_desc){.width = FONT_ATLAS_W, .height = FONT_ATLAS_H,
                                                         .format = VKMIN_FMT_RGBA8_UNORM, .usage = VKMIN_IMAGE_SAMPLED, .label = "vkr.font"});
-    vkmin_image_upload(gpu, r->font, 0, font_px, (size_t)FONT_ATLAS_W * FONT_ATLAS_H * 4);
+    vkmin_image_upload(gpu, r->font, 0, (vkmin_bytes){font_px, (size_t)FONT_ATLAS_W * FONT_ATLAS_H * 4});
     free(font_px);
     r->font_tex = vkmin_register_texture(gpu, r->font, VKMIN_SAMPLER_LINEAR_CLAMP);
 
@@ -200,19 +200,17 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     /* Ten pipelines for the whole engine, all created here, all against the
      * one layout. The forward shader is the game's choice: a canonical one
      * or its own composed from shaders/lib. */
-    const uint32_t *fs = desc->fs ? desc->fs : desc->shading == VKR_SHADE_CEL ? lit_cel_frag_spv
-                                             : desc->shading == VKR_SHADE_UNLIT ? unlit_frag_spv : lit_pbr_frag_spv;
-    const size_t fs_bytes = desc->fs ? desc->fs_bytes : desc->shading == VKR_SHADE_CEL ? sizeof lit_cel_frag_spv
-                                                     : desc->shading == VKR_SHADE_UNLIT ? sizeof unlit_frag_spv : sizeof lit_pbr_frag_spv;
-    const char *fs_path = desc->fs ? NULL : desc->shading == VKR_SHADE_CEL ? "build/lit_cel.frag.spv"
+    const vkmin_bytes fs = desc->fs.data ? desc->fs : desc->shading == VKR_SHADE_CEL ? VKMIN_BYTES(lit_cel_frag_spv)
+                                          : desc->shading == VKR_SHADE_UNLIT ? VKMIN_BYTES(unlit_frag_spv) : VKMIN_BYTES(lit_pbr_frag_spv);
+    const char *fs_path = desc->fs.data ? NULL : desc->shading == VKR_SHADE_CEL ? "build/lit_cel.frag.spv"
                                           : desc->shading == VKR_SHADE_UNLIT ? "build/unlit.frag.spv" : "build/lit_pbr.frag.spv";
-    r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cull_comp_spv, .cs_bytes = sizeof cull_comp_spv, .label = "vkr.cull"});
-    r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.cs = cluster_comp_spv, .cs_bytes = sizeof cluster_comp_spv, .label = "vkr.cluster"});
-    const vkmin_pipe_desc depth_desc = {.vs = depth_vert_spv, .vs_bytes = sizeof depth_vert_spv,
-                                        .fs = depth_frag_spv, .fs_bytes = sizeof depth_frag_spv,
+    const uint32_t push = sizeof(Push); /* every renderer pipeline pushes the one Push block */
+    r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cull_comp_spv), .push_size = push, .label = "vkr.cull"});
+    r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cluster_comp_spv), .push_size = push, .label = "vkr.cluster"});
+    const vkmin_pipeline_desc depth_desc = {.vs = VKMIN_BYTES(depth_vert_spv), .fs = VKMIN_BYTES(depth_frag_spv), .push_size = push,
                                         .color_format = VKMIN_FMT_NONE, .depth = true, .depth_write = true, .depth_compare = VKMIN_CMP_LESS,
                                         .depth_bias = true, .cull = VKMIN_CULL_BACK, .label = "vkr.depth"};
-    vkmin_pipe_desc d = depth_desc;
+    vkmin_pipeline_desc d = depth_desc;
     r->depth_cull = vkmin_make_pipeline(gpu, &d);
     d.cull = VKMIN_CULL_NONE;
     d.label = "vkr.depth.double_sided";
@@ -221,12 +219,12 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     /* LESS_EQUAL with write on works with and without the prepass: after a
      * prepass it behaves as EQUAL, without one it is the ordinary depth test.
      * One pipeline set instead of two, for a negligible cost. */
-    const vkmin_pipe_desc fwd_desc = {.vs = scene_vert_spv, .vs_bytes = sizeof scene_vert_spv, .fs = fs, .fs_bytes = fs_bytes,
+    const vkmin_pipeline_desc fwd_desc = {.vs = VKMIN_BYTES(scene_vert_spv), .fs = fs, .push_size = push,
                                       .vs_path = "build/scene.vert.spv", .fs_path = fs_path,
                                       .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
                                       .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
                                       .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_BACK, .label = "vkr.forward"};
-    vkmin_pipe_desc f = fwd_desc;
+    vkmin_pipeline_desc f = fwd_desc;
     r->fwd_cull = vkmin_make_pipeline(gpu, &f);
     f.cull = VKMIN_CULL_NONE;
     f.label = "vkr.forward.double_sided";
@@ -237,20 +235,17 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->fwd_blend = vkmin_make_pipeline(gpu, &f);
 
     const vkmin_format bb = vkmin_backbuffer_format(gpu);
-    r->tonemap = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = fullscreen_vert_spv, .vs_bytes = sizeof fullscreen_vert_spv,
-                                                              .fs = tonemap_frag_spv, .fs_bytes = sizeof tonemap_frag_spv,
+    r->tonemap = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(tonemap_frag_spv), .push_size = push,
                                                               .fs_path = "build/tonemap.frag.spv",
                                                               .color_format = bb, .cull = VKMIN_CULL_NONE, .label = "vkr.tonemap"});
     /* The batcher twice: world quads into the forward pass (HDR, depth
      * tested, MRT extras masked by .blend), screen quads onto the backbuffer. */
-    r->quad_world = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = quad_vert_spv, .vs_bytes = sizeof quad_vert_spv,
-                                                                 .fs = quad_frag_spv, .fs_bytes = sizeof quad_frag_spv,
+    r->quad_world = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv), .push_size = push,
                                                                  .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
                                                                  .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
                                                                  .depth = true, .depth_compare = VKMIN_CMP_LESS_EQUAL,
                                                                  .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.world"});
-    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipe_desc){.vs = quad_vert_spv, .vs_bytes = sizeof quad_vert_spv,
-                                                                  .fs = quad_frag_spv, .fs_bytes = sizeof quad_frag_spv,
+    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv), .push_size = push,
                                                                   .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.screen"});
     for (int i = 0; i < VKR_FRAMES; ++i) {
         r->check_cpu[i] = calloc(2u * desc->max_instances + 2u, sizeof(DrawCmd));
@@ -275,10 +270,10 @@ uint32_t vkr_upload_geometry(vkr *r, const vkr_geometry *g) {
     VKR_ASSERT(r->skin_count + g->skin_vertex_count <= r->desc.max_skin_vertices || g->skin_vertex_count == 0, "skin arena full");
     VKR_ASSERT(r->mesh_count + g->mesh_count <= r->desc.max_meshes, "mesh table full");
 
-    vkmin_buffer_upload(r->gpu, r->vertices, r->vertex_count * sizeof(Vertex), g->vertices, g->vertex_count * sizeof(Vertex));
-    vkmin_buffer_upload(r->gpu, r->indices, r->index_count * sizeof(uint32_t), g->indices, g->index_count * sizeof(uint32_t));
+    vkmin_buffer_upload(r->gpu, r->vertices, r->vertex_count * sizeof(Vertex), (vkmin_bytes){g->vertices, g->vertex_count * sizeof(Vertex)});
+    vkmin_buffer_upload(r->gpu, r->indices, r->index_count * sizeof(uint32_t), (vkmin_bytes){g->indices, g->index_count * sizeof(uint32_t)});
     if (g->skin_vertex_count) {
-        vkmin_buffer_upload(r->gpu, r->skin_vertices, r->skin_count * sizeof(SkinVertex), g->skin_vertices, g->skin_vertex_count * sizeof(SkinVertex));
+        vkmin_buffer_upload(r->gpu, r->skin_vertices, r->skin_count * sizeof(SkinVertex), (vkmin_bytes){g->skin_vertices, g->skin_vertex_count * sizeof(SkinVertex)});
     }
     Mesh *rebased = malloc(g->mesh_count * sizeof(Mesh));
     VKR_ASSERT(rebased != NULL, "out of memory");
@@ -288,7 +283,7 @@ uint32_t vkr_upload_geometry(vkr *r, const vkr_geometry *g) {
         rebased[i].vertex_offset += r->vertex_count;
         if (rebased[i].skin_offset != VKMIN_NONE) rebased[i].skin_offset += r->skin_count;
     }
-    vkmin_buffer_upload(r->gpu, r->meshes, r->mesh_count * sizeof(Mesh), rebased, g->mesh_count * sizeof(Mesh));
+    vkmin_buffer_upload(r->gpu, r->meshes, r->mesh_count * sizeof(Mesh), (vkmin_bytes){rebased, g->mesh_count * sizeof(Mesh)});
     memcpy(r->host_meshes + r->mesh_count, rebased, g->mesh_count * sizeof(Mesh));
     free(rebased);
     const uint32_t first = r->mesh_count;
@@ -302,7 +297,7 @@ uint32_t vkr_upload_geometry(vkr *r, const vkr_geometry *g) {
 uint32_t vkr_upload_materials(vkr *r, const Material *m, uint32_t count) {
     VKR_ASSERT(r && m, "vkr_upload_materials: null argument");
     VKR_ASSERT(r->material_count + count <= r->desc.max_materials, "material table full");
-    vkmin_buffer_upload(r->gpu, r->materials, r->material_count * sizeof(Material), m, count * sizeof(Material));
+    vkmin_buffer_upload(r->gpu, r->materials, r->material_count * sizeof(Material), (vkmin_bytes){m, count * sizeof(Material)});
     memcpy(r->host_materials + r->material_count, m, count * sizeof(Material));
     const uint32_t first = r->material_count;
     r->material_count += count;
@@ -634,7 +629,7 @@ uint32_t vkr_text(const vkr *r, const char *text, float x0, float y0, float px, 
 
 /* ---------------------------------------------------------------- frame --- */
 
-static void draw_lists(vkr *r, uint32_t view, vkmin_pipe culled, vkmin_pipe double_sided, const Push *base,
+static void draw_lists(vkr *r, uint32_t view, vkmin_pipeline culled, vkmin_pipeline double_sided, const Push *base,
                        bool gpu_cull, const uint64_t *host_cmds, const uint32_t *host_counts) {
     Push push = *base;
     push.view = view;
@@ -650,7 +645,7 @@ static void draw_lists(vkr *r, uint32_t view, vkmin_pipe culled, vkmin_pipe doub
             d.host_cmds = host_cmds[view * 2 + list];
             d.host_count = host_counts[view * 2 + list];
         }
-        vkmin_draw_indirect(r->gpu, list == 0 ? culled : double_sided, &push, sizeof push, &d);
+        vkmin_draw_indirect(r->gpu, list == 0 ? culled : double_sided, &push, &d);
     }
 }
 
@@ -670,14 +665,14 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     }
     if (!s.freeze) r->frozen = false;
 
-    int win_w = 0, win_h = 0;
-    vkmin_size(gpu, &win_w, &win_h);
+    const int win_w = f->frame.width, win_h = f->frame.height;
     /* Targets are made once at the maximum size; a larger window renders at
      * the maximum and is upscaled by the tonemap pass. */
     const int rw = win_w < r->desc.width ? win_w : r->desc.width;
     const int rh = win_h < r->desc.height ? win_h : r->desc.height;
 
-    const uint32_t slot = vkmin_frame_slot(gpu);
+    const uint32_t slot = f->frame.slot;
+    VKR_ASSERT(slot < VKR_FRAMES, "vkr_frame: frame slot %u", slot);
     for (int i = 0; i + 1 < gs.timestamps && i < 8; ++i) r->stats.pass_ms[i] = gs.gpu_ms[i + 1] - gs.gpu_ms[i];
     if (gs.timestamps == VKR_TIMESTAMPS) r->stats.frame_ms = gs.gpu_ms[VKR_TIMESTAMPS - 1] - gs.gpu_ms[0];
     if (r->counts_valid[slot]) {
@@ -744,7 +739,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         .proj = f->proj,
         .view_proj = vkmin_mat4_mul(f->proj, f->view),
         .inv_view_proj = vkmin_mat4_inverse(vkmin_mat4_mul(f->proj, f->view)),
-        .camera_pos = {f->camera_pos.x, f->camera_pos.y, f->camera_pos.z, (float)f->frame_index},
+        .camera_pos = {f->camera_pos.x, f->camera_pos.y, f->camera_pos.z, (float)f->frame.index},
         .cascade_splits = vs.cascade_splits,
         .cluster_params = {(float)VKMIN_CLUSTER_Z / log_ratio, -(float)VKMIN_CLUSTER_Z * logf(f->near) / log_ratio, f->near, cluster_far},
         .cluster_dims = {VKMIN_CLUSTER_X, VKMIN_CLUSTER_Y, VKMIN_CLUSTER_Z, 0},
@@ -756,7 +751,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         .debug_mode = (uint32_t)s.debug,
         .flags = (s.shadows ? VKMIN_FRAME_SHADOWS : 0u) | (s.normal_maps ? VKMIN_FRAME_NORMAL_MAPS : 0u) |
                  (s.clustered ? VKMIN_FRAME_CLUSTERED : 0u),
-        .frame_index = f->frame_index,
+        .frame_index = f->frame.index,
         .sun_light = sun_index,
         .instance_count = f->instance_count,
         .shadow_atlas_tex = r->atlas_shadow_tex,
@@ -826,7 +821,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     if (s.gpu_cull && f->instance_count) {
         Push push = base_push;
         push.param = s.compact ? 1u : 0u;
-        vkmin_dispatch(gpu, r->cull, &push, sizeof push, (f->instance_count + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
+        vkmin_dispatch(gpu, r->cull, &push, (f->instance_count + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
     }
     vkmin_timestamp(gpu, 1);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.compute_to_indirect_draw = true, .compute_to_transfer = true});
@@ -856,7 +851,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_timestamp(gpu, 3);
 
     /* --- 4. light clusters ------------------------------------------------ */
-    vkmin_dispatch(gpu, r->cluster, &base_push, sizeof base_push, (VKMIN_CLUSTER_COUNT + VKMIN_CLUSTER_GROUP - 1) / VKMIN_CLUSTER_GROUP, 1, 1);
+    vkmin_dispatch(gpu, r->cluster, &base_push, (VKMIN_CLUSTER_COUNT + VKMIN_CLUSTER_GROUP - 1) / VKMIN_CLUSTER_GROUP, 1, 1);
     vkmin_timestamp(gpu, 4);
     const vkmin_transition to_sampled_atlas[] = {{r->atlas, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_atlas, .image_count = 1, .compute_to_fragment = true});
@@ -871,13 +866,13 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
                s.gpu_cull, host_cmds, host_counts);
     vkmin_timestamp(gpu, 5);
     if (transparent_count) {
-        vkmin_draw_indirect(gpu, r->fwd_blend, &base_push, sizeof base_push,
+        vkmin_draw_indirect(gpu, r->fwd_blend, &base_push,
                             &(vkmin_indirect_desc){.indices = r->indices, .host_cmds = transparent_addr, .host_count = transparent_count});
     }
     if (world_quads) {
         Push q = base_push;
         q.aux = quads_addr;
-        vkmin_draw(gpu, r->quad_world, &q, sizeof q, world_quads * 6, 1);
+        vkmin_draw(gpu, r->quad_world, &q, world_quads * 6, 1);
     }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 6);
@@ -894,12 +889,12 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* Debug views are diagnostic colours, not radiance: pass them through. */
     tm.param2 = s.debug != 0 ? 0u : (uint32_t)s.tonemap;
     tm.param3 = r->atlas_raw_tex;
-    vkmin_draw(gpu, r->tonemap, &tm, sizeof tm, 3, 1);
+    vkmin_draw(gpu, r->tonemap, &tm, 3, 1);
     vkmin_timestamp(gpu, 7);
     if (screen_quads) {
         Push q = base_push;
         q.aux = quads_addr + (uint64_t)world_quads * sizeof(Quad);
-        vkmin_draw(gpu, r->quad_screen, &q, sizeof q, screen_quads * 6, 1);
+        vkmin_draw(gpu, r->quad_screen, &q, screen_quads * 6, 1);
     }
     vkmin_pass_end(gpu);
     vkmin_timestamp(gpu, 8);

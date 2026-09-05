@@ -83,11 +83,13 @@ int main(int argc, char **argv) {
     uint32_t ticks_done = 0;
     Light lights[2];
     char hud[128];
-    while (vkmin_frame_begin(gpu, NULL)) {
-        const vkmin_inputs *in = vkmin_input(gpu);
-        const uint32_t frame = vkmin_frame_index(gpu);
-        vkmin_size(gpu, &width, &height);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
+        const vkmin_inputs *in = &fr.input;
+        const uint32_t frame = fr.index;
+        width = fr.width;
+        height = fr.height;
+        if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
 
         /* --- simulate: the player walks, the enemies are functions of the tick --- */
         const uint32_t due = gk_ticks_due(frame, HZ, &ticks_done);
@@ -138,7 +140,7 @@ int main(int argc, char **argv) {
         lights[1] = gk_point_light((vec3){g.px, py + 2.5f, g.pz}, 9.0f, (vec3){1.0f, 0.85f, 0.6f}, 14.0f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 0.1f, .far = 80.0f, .instances = instances, .instance_count = n, .lights = lights, .light_count = 2,
-                                       .quads = quads, .quad_count = nq, .frame_index = frame});
+                                       .quads = quads, .quad_count = nq, .frame = fr});
         vkmin_frame_end(gpu);
         g.hovered = vkmin_pick(gpu, vkr_id_target(r), (int)in->mouse_x, (int)in->mouse_y);
         if (in->buttons_pressed & VKMIN_MOUSE_LEFT) g.picked = g.hovered;

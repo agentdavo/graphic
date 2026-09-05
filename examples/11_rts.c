@@ -159,11 +159,13 @@ int main(int argc, char **argv) {
 
     uint32_t ticks_done = 0;
     char hud[256];
-    while (vkmin_frame_begin(gpu, NULL)) {
-        const vkmin_inputs *in = vkmin_input(gpu);
-        const uint32_t frame = vkmin_frame_index(gpu);
-        vkmin_size(gpu, &width, &height);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
+        const vkmin_inputs *in = &fr.input;
+        const uint32_t frame = fr.index;
+        width = fr.width;
+        height = fr.height;
+        if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
 
         /* --- input to camera and orders -------------------------------- */
         const float pan = 3.0f * g->cam_distance / 260.0f;
@@ -247,7 +249,7 @@ int main(int argc, char **argv) {
         const Light sun = gk_sun((vec3){0.4f, -1.0f, 0.3f}, 4.0f);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {cam.pos.x, cam.pos.y, cam.pos.z, 1},
                                        .near = 2.0f, .far = 3000.0f, .instances = instances, .instance_count = n, .lights = &sun, .light_count = 1,
-                                       .quads = quads, .quad_count = nq, .frame_index = frame,
+                                       .quads = quads, .quad_count = nq, .frame = fr,
                                        .look = {.fog = {0.55f, 0.65f, 0.80f}, .fog_density = 0.0006f}});
         vkmin_frame_end(gpu);
         /* Picking reads the frame just finished, so the highlight is one frame late. */

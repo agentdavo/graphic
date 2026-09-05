@@ -16,9 +16,10 @@ int main(int argc, char **argv) {
     const vkmin_camera cam = vkmin_camera_fps((vec3){0, 0, 6}, 0.0f, 0.0f, 1.0f, 1.0f, 0.1f, 50.0f);
     const Light sun = gk_sun((vec3){0.3f, -1, 0.2f}, 3.0f);
     int failures = 0;
-    for (int frame = 0; frame < 2 && vkmin_frame_begin(gpu, NULL); ++frame) {
+    for (int frame = 0; frame < 2 && vkmin_running(gpu); ++frame) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL);
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {0, 0, 6, 1}, .near = 0.1f, .far = 50.0f,
-                                       .instances = &inst, .instance_count = 1, .lights = &sun, .light_count = 1, .frame_index = (uint32_t)frame});
+                                       .instances = &inst, .instance_count = 1, .lights = &sun, .light_count = 1, .frame = fr});
         vkmin_frame_end(gpu);
         const uint32_t centre = vkmin_pick(gpu, vkr_id_target(r), 32, 32), corner = vkmin_pick(gpu, vkr_id_target(r), 1, 1);
         const uint32_t off = vkmin_pick(gpu, vkr_id_target(r), 500, -3);

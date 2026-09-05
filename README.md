@@ -152,7 +152,7 @@ is reported as skipped by name.
 
 ## v0.3: the API surface
 
-`src/vkmin.h` is **223 lines** (201 non-blank) and is the documentation: the
+`src/vkmin.h` is **271 lines** and is the documentation: the
 header comment states the shape (one context, typed handles, zero-default
 descs, no callbacks, no allocation after init, no clock, single-threaded,
 failure fatal) and every function carries a state contract in its trailing
@@ -163,11 +163,28 @@ block at the top (`VKMIN_MAX_BUFFERS/IMAGES/PIPES`, `VKMIN_FAIL`,
 **Resources are numbers.** A shader reaches a texture by its bindless index
 (`vkmin_index`) and a buffer by its device address (`vkmin_address`); both
 travel in the push block the user defines in `shared.h`. There is no
-`vkmin_bind`: a draw is `vkmin_draw(ctx, pipe, push, bytes, verts, inst)`.
-`vkmin_frame_begin` returns `false` when the program should stop (window
-closed, `--frame N` reached), so the main loop is a `while`. The command line
+`vkmin_bind`: a draw is `vkmin_draw(ctx, pipe, push, verts, inst)`. The push
+block's size is the pipeline's (`.push_size`), not the draw's, and at
+creation it is checked against the push-constant block the SPIR-V declares:
+the CPU/GPU layout mismatch `shared.h` cannot `_Static_assert` -- the game's
+own push struct against the game's own shader -- is caught at init, once, by
+a tool. Folding that check in immediately found three of the seven examples
+declaring the engine's 32-byte block through `common.glsl` while pushing
+their own 88-byte one; the draws had worked by luck of layout.
+
+**A pointer never travels without its size.** `vkmin_bytes` is
+`{ const void *data; size_t size; }` and `VKMIN_BYTES(x)` pairs an array or
+object with its `sizeof` in one compound literal, so `.vs`, `.fs`, `.cs`,
+`.data`, `.pixels` and the uploads take one argument each and the wrong size
+is unwritable. **A frame reads the outside world at one point:** the loop is
+`while (vkmin_running(ctx)) { f = vkmin_frame_begin(ctx, clear); ...; vkmin_frame_end(ctx); }`,
+where `vkmin_running` polls the window and the demo file and decides the
+next frame, and `f` is a value carrying the frame index, slot, size, aspect
+and input snapshot -- the same record the journal writes. `vkmin_frame_index`,
+`vkmin_aspect`, `vkmin_input` and `vkmin_key_hit` are gone. The command line
 goes into `vkmin_init` and is parsed there: `--headless --frame N --out PNG
---path=... --record FILE --replay FILE`, and any cvar as `name=value`.
+--path=... --record FILE --replay FILE --demo FILE --play FILE`, and any cvar
+as `name=value`.
 
 **The journal.** With `--record FILE`, every public call that reaches the GPU
 is appended as a record `{op, header, payload, relocation list}`, including
@@ -198,10 +215,10 @@ examples are the tests: `01_clear` (12 lines), `02_triangle` (18),
 `07_replay` (24); each renders frame 60 at 256² against a golden.
 
 **Budgets, honestly.** The brief's budget for the core was 2500 lines with
-both paths, written for the cube lineage; `src/vkmin.c` is **2972 lines
-(2777 non-blank)** carrying both paths (108 legacy-only, 74 modern-only),
-the journal, hot reload, stats and dump. The renderer (`render.c`, 776) and
-the rest of `src/` bring the core to about 4800. It is over the number and I
+both paths, written for the cube lineage; at the end of v0.3 `src/vkmin.c`
+was 2972 lines carrying both paths (108 legacy-only, 74 modern-only), the
+journal, hot reload, stats and dump, and with the renderer (`render.c`, 776)
+and the rest of `src/` the core was about 4800 (v0.4's numbers are below). It is over the number and I
 have not cut it to fit; the journal alone is ~400 lines, and taking it out
 would remove the one feature that turns every bug into a batch job. The
 brief's other acceptance test — hand the header to someone and time them to a
@@ -288,7 +305,7 @@ so.
 **Numbers.** Core (`src/*.c`, `src/*.h` less the stb bridge and the baked
 font): **5582 lines** with both paths, against a budget of 7000. The shader
 library is 259 lines (budget 1000); every shader in the tree, library
-included, is 877. `vkmin.h` is 247 lines. The games: `10_shooter` 193,
+included, is 877. `vkmin.h` is 271 lines. The games: `10_shooter` 193,
 `11_rts` 262, `12_topdown` 150, `13_platformer` 165, `14_anime` 113 (budget
 500 each), sharing `demo/gamekit.h` (303: mesh builders, scene upload,
 procedural textures, the lavapipe profile, option parsing) and `demo/anim.h`

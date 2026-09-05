@@ -11,13 +11,14 @@ int main(int argc, char **argv) {
         {0.7f, 0.7f, 0, 0xffff4040u, 1, 0, 0, 0},   {-0.7f, -0.7f, 0, 0xff4040ffu, 0, 1, 0, 0},
         {0.7f, 0.7f, 0, 0xffff4040u, 1, 0, 0, 0},   {-0.7f, 0.7f, 0, 0xffffff40u, 0, 0, 0, 0},
     };
-    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = quad, .size = sizeof quad, .label = "quad"});
-    vkmin_pipe pipe = vkmin_make_pipeline(ctx, &(vkmin_pipe_desc){
-        .vs = ex_vertex_vert_spv, .vs_bytes = sizeof ex_vertex_vert_spv,
-        .fs = ex_color_frag_spv, .fs_bytes = sizeof ex_color_frag_spv, .cull = VKMIN_CULL_NONE, .label = "buffer"});
-    while (vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f})) {
-        const ExPush push = {.mvp = vkmin_mat4_ortho(-1, 1, -1, 1, 0, 1) /* y up */, .vertices = vkmin_address(ctx, vb)};
-        vkmin_draw(ctx, pipe, &push, sizeof push, 6, 1);
+    vkmin_buffer vb = vkmin_make_buffer(ctx, &(vkmin_buffer_desc){.data = VKMIN_BYTES(quad), .label = "quad"});
+    vkmin_pipeline pipe = vkmin_make_pipeline(ctx, &(vkmin_pipeline_desc){
+        .vs = VKMIN_BYTES(ex_vertex_vert_spv), .fs = VKMIN_BYTES(ex_color_frag_spv),
+        .push_size = sizeof(ExPush), .cull = VKMIN_CULL_NONE, .label = "buffer"});
+    const uint64_t verts = vkmin_address(ctx, vb); /* stable for the buffer's lifetime */
+    while (vkmin_running(ctx)) {
+        vkmin_frame_begin(ctx, &(vkmin_clear){.r = 0.1f, .g = 0.1f, .b = 0.12f, .a = 1.0f});
+        vkmin_draw(ctx, pipe, &(ExPush){.mvp = vkmin_mat4_ortho(-1, 1, -1, 1, 0, 1) /* y up */, .vertices = verts}, 6, 1);
         vkmin_frame_end(ctx);
     }
     vkmin_shutdown(ctx);

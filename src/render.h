@@ -30,7 +30,7 @@ typedef struct {
     size_t max_vertices, max_indices, max_skin_vertices;
     uint32_t max_meshes, max_materials, max_instances;
     vkr_shading shading;       /* which canonical forward shader; 0 = PBR */
-    const uint32_t *fs; size_t fs_bytes; /* or the game's own, composed from shaders/lib */
+    vkmin_bytes fs;            /* or the game's own SPIR-V, composed from shaders/lib */
 } vkr_desc;
 
 /* The look: everything the shader library reads that is not geometry. All
@@ -65,7 +65,7 @@ typedef struct {
     const Quad *quads; uint32_t quad_count;  /* sprites, particles, billboards, UI; drawn in order */
     const char *overlay_text;  /* '\n'-separated lines drawn at the top left, may be NULL */
     vkr_look look;
-    uint32_t frame_index;
+    vkmin_frame frame;         /* what vkmin_frame_begin returned: index, slot, size */
 } vkr_frame_desc;
 
 typedef struct {

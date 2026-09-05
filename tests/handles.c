@@ -3,6 +3,7 @@
  * the new one. The rejection is an abort, so the test forks: the child must
  * die, the parent checks how. */
 #include "vkmin.h"
+#include "shaders.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -18,7 +19,7 @@ static vkmin_ctx *make_ctx(void) {
 int main(void) {
     const uint8_t px[4] = {1, 2, 3, 4};
     vkmin_ctx *c = make_ctx();
-    const vkmin_buffer_desc bd = {.size = 64, .data = px, .label = "handles.buffer"};
+    const vkmin_buffer_desc bd = {.size = 64, .data = {px, sizeof px}, .label = "handles.buffer"};
     const vkmin_image_desc id = {.width = 1, .height = 1, .format = VKMIN_FMT_RGBA8_UNORM,
                                  .usage = VKMIN_IMAGE_SAMPLED, .label = "handles.image"};
     const vkmin_buffer b0 = vkmin_make_buffer(c, &bd);
@@ -43,8 +44,21 @@ int main(void) {
     int status = 0;
     waitpid(pid, &status, 0);
     const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
-    vkmin_shutdown(c);
     if (!aborted) { puts("handles: FAIL stale buffer handle was accepted"); return 1; }
-    puts("handles: ok (stale handle aborted, slot reused with a new generation)");
+
+    /* A pipeline whose push_size disagrees with its SPIR-V must abort too. */
+    fflush(stdout);
+    const pid_t pid2 = fork();
+    if (pid2 == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(2);
+        (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push) + 16, .label = "wrong push"});
+        _exit(0);
+    }
+    waitpid(pid2, &status, 0);
+    const bool push_aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    (void)vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(smoke_comp_spv), .push_size = sizeof(Push), .label = "right push"});
+    vkmin_shutdown(c);
+    if (!push_aborted) { puts("handles: FAIL a wrong push_size was accepted"); return 1; }
+    puts("handles: ok (stale handle aborted, slot reused with a new generation, wrong push_size aborted)");
     return 0;
 }

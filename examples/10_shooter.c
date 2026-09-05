@@ -111,11 +111,13 @@ int main(int argc, char **argv) {
     mat4 bones[MAX_BONES];
     uint32_t ticks_done = 0;
     char hud[128];
-    while (vkmin_frame_begin(gpu, NULL)) {
-        const vkmin_inputs *in = vkmin_input(gpu);
-        const uint32_t frame = vkmin_frame_index(gpu);
-        vkmin_size(gpu, &width, &height);
-        if (vkmin_key_hit(gpu, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
+    while (vkmin_running(gpu)) {
+        const vkmin_frame fr = vkmin_frame_begin(gpu, NULL); /* the one read of the outside world */
+        const vkmin_inputs *in = &fr.input;
+        const uint32_t frame = fr.index;
+        width = fr.width;
+        height = fr.height;
+        if (vkmin_key_pressed(in, VKMIN_KEY_ESCAPE)) { vkmin_frame_end(gpu); break; }
 
         /* Mouse look from the snapshot's deltas; the first frame only records. */
         if (p.mouse_valid) {
@@ -180,7 +182,7 @@ int main(int argc, char **argv) {
 
         vkr_frame(r, &(vkr_frame_desc){.view = cam.view, .proj = cam.proj, .camera_pos = {p.pos.x, p.pos.y, p.pos.z, 1},
                                        .near = 0.1f, .far = 120.0f, .instances = instances, .instance_count = n, .lights = lights, .light_count = LIGHTS + 1,
-                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame_index = frame,
+                                       .bones = bones, .bone_count = bone_count, .quads = quads, .quad_count = nq, .frame = fr,
                                        .look = {.fog = {0.5f, 0.55f, 0.6f}, .fog_density = 0.012f}});
         vkmin_frame_end(gpu);
     }

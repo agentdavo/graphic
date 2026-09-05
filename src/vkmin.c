@@ -125,9 +125,10 @@ typedef struct {
     char label[VKMIN_LABEL];
     /* For hot reload: the desc to rebuild from, the files' last mtimes, and
      * the blobs read from disk (owned here once a reload has happened). */
-    vkmin_pipe_desc desc;
+    vkmin_pipeline_desc desc;
     long mtime[3];
     uint32_t *loaded[3];
+    uint32_t push_size;  /* what every draw pushes; checked against the SPIR-V at creation */
 } pipe_slot;
 
 typedef struct {
@@ -208,6 +209,7 @@ struct vkmin_ctx {
     FILE *demo_out, *demo_in;
     const char *demo_path, *play_path;
     int frame_last;              /* highest --frame asked for, or -1 */
+    bool armed;                  /* vkmin_running said yes and frame_begin has not consumed it */
 
     VkCommandBuffer imm_cmd;
     VkFence imm_fence;
@@ -354,7 +356,7 @@ enum {
     OP_FILL, OP_COPY_TO_RING, OP_PASS_BEGIN, OP_PASS_END, OP_VIEWPORT, OP_DEPTH_BIAS, OP_DRAW,
     OP_DRAW_INDIRECT, OP_DISPATCH, OP_TIMESTAMP, OP_PICK
 };
-enum { JOURNAL_VERSION = 2 };
+enum { JOURNAL_VERSION = 3 };
 enum { RELOC_ARENA = 1, RELOC_RING = 2, VKMIN_MAX_RELOCS = 4096 };
 
 typedef struct { uint32_t magic, version, width, height; uint64_t arena_base, ring_base; } journal_header;
@@ -363,7 +365,7 @@ typedef struct { uint32_t offset; uint32_t kind; } reloc;
 /* Fixed-size mirrors of the descs, with strings copied and pointers dropped. */
 typedef struct { uint64_t size; uint32_t result, has_data; char label[VKMIN_LABEL]; } rec_buffer;
 typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; } rec_image;
-typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result, extra_colors, extra_format[2]; char label[VKMIN_LABEL]; } rec_pipe;
+typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result, extra_colors, extra_format[2], push_size; char label[VKMIN_LABEL]; } rec_pipe;
 typedef struct { uint32_t id, mip; uint64_t offset; } rec_upload;
 typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; vkmin_inputs input; } rec_frame;
 typedef struct { uint32_t magic, version, width, height; } demo_header;
@@ -1636,32 +1638,26 @@ void vkmin_size(const vkmin_ctx *c, int *w, int *h) {
     *h = (int)c->extent.height;
 }
 
-const vkmin_inputs *vkmin_input(const vkmin_ctx *c) { return &c->input; }
-
-bool vkmin_key_hit(const vkmin_ctx *c, int key) {
-    VKMIN_ASSERT(c != NULL && key >= 0 && key < (int)VKMIN_KEY_COUNT, "vkmin_key_hit: bad argument");
-    return vkmin_key_pressed(&c->input, key) != 0u;
-}
-
-uint32_t vkmin_frame_slot(const vkmin_ctx *c) { return c->slot; }
 
 /* ------------------------------------------------------------- buffers ---- */
 
 vkmin_buffer vkmin_make_buffer(vkmin_ctx *c, const vkmin_buffer_desc *desc) {
-    VKMIN_ASSERT(c && desc && desc->size > 0, "vkmin_make_buffer: bad argument");
+    VKMIN_ASSERT(c && desc, "vkmin_make_buffer: null argument");
+    const size_t size = desc->size ? desc->size : desc->data.size;
+    VKMIN_ASSERT(size > 0 && size >= desc->data.size, "vkmin_make_buffer: size %zu, initial data %zu", size, desc->data.size);
     RECORD_ENTER(c);
     uint32_t index = 0;
     VKMIN_SLOT_ALLOC(c->buffers, VKMIN_MAX_BUFFERS, index);
     buffer_slot *s = &c->buffers[index];
-    s->size = desc->size;
+    s->size = size;
     snprintf(s->label, sizeof s->label, "%s", desc->label ? desc->label : "buffer");
-    s->offset = arena_alloc(&c->buf_arena, desc->size, VKMIN_ARENA_ALIGN, s->label);
+    s->offset = arena_alloc(&c->buf_arena, size, VKMIN_ARENA_ALIGN, s->label);
     const vkmin_buffer b = {handle_make(index, s->gen)};
-    if (desc->data) vkmin_buffer_upload(c, b, 0, desc->data, desc->size);
+    if (desc->data.data) vkmin_buffer_upload(c, b, 0, desc->data);
     RECORD_LEAVE(c);
-    rec_buffer rb = {.size = desc->size, .result = b.id, .has_data = desc->data != NULL};
+    rec_buffer rb = {.size = size, .result = b.id, .has_data = desc->data.data != NULL};
     snprintf(rb.label, sizeof rb.label, "%s", s->label);
-    RECORD(c, OP_MAKE_BUFFER, rb, desc->data, desc->data ? desc->size : 0);
+    RECORD(c, OP_MAKE_BUFFER, rb, desc->data.data, desc->data.data ? desc->data.size : 0);
     return b;
 }
 
@@ -1694,8 +1690,10 @@ uint64_t vkmin_address(vkmin_ctx *c, vkmin_buffer b) {
     return c->arena_addr + s->offset;
 }
 
-void vkmin_buffer_upload(vkmin_ctx *c, vkmin_buffer b, size_t offset, const void *data, size_t bytes) {
-    VKMIN_ASSERT(c && data, "vkmin_buffer_upload: null argument");
+void vkmin_buffer_upload(vkmin_ctx *c, vkmin_buffer b, size_t offset, vkmin_bytes upload) {
+    VKMIN_ASSERT(c && upload.data, "vkmin_buffer_upload: null argument");
+    const void *data = upload.data;
+    const size_t bytes = upload.size;
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
     VKMIN_ASSERT(offset + bytes <= s->size, "upload of %zu bytes at %zu overruns a %llu byte buffer",
@@ -1785,12 +1783,16 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     set_name(c, VK_OBJECT_TYPE_IMAGE, (uint64_t)s->img, "%s", s->label);
     set_name(c, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)s->view, "%s.view", s->label);
     const vkmin_image img = {handle_make(index, s->gen)};
-    if (desc->pixels) vkmin_image_upload(c, img, 0, desc->pixels, mip_bytes(fi, s->w, s->h));
+    if (desc->pixels.data) {
+        VKMIN_ASSERT(desc->pixels.size == 0 || desc->pixels.size >= mip_bytes(fi, s->w, s->h),
+                     "'%s': %zu bytes of pixels for a %zu byte mip 0", s->label, desc->pixels.size, mip_bytes(fi, s->w, s->h));
+        vkmin_image_upload(c, img, 0, (vkmin_bytes){desc->pixels.data, mip_bytes(fi, s->w, s->h)});
+    }
     RECORD_LEAVE(c);
     rec_image ri = {.w = desc->width, .h = desc->height, .mips = desc->mip_levels, .format = desc->format, .usage = desc->usage,
-                    .sampler = desc->sampler, .result = img.id, .has_pixels = desc->pixels != NULL};
+                    .sampler = desc->sampler, .result = img.id, .has_pixels = desc->pixels.data != NULL};
     snprintf(ri.label, sizeof ri.label, "%s", s->label);
-    RECORD(c, OP_MAKE_IMAGE, ri, desc->pixels, desc->pixels ? mip_bytes(fi, s->w, s->h) : 0);
+    RECORD(c, OP_MAKE_IMAGE, ri, desc->pixels.data, desc->pixels.data ? mip_bytes(fi, s->w, s->h) : 0);
     return img;
 }
 
@@ -1867,8 +1869,10 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
 }
 /* --- end modern-only ------------------------------------------------------ */
 
-void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, const void *data, size_t bytes) {
-    VKMIN_ASSERT(c && data, "vkmin_image_upload: null argument");
+void vkmin_image_upload(vkmin_ctx *c, vkmin_image img, int mip, vkmin_bytes src) {
+    VKMIN_ASSERT(c && src.data, "vkmin_image_upload: null argument");
+    const void *data = src.data;
+    const size_t bytes = src.size;
     image_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, img.id, s);
     VKMIN_ASSERT(mip >= 0 && (uint32_t)mip < s->mips, "mip %d out of range (%u levels)", mip, s->mips);
@@ -1896,7 +1900,7 @@ vkmin_image vkmin_load_png(vkmin_ctx *c, const char *path, bool srgb) {
     unsigned char *pixels = vkmin_png_load(path, &w, &h);
     VKMIN_ASSERT(pixels != NULL, "could not load PNG '%s'", path);
     const vkmin_image img = vkmin_make_image(
-        c, &(vkmin_image_desc){.width = w, .height = h, .pixels = pixels,
+        c, &(vkmin_image_desc){.width = w, .height = h, .pixels = {pixels, (size_t)w * h * 4u},
                                .format = srgb ? VKMIN_FMT_RGBA8_SRGB : VKMIN_FMT_RGBA8_UNORM, .label = path});
     vkmin_png_free(pixels);
     return img;
@@ -1926,6 +1930,74 @@ typedef struct {
     VkShaderModuleCreateInfo inline_code; /* referenced by stage.pNext on the modern path */
     VkShaderModule module;                /* legacy only */
 } shader_stage;
+
+/* The byte size of the push-constant block a module declares, or 0 for none.
+ * Walks the type table as scalar layout lays it out: scalars, vectors,
+ * matrices, arrays (by ArrayStride), structs (by member Offset). This is the
+ * CPU/GPU layout check for the one struct shared.h cannot _Static_assert:
+ * the push block is the game's, declared in its own shader. */
+enum { SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23, SPV_OP_TYPE_MATRIX = 24, SPV_OP_TYPE_ARRAY = 28,
+       SPV_OP_TYPE_STRUCT = 30, SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_VARIABLE = 59, SPV_OP_DECORATE = 71,
+       SPV_OP_MEMBER_DECORATE = 72, SPV_DEC_ARRAY_STRIDE = 6, SPV_DEC_OFFSET = 35, SPV_STORAGE_PUSH_CONSTANT = 9 };
+
+typedef struct { const uint32_t *w; size_t n; const uint32_t *def; uint32_t bound; } spirv_view;
+
+static uint32_t spirv_type_size(const spirv_view *v, uint32_t id, int depth) {
+    if (id >= v->bound || v->def[id] == 0 || depth > 16) return 0;
+    const uint32_t *op = v->w + v->def[id];
+    const uint32_t code = op[0] & 0xffffu, words = op[0] >> 16;
+    switch (code) {
+    case SPV_OP_TYPE_INT:
+    case SPV_OP_TYPE_FLOAT: return op[2] / 8u;
+    case SPV_OP_TYPE_VECTOR: return op[3] * spirv_type_size(v, op[2], depth + 1);
+    case SPV_OP_TYPE_MATRIX: return op[3] * spirv_type_size(v, op[2], depth + 1); /* scalar layout: columns are tight */
+    case SPV_OP_TYPE_ARRAY: {
+        uint32_t stride = spirv_type_size(v, op[2], depth + 1), length = 0;
+        if (op[3] < v->bound && v->def[op[3]] && (v->w[v->def[op[3]]] & 0xffffu) == SPV_OP_CONSTANT) length = v->w[v->def[op[3]] + 3];
+        for (size_t i = 5; i + 3 < v->n; i += v->w[i] >> 16) {
+            if ((v->w[i] & 0xffffu) == SPV_OP_DECORATE && v->w[i + 1] == id && v->w[i + 2] == SPV_DEC_ARRAY_STRIDE) stride = v->w[i + 3];
+        }
+        return stride * length;
+    }
+    case SPV_OP_TYPE_STRUCT: {
+        uint32_t size = 0;
+        for (uint32_t m = 0; m + 2 < words; ++m) {
+            uint32_t offset = size; /* no Offset decoration: pack tightly */
+            for (size_t i = 5; i + 4 < v->n; i += v->w[i] >> 16) {
+                if ((v->w[i] & 0xffffu) == SPV_OP_MEMBER_DECORATE && v->w[i + 1] == id && v->w[i + 2] == m && v->w[i + 3] == SPV_DEC_OFFSET) offset = v->w[i + 4];
+            }
+            const uint32_t end = offset + spirv_type_size(v, op[2 + m], depth + 1);
+            size = end > size ? end : size;
+        }
+        return size;
+    }
+    default: return 0;
+    }
+}
+
+static uint32_t spirv_push_size(const uint32_t *w, size_t bytes) {
+    const size_t n = bytes / 4;
+    if (n < 6) return 0;
+    const uint32_t bound = w[3];
+    uint32_t *def = calloc(bound ? bound : 1, sizeof *def);
+    VKMIN_ASSERT(def != NULL, "out of memory");
+    uint32_t push_type = 0;
+    for (size_t i = 5; i < n && (w[i] >> 16) > 0; i += w[i] >> 16) {
+        const uint32_t code = w[i] & 0xffffu, words = w[i] >> 16;
+        if (i + words > n) break;
+        /* result id is word 1 for types, word 2 for constants and variables */
+        if ((code >= SPV_OP_TYPE_INT && code <= SPV_OP_TYPE_POINTER) && words > 1 && w[i + 1] < bound) def[w[i + 1]] = (uint32_t)i;
+        if (code == SPV_OP_CONSTANT && words > 2 && w[i + 2] < bound) def[w[i + 2]] = (uint32_t)i;
+        if (code == SPV_OP_VARIABLE && words > 3 && w[i + 3] == SPV_STORAGE_PUSH_CONSTANT) push_type = w[i + 1];
+    }
+    uint32_t size = 0;
+    if (push_type && push_type < bound && def[push_type] && (w[def[push_type]] & 0xffffu) == SPV_OP_TYPE_POINTER) {
+        const spirv_view v = {w, n, def, bound};
+        size = spirv_type_size(&v, w[def[push_type] + 3], 0);
+    }
+    free(def);
+    return size;
+}
 
 static void check_spirv(const uint32_t *spv, size_t bytes, const char *label) {
     VKMIN_ASSERT(spv && bytes >= 4 && bytes % 4 == 0, "'%s': bad SPIR-V size %zu", label, bytes);
@@ -1989,28 +2061,39 @@ static VkCompareOp compare_lookup(vkmin_compare cmp) {
     VKMIN_FAIL("bad compare %d", (int)cmp);
 }
 
-static vkmin_pipe make_compute(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label);
+static vkmin_pipeline make_compute(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label);
 
-static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label);
+static vkmin_pipeline make_graphics(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label);
 
-vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
-    VKMIN_ASSERT(c && desc && (desc->vs || desc->cs), "vkmin_make_pipeline: needs .vs or .cs");
+vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc) {
+    VKMIN_ASSERT(c && desc && (desc->vs.data || desc->cs.data), "vkmin_make_pipeline: needs .vs or .cs");
     const char *label = desc->label ? desc->label : "pipeline";
-    const vkmin_pipe p = desc->cs ? make_compute(c, desc, label) : make_graphics(c, desc, label);
+    VKMIN_ASSERT(desc->push_size <= VKMIN_PUSH_BYTES, "'%s': push block of %u bytes (max %u)", label, desc->push_size, (unsigned)VKMIN_PUSH_BYTES);
+    /* Each stage that declares a push block must declare push_size bytes of it. */
+    const vkmin_bytes stages[3] = {desc->vs, desc->fs, desc->cs};
+    for (int k = 0; k < 3; ++k) {
+        if (!stages[k].data) continue;
+        check_spirv(stages[k].data, stages[k].size, label);
+        const uint32_t declared = spirv_push_size(stages[k].data, stages[k].size);
+        VKMIN_ASSERT(declared == 0 || declared == desc->push_size,
+                     "'%s': the %s shader declares a %u byte push block, the pipeline says push_size = %u", label,
+                     k == 0 ? "vertex" : k == 1 ? "fragment" : "compute", declared, desc->push_size);
+    }
+    const vkmin_pipeline p = desc->cs.data ? make_compute(c, desc, label) : make_graphics(c, desc, label);
     if (c->rec && c->rec_depth == 0) {
         /* Blobs concatenated: vs, fs, cs. */
-        const size_t total = desc->vs_bytes + desc->fs_bytes + desc->cs_bytes;
+        const size_t total = desc->vs.size + desc->fs.size + desc->cs.size;
         uint8_t *blob = malloc(total ? total : 1);
         VKMIN_ASSERT(blob != NULL, "out of memory");
         size_t at = 0;
-        if (desc->vs) { memcpy(blob + at, desc->vs, desc->vs_bytes); at += desc->vs_bytes; }
-        if (desc->fs) { memcpy(blob + at, desc->fs, desc->fs_bytes); at += desc->fs_bytes; }
-        if (desc->cs) { memcpy(blob + at, desc->cs, desc->cs_bytes); at += desc->cs_bytes; }
-        rec_pipe rp = {.vs_bytes = (uint32_t)(desc->vs ? desc->vs_bytes : 0), .fs_bytes = (uint32_t)(desc->fs ? desc->fs_bytes : 0),
-                       .cs_bytes = (uint32_t)(desc->cs ? desc->cs_bytes : 0), .color_format = desc->color_format, .depth = desc->depth,
+        for (int k = 0; k < 3; ++k) {
+            if (stages[k].data) { memcpy(blob + at, stages[k].data, stages[k].size); at += stages[k].size; }
+        }
+        rec_pipe rp = {.vs_bytes = (uint32_t)(desc->vs.data ? desc->vs.size : 0), .fs_bytes = (uint32_t)(desc->fs.data ? desc->fs.size : 0),
+                       .cs_bytes = (uint32_t)(desc->cs.data ? desc->cs.size : 0), .color_format = desc->color_format, .depth = desc->depth,
                        .depth_write = desc->depth_write, .compare = desc->depth_compare, .cull = desc->cull,
                        .blend = desc->blend, .bias = desc->depth_bias, .result = p.id, .extra_colors = (uint32_t)desc->extra_colors,
-                       .extra_format = {desc->extra_format[0], desc->extra_format[1]}};
+                       .extra_format = {desc->extra_format[0], desc->extra_format[1]}, .push_size = desc->push_size};
         snprintf(rp.label, sizeof rp.label, "%s", label);
         RECORD(c, OP_MAKE_PIPELINE, rp, blob, at);
         free(blob);
@@ -2018,10 +2101,10 @@ vkmin_pipe vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipe_desc *desc) {
     return p;
 }
 
-static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label) {
+static vkmin_pipeline make_graphics(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label) {
     shader_stage vs = {0}, fs = {0};
-    make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs, desc->vs_bytes, label);
-    if (desc->fs) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs, desc->fs_bytes, label);
+    make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs.data, desc->vs.size, label);
+    if (desc->fs.data) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs.data, desc->fs.size, label);
     const VkPipelineShaderStageCreateInfo stages[2] = {vs.stage, fs.stage};
     /* No vertex input state: every vertex shader pulls from a device address. */
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -2098,7 +2181,7 @@ static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const
     const VkGraphicsPipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = robustness_chain(c, &robust, &rendering),
-        .stageCount = desc->fs ? 2u : 1u,
+        .stageCount = desc->fs.data ? 2u : 1u,
         .pStages = stages,
         .pVertexInputState = &vertex_input,
         .pInputAssemblyState = &assembly,
@@ -2116,6 +2199,7 @@ static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const
     s->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     snprintf(s->label, sizeof s->label, "%s", label);
     s->desc = *desc;
+    s->push_size = desc->push_size;
     s->mtime[0] = file_mtime(desc->vs_path);
     s->mtime[1] = file_mtime(desc->fs_path);
     s->mtime[2] = file_mtime(desc->cs_path);
@@ -2123,12 +2207,12 @@ static vkmin_pipe make_graphics(vkmin_ctx *c, const vkmin_pipe_desc *desc, const
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label);
     if (vs.module) vkDestroyShaderModule(c->dev, vs.module, NULL);
     if (fs.module) vkDestroyShaderModule(c->dev, fs.module, NULL);
-    return (vkmin_pipe){handle_make(index, s->gen)};
+    return (vkmin_pipeline){handle_make(index, s->gen)};
 }
 
-static vkmin_pipe make_compute(vkmin_ctx *c, const vkmin_pipe_desc *desc, const char *label) {
+static vkmin_pipeline make_compute(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label) {
     shader_stage cs = {0};
-    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, desc->cs, desc->cs_bytes, label);
+    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, desc->cs.data, desc->cs.size, label);
     VkPipelineRobustnessCreateInfoEXT robust;
     const VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -2142,11 +2226,12 @@ static vkmin_pipe make_compute(vkmin_ctx *c, const vkmin_pipe_desc *desc, const 
     s->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
     snprintf(s->label, sizeof s->label, "%s", label);
     s->desc = *desc;
+    s->push_size = desc->push_size;
     s->mtime[2] = file_mtime(desc->cs_path);
     VK_CHECK(vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &info, NULL, &s->pipe));
     set_name(c, VK_OBJECT_TYPE_PIPELINE, (uint64_t)s->pipe, "%s", label);
     if (cs.module) vkDestroyShaderModule(c->dev, cs.module, NULL);
-    return (vkmin_pipe){handle_make(index, s->gen)};
+    return (vkmin_pipeline){handle_make(index, s->gen)};
 }
 
 /* ------------------------------------------------------------ hot reload -- */
@@ -2183,15 +2268,15 @@ static void hot_reload_check(vkmin_ctx *c) {
             if (paths[k] && m != s->mtime[k]) { changed = s->mtime[k] != 0; s->mtime[k] = m; }
         }
         if (!changed) continue;
-        vkmin_pipe_desc d = s->desc;
-        const uint32_t **blobs[3] = {&d.vs, &d.fs, &d.cs};
-        size_t *sizes[3] = {&d.vs_bytes, &d.fs_bytes, &d.cs_bytes};
+        vkmin_pipeline_desc d = s->desc;
+        vkmin_bytes *blobs[3] = {&d.vs, &d.fs, &d.cs};
         bool ok = true;
         uint32_t *fresh[3] = {0};
         for (int k = 0; k < 3 && ok; ++k) {
             if (!paths[k]) continue;
-            fresh[k] = read_spirv_file(paths[k], sizes[k]);
-            if (!fresh[k]) ok = false; else *blobs[k] = fresh[k];
+            size_t size = 0;
+            fresh[k] = read_spirv_file(paths[k], &size);
+            if (!fresh[k]) ok = false; else *blobs[k] = (vkmin_bytes){fresh[k], size};
         }
         if (!ok) { /* half-written file: try again next frame */
             for (int k = 0; k < 3; ++k) free(fresh[k]);
@@ -2204,7 +2289,7 @@ static void hot_reload_check(vkmin_ctx *c) {
         const char label[VKMIN_LABEL];
         memcpy((void *)label, s->label, sizeof label);
         s->used = false;                       /* let make_pipeline take this very slot */
-        const vkmin_pipe p = vkmin_make_pipeline(c, &d);
+        const vkmin_pipeline p = vkmin_make_pipeline(c, &d);
         VKMIN_ASSERT(handle_index(p.id) == i, "hot reload landed in a different slot");
         s->gen = gen;                          /* same handle as before */
         for (int k = 0; k < 3; ++k) { free(s->loaded[k]); s->loaded[k] = fresh[k]; }
@@ -2226,16 +2311,13 @@ static void backbuffer_bind(vkmin_ctx *c, VkImage img, VkImageView view) {
      * write after that read. */
 }
 
-bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
-    VKMIN_ASSERT(c != NULL, "vkmin_frame_begin: null context");
-    VKMIN_ASSERT(!c->in_frame, "vkmin_frame_begin called twice without a frame_end");
-
-    /* Is there a frame to render? Headless walks the --frame list; windowed
-     * runs until the window closes or --exit-after is reached. A replay has
-     * had its frame index set by the record being replayed. */
-    if (c->replaying) {
-        /* nothing to decide: the journal decides, input included */
-    } else if (c->demo_in) {
+/* The one point a frame reads the outside world: the window, the demo file,
+ * the frame list. Decides whether there is a frame and which, and takes the
+ * input snapshot; frame_begin then hands all of it back as a value. */
+bool vkmin_running(vkmin_ctx *c) {
+    VKMIN_ASSERT(c != NULL && !c->in_frame, "vkmin_running: call it between frames");
+    VKMIN_ASSERT(!c->replaying, "vkmin_running: a replaying context is driven by vkmin_replay");
+    if (c->demo_in) {
         demo_record dr;
         if (fread(&dr, sizeof dr, 1, c->demo_in) != 1) return false;
         if (c->frame_last >= 0 && (int)dr.frame_index > c->frame_last) return false;
@@ -2253,9 +2335,9 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         if (plat_should_close()) return false;
         if (c->exit_after > 0 && (int)c->frames_rendered >= c->exit_after) return false;
     }
-    if (!c->replaying && !c->demo_in) {
-        /* The one place input is read. Edges are computed here so the
-         * snapshot, not the backend, is the whole truth of the frame. */
+    if (!c->demo_in) {
+        /* Edges are computed here so the snapshot, not the backend, is the
+         * whole truth of the frame. */
         vkmin_inputs raw = {0};
         if (!c->desc.headless) plat_input(&raw);
         for (size_t k = 0; k < sizeof raw.down / sizeof raw.down[0]; ++k) raw.pressed[k] = raw.down[k] & ~c->prev_input.down[k];
@@ -2267,6 +2349,15 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         const demo_record dr = {.frame_index = c->frame_index, .input = c->input};
         VKMIN_ASSERT(fwrite(&dr, sizeof dr, 1, c->demo_out) == 1, "demo write failed");
     }
+    c->armed = true;
+    return true;
+}
+
+vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
+    VKMIN_ASSERT(c != NULL, "vkmin_frame_begin: null context");
+    VKMIN_ASSERT(!c->in_frame, "vkmin_frame_begin called twice without a frame_end");
+    VKMIN_ASSERT(c->armed, "vkmin_frame_begin without vkmin_running saying yes");
+    c->armed = false;
     c->draws = 0;
     c->dispatches = 0;
     c->ring_issued_count = 0;
@@ -2332,11 +2423,9 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         c->in_default_pass = true;
     }
     RECORD_LEAVE(c);
-    return true;
+    return (vkmin_frame){.index = c->frame_index, .slot = c->slot, .width = (int)c->extent.width, .height = (int)c->extent.height,
+                         .aspect = (float)c->extent.width / (float)c->extent.height, .input = c->input};
 }
-
-uint32_t vkmin_frame_index(const vkmin_ctx *c) { return c->frame_index; }
-float vkmin_aspect(const vkmin_ctx *c) { return (float)c->extent.width / (float)c->extent.height; }
 
 void *vkmin_ring_alloc(vkmin_ctx *c, size_t bytes, uint64_t *addr_out) {
     VKMIN_ASSERT(c && c->in_frame, "vkmin_ring_alloc outside a frame");
@@ -2590,12 +2679,19 @@ void vkmin_set_depth_bias(vkmin_ctx *c, float constant, float slope) {
 
 /* Every draw and dispatch goes through here: the pipeline and the push block
  * are parameters of the call, never state left behind for the next one. */
-static void bind_and_push(vkmin_ctx *c, vkmin_pipe p, VkPipelineBindPoint want, const void *push, uint32_t bytes) {
-    VKMIN_ASSERT(c && c->in_frame, "draw or dispatch outside a frame");
-    VKMIN_ASSERT(bytes <= VKMIN_PUSH_BYTES && (bytes == 0 || push), "push block of %u bytes (max %u)", bytes,
-                 (unsigned)VKMIN_PUSH_BYTES);
+/* The pipeline knows its push size; the draw only supplies the bytes. */
+static uint32_t pipe_push_size(vkmin_ctx *c, vkmin_pipeline p) {
     const pipe_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->pipes, VKMIN_MAX_PIPES, p.id, s);
+    return s->push_size;
+}
+
+static void bind_and_push(vkmin_ctx *c, vkmin_pipeline p, VkPipelineBindPoint want, const void *push) {
+    VKMIN_ASSERT(c && c->in_frame, "draw or dispatch outside a frame");
+    const pipe_slot *s = NULL;
+    VKMIN_SLOT_LOOKUP(c->pipes, VKMIN_MAX_PIPES, p.id, s);
+    const uint32_t bytes = s->push_size;
+    VKMIN_ASSERT(bytes == 0 || push, "'%s' pushes %u bytes but the draw passed no push block", s->label, bytes);
     VKMIN_ASSERT(s->bind_point == want, "'%s' is not a %s pipeline", s->label,
                  want == VK_PIPELINE_BIND_POINT_GRAPHICS ? "graphics" : "compute");
     VKMIN_ASSERT((want == VK_PIPELINE_BIND_POINT_GRAPHICS) == c->in_pass, "draws go inside a pass, dispatches outside");
@@ -2607,16 +2703,18 @@ static void bind_and_push(vkmin_ctx *c, vkmin_pipe p, VkPipelineBindPoint want, 
     }
 }
 
-void vkmin_draw(vkmin_ctx *c, vkmin_pipe p, const void *push, uint32_t push_bytes, uint32_t vertices, uint32_t instances) {
+void vkmin_draw(vkmin_ctx *c, vkmin_pipeline p, const void *push, uint32_t vertices, uint32_t instances) {
+    const uint32_t push_bytes = pipe_push_size(c, p);
     const rec_draw rd = {.pipe = p.id, .push_bytes = push_bytes, .a = vertices, .b = instances};
     RECORD(c, OP_DRAW, rd, push, push_bytes);
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push, push_bytes);
+    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
     vkCmdDraw(c->cmd[c->slot], vertices, instances, 0, 0);
     c->draws++;
 }
 
-void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipe p, const void *push, uint32_t push_bytes, const vkmin_indirect_desc *d) {
+void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipeline p, const void *push, const vkmin_indirect_desc *d) {
     VKMIN_ASSERT(d && vkmin_valid(d->indices), "vkmin_draw_indirect: needs an index buffer");
+    const uint32_t push_bytes = pipe_push_size(c, p);
     {
         const rec_indirect ri = {.pipe = p.id, .push_bytes = push_bytes, .indices = d->indices.id, .cmds = d->cmds.id,
                                  .counts = d->counts.id, .max_draws = d->max_draws, .host_count = d->host_count,
@@ -2627,7 +2725,7 @@ void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipe p, const void *push, uint32_t 
         memcpy(data + push_bytes, &d->host_cmds, 8);
         RECORD(c, OP_DRAW_INDIRECT, ri, data, push_bytes + 8);
     }
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push, push_bytes);
+    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
     const buffer_slot *ib = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, d->indices.id, ib);
     vkCmdBindIndexBuffer(c->cmd[c->slot], c->arena_buf, ib->offset, VK_INDEX_TYPE_UINT32);
@@ -2650,10 +2748,11 @@ void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipe p, const void *push, uint32_t 
     c->draws++;
 }
 
-void vkmin_dispatch(vkmin_ctx *c, vkmin_pipe p, const void *push, uint32_t push_bytes, uint32_t x, uint32_t y, uint32_t z) {
+void vkmin_dispatch(vkmin_ctx *c, vkmin_pipeline p, const void *push, uint32_t x, uint32_t y, uint32_t z) {
+    const uint32_t push_bytes = pipe_push_size(c, p);
     const rec_draw rd = {.pipe = p.id, .push_bytes = push_bytes, .a = x, .b = y, .cnt = z};
     RECORD(c, OP_DISPATCH, rd, push, push_bytes);
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_COMPUTE, push, push_bytes);
+    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_COMPUTE, push);
     vkCmdDispatch(c->cmd[c->slot], x, y, z);
     c->dispatches++;
 }
@@ -2947,29 +3046,29 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
 #define SAME(got, want) VKMIN_ASSERT((got) == (want), "replay diverged at record %u: handle %u, recorded %u", records, (unsigned)(got), (unsigned)(want))
         switch (rh.op) {
         case OP_MAKE_BUFFER: { HDR(rec_buffer);
-            const vkmin_buffer b = vkmin_make_buffer(c, &(vkmin_buffer_desc){.size = rec.size, .data = rec.has_data ? data : NULL, .label = rec.label});
+            const vkmin_buffer b = vkmin_make_buffer(c, &(vkmin_buffer_desc){.size = rec.size, .data = {rec.has_data ? data : NULL, rh.data_bytes}, .label = rec.label});
             SAME(b.id, rec.result); break; }
         case OP_FREE_BUFFER: { HDR(vkmin_buffer); vkmin_free_buffer(c, rec); break; }
-        case OP_BUFFER_UPLOAD: { HDR(rec_upload); vkmin_buffer_upload(c, (vkmin_buffer){rec.id}, rec.offset, data, rh.data_bytes); break; }
+        case OP_BUFFER_UPLOAD: { HDR(rec_upload); vkmin_buffer_upload(c, (vkmin_buffer){rec.id}, rec.offset, (vkmin_bytes){data, rh.data_bytes}); break; }
         case OP_MAKE_IMAGE: { HDR(rec_image);
             const vkmin_image i = vkmin_make_image(c, &(vkmin_image_desc){.width = rec.w, .height = rec.h, .mip_levels = rec.mips,
-                .format = (vkmin_format)rec.format, .usage = rec.usage, .sampler = rec.sampler, .pixels = rec.has_pixels ? data : NULL, .label = rec.label});
+                .format = (vkmin_format)rec.format, .usage = rec.usage, .sampler = rec.sampler, .pixels = {rec.has_pixels ? data : NULL, rh.data_bytes}, .label = rec.label});
             SAME(i.id, rec.result); break; }
         case OP_FREE_IMAGE: { HDR(vkmin_image); vkmin_free_image(c, rec); break; }
-        case OP_IMAGE_UPLOAD: { HDR(rec_upload); vkmin_image_upload(c, (vkmin_image){rec.id}, (int)rec.mip, data, rh.data_bytes); break; }
+        case OP_IMAGE_UPLOAD: { HDR(rec_upload); vkmin_image_upload(c, (vkmin_image){rec.id}, (int)rec.mip, (vkmin_bytes){data, rh.data_bytes}); break; }
         case OP_INDEX: { HDR(rec_draw); SAME(vkmin_index(c, (vkmin_image){rec.pipe}), rec.a); break; }
         case OP_REGISTER: { HDR(rec_draw); SAME(vkmin_register_texture(c, (vkmin_image){rec.pipe}, rec.a), rec.b); break; }
         case OP_MAKE_PIPELINE: { HDR(rec_pipe);
             const uint32_t *vs = rec.vs_bytes ? (const uint32_t *)(void *)data : NULL;
             const uint32_t *fs = rec.fs_bytes ? (const uint32_t *)(void *)(data + rec.vs_bytes) : NULL;
             const uint32_t *cs = rec.cs_bytes ? (const uint32_t *)(void *)(data + rec.vs_bytes + rec.fs_bytes) : NULL;
-            const vkmin_pipe p = vkmin_make_pipeline(c, &(vkmin_pipe_desc){.vs = vs, .vs_bytes = rec.vs_bytes, .fs = fs, .fs_bytes = rec.fs_bytes,
-                .cs = cs, .cs_bytes = rec.cs_bytes, .color_format = (vkmin_format)rec.color_format, .depth = rec.depth, .depth_write = rec.depth_write,
+            const vkmin_pipeline p = vkmin_make_pipeline(c, &(vkmin_pipeline_desc){.vs = {vs, rec.vs_bytes}, .fs = {fs, rec.fs_bytes},
+                .cs = {cs, rec.cs_bytes}, .push_size = rec.push_size, .color_format = (vkmin_format)rec.color_format, .depth = rec.depth, .depth_write = rec.depth_write,
                 .depth_compare = (vkmin_compare)rec.compare, .cull = (vkmin_cull)rec.cull, .blend = rec.blend, .depth_bias = rec.bias, .label = rec.label,
                 .extra_colors = (int)rec.extra_colors, .extra_format = {(vkmin_format)rec.extra_format[0], (vkmin_format)rec.extra_format[1]}});
             SAME(p.id, rec.result); break; }
-        case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index; c->input = rec.input;
-            VKMIN_ASSERT(vkmin_frame_begin(c, rec.has_clear ? &rec.clear : NULL), "replay: frame_begin refused"); break; }
+        case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index; c->input = rec.input; c->armed = true;
+            (void)vkmin_frame_begin(c, rec.has_clear ? &rec.clear : NULL); break; }
         case OP_RING_ALLOC: { HDR(rec_upload); uint64_t addr = 0; vkmin_ring_alloc(c, (size_t)rec.offset, &addr); break; }
         case OP_FRAME_END: { HDR(rec_upload);
             VKMIN_ASSERT(rec.offset == c->ring_head[c->slot], "replay: ring usage differs (%llu vs %llu)", (unsigned long long)rec.offset, (unsigned long long)c->ring_head[c->slot]);
@@ -2988,12 +3087,15 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         case OP_PASS_END: vkmin_pass_end(c); break;
         case OP_VIEWPORT: { HDR(rec_pass); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
         case OP_DEPTH_BIAS: { HDR(vkmin_clear); vkmin_set_depth_bias(c, rec.r, rec.g); break; }
-        case OP_DRAW: { HDR(rec_draw); vkmin_draw(c, (vkmin_pipe){rec.pipe}, rec.push_bytes ? data : NULL, rec.push_bytes, rec.a, rec.b); break; }
+        case OP_DRAW: { HDR(rec_draw); SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+            vkmin_draw(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b); break; }
         case OP_DRAW_INDIRECT: { HDR(rec_indirect); uint64_t host; memcpy(&host, data + rec.push_bytes, 8);
-            vkmin_draw_indirect(c, (vkmin_pipe){rec.pipe}, rec.push_bytes ? data : NULL, rec.push_bytes,
+            SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+            vkmin_draw_indirect(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL,
                 &(vkmin_indirect_desc){.indices = {rec.indices}, .cmds = {rec.cmds}, .cmd_offset = rec.cmd_offset, .counts = {rec.counts},
                 .count_offset = rec.count_offset, .max_draws = rec.max_draws, .host_cmds = host, .host_count = rec.host_count}); break; }
-        case OP_DISPATCH: { HDR(rec_draw); vkmin_dispatch(c, (vkmin_pipe){rec.pipe}, rec.push_bytes ? data : NULL, rec.push_bytes, rec.a, rec.b, rec.cnt); break; }
+        case OP_DISPATCH: { HDR(rec_draw); SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+            vkmin_dispatch(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b, rec.cnt); break; }
         case OP_TIMESTAMP: { HDR(uint32_t); vkmin_timestamp(c, (int)rec); break; }
         case OP_PICK: { HDR(rec_pick); const uint32_t got = vkmin_pick(c, (vkmin_image){rec.image}, rec.x, rec.y);
             VKMIN_ASSERT(got == rec.result, "replay diverged at record %u: pick read %u, recorded %u", records, got, rec.result); break; }
