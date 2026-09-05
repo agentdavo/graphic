@@ -81,6 +81,14 @@ struct vkr {
     vkmin_ctx *gpu;
     vkr_desc desc;
 
+    vkmin_image water_target, history[2], bloom_target[2];
+    uint32_t water_tex, history_tex[2], bloom_tex[2];
+    vkmin_pipeline sky, scatter, water, taa, bloom, quad_masked;
+    vkmin_buffer outside_instances, outside_quads;
+    mat4 previous_vp;
+    uint32_t history_next, previous_index;
+    int previous_width, previous_height;
+    bool history_valid;
     vkmin_image hdr, depth, atlas, font, id, normal, ramp;
     uint32_t hdr_tex, atlas_shadow_tex, atlas_raw_tex, font_tex, depth_tex, normal_tex, ramp_tex;
 
@@ -193,7 +201,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->skin_vertices = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (desc->max_skin_vertices ? desc->max_skin_vertices : 1) * sizeof(SkinVertex), .label = "vkr.skin"});
     r->meshes = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = desc->max_meshes * sizeof(Mesh), .label = "vkr.meshes"});
     r->materials = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = desc->max_materials * sizeof(Material), .label = "vkr.materials"});
-    r->draw_cmds = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_MAX_VIEWS * 2 * VKMIN_MAX_DRAWS * sizeof(DrawCmd), .label = "vkr.draw_cmds"});
+    r->draw_cmds = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_MAX_VIEWS * 2 * desc->max_instances * sizeof(DrawCmd), .label = "vkr.draw_cmds"});
     r->draw_counts = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), .label = "vkr.draw_counts"});
     r->cluster_lights = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_CLUSTER_COUNT * VKMIN_CLUSTER_STRIDE * sizeof(uint32_t), .label = "vkr.cluster_lights"});
 
@@ -245,6 +253,39 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
                                                                  .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.world"});
     r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_screen_frag_spv), .push_size = push,
                                                                   .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.screen"});
+    if (desc->outdoor) {
+        r->outside_instances = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = desc->max_instances*sizeof(Instance), .label = "outside.instances"});
+        r->outside_quads = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = desc->max_instances*sizeof(Quad), .label = "outside.impostors"});
+        r->water_target = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height,
+            .format = VKMIN_FMT_RGBA16_FLOAT, .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_SAMPLED, .label = "outside.water"});
+        r->water_tex = vkmin_index(gpu, r->water_target);
+        for (int k = 0; k < 2; ++k) {
+            r->history[k] = vkmin_make_image(gpu, &(vkmin_image_desc){.width = desc->width, .height = desc->height,
+                .format = VKMIN_FMT_RGBA16_FLOAT, .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_SAMPLED,
+                .sampler = VKMIN_SAMPLER_LINEAR_CLAMP, .label = "outside.history"});
+            r->history_tex[k] = vkmin_index(gpu, r->history[k]);
+            r->bloom_target[k] = vkmin_make_image(gpu, &(vkmin_image_desc){.width = (desc->width+1)/2, .height = (desc->height+1)/2,
+                .format = VKMIN_FMT_R11G11B10_FLOAT, .usage = VKMIN_IMAGE_COLOR | VKMIN_IMAGE_SAMPLED,
+                .sampler = VKMIN_SAMPLER_LINEAR_CLAMP, .label = "outside.bloom"});
+            r->bloom_tex[k] = vkmin_index(gpu, r->bloom_target[k]);
+        }
+        r->scatter = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(scatter_comp_spv), .push_size = push, .label = "outside.scatter"});
+        vkmin_pipeline_desc full = {.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(sky_frag_spv), .push_size = push,
+            .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2, .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
+            .cull = VKMIN_CULL_NONE, .depth = true, .depth_compare = VKMIN_CMP_ALWAYS, .label = "outside.sky"};
+        r->sky = vkmin_make_pipeline(gpu, &full);
+        full.depth = false; full.extra_colors = 0; full.color_format = VKMIN_FMT_RGBA16_FLOAT;
+        full.fs = VKMIN_BYTES(water_frag_spv); full.label = "outside.water";
+        r->water = vkmin_make_pipeline(gpu, &full);
+        full.fs = VKMIN_BYTES(taa_frag_spv); full.label = "outside.taa";
+        r->taa = vkmin_make_pipeline(gpu, &full);
+        full.fs = VKMIN_BYTES(bloom_frag_spv); full.label = "outside.bloom"; full.color_format = VKMIN_FMT_R11G11B10_FLOAT;
+        r->bloom = vkmin_make_pipeline(gpu, &full);
+        r->quad_masked = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv),
+            .push_size = push, .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
+            .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
+            .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_NONE, .label = "outside.impostors.batcher"});
+    }
     for (int i = 0; i < VKR_FRAMES; ++i) {
         r->check_cpu[i] = calloc(2u * desc->max_instances + 2u, sizeof(DrawCmd));
         VKR_ASSERT(r->check_cpu[i] != NULL, "out of memory");
@@ -579,15 +620,15 @@ static int by_first_instance(const void *a, const void *b) {
 /* Ordering-stable comparison of a GPU-written draw list with the CPU one:
  * the compact cull emits in whatever order the atomics decide, so both are
  * sorted by instance first. Returns the count of entries that differ. */
-static uint32_t compare_draw_lists(const DrawCmd *gpu, const uint32_t *gpu_counts, DrawCmd *cpu, uint32_t cpu_count) {
+static uint32_t compare_draw_lists(const DrawCmd *gpu, const uint32_t *gpu_counts, DrawCmd *cpu, uint32_t cpu_count, uint32_t capacity) {
     DrawCmd sorted[VKMIN_MAX_DRAWS];
     uint32_t live = 0;
     /* Two lists (culled, double-sided), each `count` long; entries past the
      * count are stale from earlier frames. The stable mode counts every
      * instance and leaves the culled ones with instance_count 0. */
     for (uint32_t list = 0; list < 2; ++list) {
-        for (uint32_t i = 0; i < gpu_counts[list] && i < VKMIN_MAX_DRAWS && live < VKMIN_MAX_DRAWS; ++i) {
-            const DrawCmd *d = &gpu[list * VKMIN_MAX_DRAWS + i];
+        for (uint32_t i = 0; i < gpu_counts[list] && i < capacity && live < VKMIN_MAX_DRAWS; ++i) {
+            const DrawCmd *d = &gpu[list * capacity + i];
             if (d->instance_count) sorted[live++] = *d;
         }
     }
@@ -629,7 +670,7 @@ vkr_stats vkr_finish(vkr *r) {
     vkmin_wait(r->gpu);
     for (uint32_t slot = 0; slot < VKR_FRAMES; ++slot) {
         if (r->check_valid[slot] && r->counts_valid[slot]) {
-            r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot]);
+            r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
             r->check_valid[slot] = false;
         }
     }
@@ -646,10 +687,10 @@ static void draw_lists(vkr *r, uint32_t view, vkmin_pipeline culled, vkmin_pipel
         vkmin_indirect_desc d = {.indices = r->indices};
         if (gpu_cull) {
             d.cmds = r->draw_cmds;
-            d.cmd_offset = (size_t)(view * 2 + list) * VKMIN_MAX_DRAWS * sizeof(DrawCmd);
+            d.cmd_offset = (size_t)(view * 2 + list) * r->desc.max_instances * sizeof(DrawCmd);
             d.counts = r->draw_counts;
             d.count_offset = (size_t)(view * 2 + list) * sizeof(uint32_t);
-            d.max_draws = VKMIN_MAX_DRAWS;
+            d.max_draws = r->desc.max_instances;
         } else {
             d.host_cmds = host_cmds[view * 2 + list];
             d.host_count = host_counts[view * 2 + list];
@@ -663,7 +704,41 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     VKR_ASSERT(f->instance_count <= r->desc.max_instances, "too many instances (%u > %u)", f->instance_count, r->desc.max_instances);
     VKR_ASSERT(f->light_count <= VKMIN_MAX_LIGHTS, "too many lights");
     vkmin_ctx *gpu = r->gpu;
-    const settings s = read_settings();
+    settings s = read_settings();
+    const bool outside = f->outdoor != NULL;
+    VKR_ASSERT(!outside || r->desc.outdoor, "outdoor resources were not requested at init");
+    VKR_ASSERT(f->scatter_count == 0 || (outside && f->scatter && s.gpu_cull && !s.check_cull),
+               "scatter requires outdoor, GPU culling and d_check_cull=0");
+    VKR_ASSERT(f->scatter_count <= 16, "at most 16 scatter layers");
+    if (outside) {
+        s.compact = false; /* fixed draw order for alpha-tested vegetation */
+        const Outdoor *o = f->outdoor;
+        VKR_ASSERT(o->terrain.z > 0 && o->terrain.w > 0 && o->height.y > 0 && o->height.w >= 0 &&
+                   o->weather.w > 0 && o->water.y > 0 && isfinite(o->terrain.x+o->terrain.y+o->terrain.z+o->terrain.w+
+                   o->height.x+o->height.y+o->height.z+o->height.w+o->weather.x+o->weather.y+o->weather.z+o->weather.w+
+                   o->water.x+o->water.y+o->water.z+o->water.w), "invalid outdoor extents/weather/water");
+    }
+    const bool use_taa = outside && cvar_get_bool(CV_taa);
+    const float bloom_strength = outside ? cvar_get(CV_bloom) : 0;
+    uint32_t total_instances = f->instance_count, impostors = 0;
+    Scatter scatter[16] = {0};
+    for (uint32_t k = 0; k < f->scatter_count; ++k) {
+        scatter[k] = f->scatter[k];
+        Scatter *a = &scatter[k];
+        const uint64_t cells = (uint64_t)a->grid.x*a->grid.y;
+        const bool tree = a->foliage.w > 0;
+        VKR_ASSERT(cells <= r->desc.max_instances && cells*(tree ? 2u : 1u)+total_instances <= r->desc.max_instances,
+                   "scatter exceeds instance capacity");
+        VKR_ASSERT(a->data.x < r->mesh_count && a->data.y < r->material_count && a->origin_cell.w > 0 &&
+                   isfinite(a->origin_cell.x+a->origin_cell.z+a->origin_cell.w+a->scale.x+a->scale.y+a->scale.z+a->scale.w) &&
+                   a->scale.x > 0 && a->scale.y >= a->scale.x && a->scale.z >= 0 && a->scale.w > 0 &&
+                   (a->grid.z & ~(VKMIN_INST_GRASS | VKMIN_INST_LEAF)) == 0,
+                   "invalid scatter mesh/material/scale");
+        VKR_ASSERT(!tree || (a->foliage.x < r->mesh_count && a->foliage.y < r->material_count), "invalid foliage mesh/material");
+        a->grid.w = total_instances;
+        total_instances += (uint32_t)cells*(tree ? 2u : 1u);
+        if (tree) impostors += (uint32_t)cells;
+    }
     /* The caller has begun the frame; stats from the frame that last used this
      * slot are complete now. */
     const vkmin_stats gs = vkmin_stats_get(gpu);
@@ -683,7 +758,8 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const uint32_t slot = f->frame.slot;
     VKR_ASSERT(slot < VKR_FRAMES, "vkr_frame: frame slot %u", slot);
     for (int i = 0; i + 1 < gs.timestamps && i < 8; ++i) r->stats.pass_ms[i] = gs.gpu_ms[i + 1] - gs.gpu_ms[i];
-    if (gs.timestamps == VKR_TIMESTAMPS) r->stats.frame_ms = gs.gpu_ms[VKR_TIMESTAMPS - 1] - gs.gpu_ms[0];
+    if (outside && gs.timestamps >= 19) for (int k = 0; k < 5; ++k) r->stats.outside_ms[k] = gs.gpu_ms[10+k*2]-gs.gpu_ms[9+k*2];
+    if (gs.timestamps >= VKR_TIMESTAMPS) r->stats.frame_ms = gs.gpu_ms[VKR_TIMESTAMPS - 1] - gs.gpu_ms[0];
     if (r->counts_valid[slot]) {
         r->stats.draws_camera = r->counts_host[slot][0] + r->counts_host[slot][1];
         r->stats.draws_shadow = 0;
@@ -692,7 +768,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         }
     }
     if (r->check_valid[slot] && r->counts_valid[slot]) {
-        r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot]);
+        r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
         r->check_valid[slot] = false;
     }
     r->stats.device_used = gs.device_used;
@@ -715,6 +791,26 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     mat4 *bones = vkmin_ring_alloc(gpu, (f->bone_count ? f->bone_count : 1) * sizeof(mat4), &bones_addr);
     if (f->bone_count) memcpy(bones, f->bones, f->bone_count * sizeof(mat4));
     Frame *frame = vkmin_ring_alloc(gpu, sizeof(Frame), &frame_addr);
+    mat4 projection = f->proj;
+    if (use_taa) {
+        const vec2 jitter = vkmin_taa_jitter(f->frame.index);
+        projection.m[8] += jitter.x*2.0f/(float)rw;
+        projection.m[9] += jitter.y*2.0f/(float)rh;
+        views[0].view_proj = vkmin_mat4_mul(projection, f->view);
+    }
+    uint64_t outdoor_addr = 0, scatter_addr = 0;
+    if (outside) {
+        Outdoor *o = vkmin_ring_alloc(gpu, sizeof(Outdoor), &outdoor_addr);
+        *o = *f->outdoor;
+        o->previous_vp = r->previous_vp;
+        const bool contiguous = r->history_valid && r->previous_index+1u == f->frame.index &&
+                                r->previous_width == rw && r->previous_height == rh;
+        o->targets = (uvec4){r->hdr_tex, r->history_tex[1u-r->history_next], contiguous && use_taa, 0};
+        if (f->scatter_count) {
+            void *data = vkmin_ring_alloc(gpu, f->scatter_count*sizeof(Scatter), &scatter_addr);
+            memcpy(data, scatter, f->scatter_count*sizeof(Scatter));
+        }
+    }
 
     /* Quads: the game's, then the overlay text, split into the world list
      * (drawn in the HDR pass, depth tested) and the screen list (after post).
@@ -745,9 +841,9 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const float log_ratio = logf(cluster_far / f->near);
     *frame = (Frame){
         .view = f->view,
-        .proj = f->proj,
-        .view_proj = vkmin_mat4_mul(f->proj, f->view),
-        .inv_view_proj = vkmin_mat4_inverse(vkmin_mat4_mul(f->proj, f->view)),
+        .proj = projection,
+        .view_proj = vkmin_mat4_mul(projection, f->view),
+        .inv_view_proj = vkmin_mat4_inverse(vkmin_mat4_mul(projection, f->view)),
         .camera_pos = {f->camera_pos.x, f->camera_pos.y, f->camera_pos.z, (float)f->frame.index},
         .cascade_splits = vs.cascade_splits,
         .cluster_params = {(float)VKMIN_CLUSTER_Z / log_ratio, -(float)VKMIN_CLUSTER_Z * logf(f->near) / log_ratio, f->near, cluster_far},
@@ -762,20 +858,22 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
                  (s.clustered ? VKMIN_FRAME_CLUSTERED : 0u),
         .frame_index = f->frame.index,
         .sun_light = sun_index,
-        .instance_count = f->instance_count,
+        .instance_count = total_instances,
         .shadow_atlas_tex = r->atlas_shadow_tex,
         .vertices = vkmin_address(gpu, r->vertices),
         .skin_vertices = vkmin_address(gpu, r->skin_vertices),
         .meshes = vkmin_address(gpu, r->meshes),
         .materials = vkmin_address(gpu, r->materials),
-        .instances = inst_addr,
+        .instances = outside ? vkmin_address(gpu,r->outside_instances) : inst_addr,
         .lights = lights_addr,
         .views = views_addr,
         .bones = bones_addr,
         .draw_cmds = vkmin_address(gpu, r->draw_cmds),
         .draw_counts = vkmin_address(gpu, r->draw_counts),
         .cluster_lights = vkmin_address(gpu, r->cluster_lights),
-        .quads = quads_addr,
+        .quads = outside ? vkmin_address(gpu,r->outside_quads) : quads_addr,
+        .outdoor = outdoor_addr,
+        .draw_capacity = r->desc.max_instances,
         .cel = {look->rim_strength, look->rim_power, look->spec_step, 0.0f},
         .shadow_tint = {tint_set ? look->shadow_tint[0] : 0.5f, tint_set ? look->shadow_tint[1] : 0.5f, tint_set ? look->shadow_tint[2] : 0.5f, 0.0f},
         .fog = {look->fog[0], look->fog[1], look->fog[2], look->fog_density},
@@ -813,7 +911,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         uint32_t n = cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu, r->host_meshes, 0);
         n += cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu + n, r->host_meshes, 1);
         r->check_cpu_count[slot] = n;
-        r->check_gpu[slot] = vkmin_ring_alloc(gpu, 2u * VKMIN_MAX_DRAWS * sizeof(DrawCmd), &check_addr);
+        r->check_gpu[slot] = vkmin_ring_alloc(gpu, 2u * r->desc.max_instances * sizeof(DrawCmd), &check_addr);
     }
     r->check_valid[slot] = s.check_cull && s.gpu_cull;
     uint64_t counts_addr = 0;
@@ -825,17 +923,33 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* --- 1. cull ---------------------------------------------------------- */
     vkmin_timestamp(gpu, 0);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.frame_start = true});
-    vkmin_fill_buffer(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), s.compact ? 0u : f->instance_count);
+    if (outside) {
+        vkmin_timestamp(gpu,9);
+        if (f->instance_count) {
+            const Push copy = {.frame = frame_addr, .aux = inst_addr, .view = VKMIN_NONE, .param3 = f->instance_count};
+            vkmin_dispatch(gpu,r->scatter,&copy,(f->instance_count+63u)/64u,1,1);
+        }
+        uint32_t quad_base = 0;
+        for (uint32_t k = 0; k < f->scatter_count; ++k) {
+            const uint32_t cells = scatter[k].grid.x*scatter[k].grid.y;
+            const Push push = {.frame = frame_addr, .aux = scatter_addr, .view = k, .param = quad_base};
+            if (cells) vkmin_dispatch(gpu,r->scatter,&push,(cells+63u)/64u,1,1);
+            if (scatter[k].foliage.w) quad_base += cells;
+        }
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){.compute_to_compute = true});
+        vkmin_timestamp(gpu,10);
+    }
+    vkmin_fill_buffer(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), s.compact ? 0u : total_instances);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.transfer_to_compute = true});
-    if (s.gpu_cull && f->instance_count) {
+    if (s.gpu_cull && total_instances) {
         Push push = base_push;
         push.param = s.compact ? 1u : 0u;
-        vkmin_dispatch(gpu, r->cull, &push, (f->instance_count + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
+        vkmin_dispatch(gpu, r->cull, &push, (total_instances + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
     }
     vkmin_timestamp(gpu, 1);
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.compute_to_indirect_draw = true, .compute_to_transfer = true});
     vkmin_copy_to_ring(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), counts_addr);
-    if (check_addr) vkmin_copy_to_ring(gpu, r->draw_cmds, 0, 2u * VKMIN_MAX_DRAWS * sizeof(DrawCmd), check_addr);
+    if (check_addr) vkmin_copy_to_ring(gpu, r->draw_cmds, 0, 2u * r->desc.max_instances * sizeof(DrawCmd), check_addr);
 
     /* --- 2. shadow atlas -------------------------------------------------- */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.depth = r->atlas, .clear_depth = true, .label = "shadows"});
@@ -870,9 +984,26 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
      * The id and normal targets clear to zero with it. */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = r->hdr, .extra = {r->id, r->normal}, .depth = r->depth, .clear_color = true,
                                              .clear = {0.30f * 2.5f, 0.50f * 2.5f, 0.95f * 2.5f, 1.0f}, .w = rw, .h = rh, .label = "forward"});
+    if (outside) {
+        vkmin_timestamp(gpu,13);
+        vkmin_draw(gpu,r->sky,&base_push,3,1);
+        vkmin_timestamp(gpu,14);
+    }
+    Push opaque_push = base_push;
+    if (outside) opaque_push.param2 = 1;
     const bool overdraw = s.debug == VKMIN_DEBUG_OVERDRAW;
-    draw_lists(r, 0, overdraw ? r->fwd_blend : r->fwd_cull, overdraw ? r->fwd_blend : r->fwd_nocull, &base_push,
+    draw_lists(r, 0, overdraw ? r->fwd_blend : r->fwd_cull, overdraw ? r->fwd_blend : r->fwd_nocull, &opaque_push,
                s.gpu_cull, host_cmds, host_counts);
+    if (outside) {
+        vkmin_timestamp(gpu,11);
+        Push grass_push = base_push; grass_push.param2 = 2;
+        draw_lists(r,0,r->fwd_cull,r->fwd_nocull,&grass_push,s.gpu_cull,host_cmds,host_counts);
+        vkmin_timestamp(gpu,12);
+        if (impostors) {
+            Push q = base_push; q.aux = frame->quads;
+            vkmin_draw(gpu,r->quad_masked,&q,impostors*6,1);
+        }
+    }
     vkmin_timestamp(gpu, 5);
     if (transparent_count) {
         vkmin_draw_indirect(gpu, r->fwd_blend, &base_push,
@@ -891,10 +1022,55 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const vkmin_transition to_post[] = {{r->hdr, VKMIN_USE_SAMPLED}, {r->normal, VKMIN_USE_SAMPLED},
                                         {r->depth, VKMIN_USE_SAMPLED}, {r->id, VKMIN_USE_TRANSFER_SRC}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_post, .image_count = 4});
+    uint32_t post_tex = r->hdr_tex;
+    if (outside) {
+        vkmin_timestamp(gpu,15);
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color = r->water_target, .w = rw, .h = rh, .label = "water"});
+        vkmin_draw(gpu,r->water,&base_push,3,1);
+        vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,16);
+        const vkmin_transition water_ready = {r->water_target,VKMIN_USE_SAMPLED};
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images = &water_ready, .image_count = 1});
+        post_tex = r->water_tex;
+        vkmin_timestamp(gpu,17);
+        if (use_taa) {
+            /* An uninitialized history is never sampled. Transitioning it is
+             * still necessary for descriptor-layout validation on first use. */
+            const vkmin_transition history_ready = {r->history[1u-r->history_next],VKMIN_USE_SAMPLED};
+            vkmin_barrier(gpu,&(vkmin_barrier_desc){.images = &history_ready, .image_count = 1});
+            vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color = r->history[r->history_next], .w = rw, .h = rh, .label = "TAA"});
+            Push temporal = base_push; temporal.param = post_tex;
+            vkmin_draw(gpu,r->taa,&temporal,3,1);
+            vkmin_pass_end(gpu);
+            const vkmin_transition resolved = {r->history[r->history_next],VKMIN_USE_SAMPLED};
+            vkmin_barrier(gpu,&(vkmin_barrier_desc){.images = &resolved, .image_count = 1});
+            post_tex = r->history_tex[r->history_next];
+            r->history_next = 1u-r->history_next;
+        }
+        r->history_valid = use_taa;
+        r->previous_vp = frame->view_proj; r->previous_index = f->frame.index;
+        r->previous_width = rw; r->previous_height = rh;
+        vkmin_timestamp(gpu,18);
+        if (bloom_strength > 0) {
+            uint32_t source = post_tex;
+            for (uint32_t k = 0; k < 3; ++k) {
+                const uint32_t target = k%2;
+                vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color = r->bloom_target[target], .label = "bloom"});
+                Push blur = base_push; blur.param = source; blur.param2 = k;
+                memcpy(&blur.param3,&bloom_strength,sizeof bloom_strength);
+                vkmin_draw(gpu,r->bloom,&blur,3,1);
+                vkmin_pass_end(gpu);
+                const vkmin_transition ready = {r->bloom_target[target],VKMIN_USE_SAMPLED};
+                vkmin_barrier(gpu,&(vkmin_barrier_desc){.images = &ready, .image_count = 1});
+                source = r->bloom_tex[target];
+            }
+        }
+    }
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .depth = vkmin_default_depth(gpu),
                                              .clear_color = true, .label = "post"});
     Push tm = base_push;
-    tm.param = r->hdr_tex;
+    tm.param = post_tex;
+    if (bloom_strength > 0) tm.aux = (uint64_t)r->bloom_tex[0]+1u;
     /* Debug views are diagnostic colours, not radiance: pass them through. */
     tm.param2 = s.debug != 0 ? 0u : (uint32_t)s.tonemap;
     tm.param3 = r->atlas_raw_tex;

@@ -10,3 +10,4 @@
 #include "lib/cel.glsl"
 #include "lib/fog.glsl"
 #include "lib/outputs.glsl"
+#include "lib/outdoor.glsl"

@@ -1,3 +1,29 @@
+# vkmin v0.5 — outside
+
+The valley demo combines terrain LOD, GPU scatter, grass patches, foliage and
+impostors, shared wind, an analytic sky, atmospheric perspective, river water,
+bloom and deterministic temporal AA. Original artwork is baked offline into
+images and one scene file. The camera travels downstream for two minutes.
+
+```sh
+make
+./build/ex_20_valley
+./build/ex_20_valley --profile=lavapipe --frame 2400 --out shallows.png
+./build/ex_20_valley --headless --frame 48 --timings --out meadow.png
+./build/ex_20_valley --headless --frame 120 +taa 0 --out isolated.png
+```
+
+TAA-enabled `--frame N` evaluates frames 0 through N and prints the warm-up
+notice. `+taa 0` restores isolated evaluation. Golden images use journal replay.
+The lavapipe profile uses 320×180, 1/50 grass density, one terrain level, a
+1000-metre far plane and no bloom or TAA. `+r_grass_patch 0` selects the simpler
+single-blade reference; the normal path groups 48 blades per scatter instance.
+
+See the [v0.5 report](docs/v0.5-outside.md) for measured performance, visual
+comparisons, release checks, reuse candidates and remaining limitations.
+
+## Previous release
+
 # vkmin v0.4 — a Doom 3-class world in a small C11 codebase, and five games on it
 
 **Current verification:** the isolated v0.4 Windows/lavapipe build for `main` completed 80

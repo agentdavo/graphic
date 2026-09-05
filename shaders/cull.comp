@@ -26,6 +26,7 @@ void main() {
     for (int p = 0; p < 6; ++p) {
         if (dot(view.planes[p].xyz, inst.bounds.xyz) + view.planes[p].w < -inst.bounds.w) visible = false;
     }
+    if (v == 0u && (inst.flags & VKMIN_INST_TREE) != 0u && uintBitsToFloat(inst.pad1) >= 1.0) visible = false;
     uint list = (mat.flags & VKMIN_MAT_DOUBLE_SIDED) != 0u ? 1u : 0u;
 
     DrawCmdRef cmds = DrawCmdRef(frame.draw_cmds);
@@ -40,14 +41,14 @@ void main() {
     if (push.param != 0u) {
         if (!visible) return;
         uint slot = atomicAdd(counts.n[v * 2u + list], 1u);
-        cmds.d[(v * 2u + list) * VKMIN_MAX_DRAWS + slot] = cmd;
+        cmds.d[(v * 2u + list) * frame.draw_capacity + slot] = cmd;
     } else {
         // Write both lists every time so no stale command survives from a
         // previous frame: the instance's own list gets the command, the other
         // list gets it with instance_count 0.
         DrawCmd none = cmd;
         none.instance_count = 0u;
-        cmds.d[(v * 2u + list) * VKMIN_MAX_DRAWS + i] = cmd;
-        cmds.d[(v * 2u + (1u - list)) * VKMIN_MAX_DRAWS + i] = none;
+        cmds.d[(v * 2u + list) * frame.draw_capacity + i] = cmd;
+        cmds.d[(v * 2u + (1u - list)) * frame.draw_capacity + i] = none;
     }
 }

@@ -1,3 +1,4 @@
+#include "lib/outdoor.glsl"
 // scene_vertex.glsl -- the one vertex fetch, shared by the depth-only and
 // forward vertex shaders. Pulls the packed vertex by device address, applies
 // skinning when the instance says so, and returns world-space attributes.
@@ -31,6 +32,14 @@ FetchedVertex fetch_vertex(Frame frame, Instance inst, uint vertex_index) {
     }
     FetchedVertex out_v;
     out_v.world_pos = (model * vec4(pos, 1.0)).xyz;
+    if (frame.outdoor != uint64_t(0) && (inst.flags & (VKMIN_INST_GRASS | VKMIN_INST_LEAF)) != 0u) {
+        Outdoor o = OutdoorRef(frame.outdoor).o;
+        vec3 root = inst.transform[3].xyz;
+        float weight = (inst.flags & VKMIN_INST_GRASS) != 0u ? clamp(pos.y,0.0,1.0) : clamp(pos.y/9.0,0.0,1.0)*0.3;
+        vec3 weatherPosition = root + vec3(float(inst.pad0 & 255u)*0.1,0,0);
+        out_v.world_pos += wind(weatherPosition,frame.frame_index)*weight*weight*o.weather.y;
+        if ((inst.flags & VKMIN_INST_GRASS) != 0u) out_v.world_pos = mix(root,out_v.world_pos,grass_fade(frame,root));
+    }
     mat3 nm = mat3(model); // no non-uniform scale in this codebase's assets
     out_v.normal = normalize(nm * nrm);
     out_v.tangent = vec4(normalize(nm * tan.xyz), tan.w);

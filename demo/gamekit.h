@@ -268,9 +268,15 @@ static inline gk_options gk_parse(int argc, char **argv, const char *help_text) 
         const char *a = argv[i];
         const bool next = i + 1 < argc;
         if (!strcmp(a, "--headless") || !strcmp(a, "--frame") || !strcmp(a, "--frames") || !strcmp(a, "--replay")) o.headless = true;
+        else if (!strncmp(a, "--profile=", 10)) o.profile = a + 10;
         else if (!strcmp(a, "--profile") && next) o.profile = argv[++i];
         else if (!strcmp(a, "--device") && next) o.device = atoi(argv[++i]);
         else if (!strcmp(a, "--help")) { fprintf(stderr, "%s", help_text); exit(0); }
+        else if (a[0] == '+' && next) {
+            char joined[256];
+            snprintf(joined,sizeof joined,"%s=%s",a+1,argv[++i]);
+            if (!cvar_parse_assignment(joined)) exit(2);
+        }
         else if (a[0] != '-' && strchr(a, '=')) { if (!cvar_parse_assignment(a)) exit(2); }
     }
     if (o.profile) {

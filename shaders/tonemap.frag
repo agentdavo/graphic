@@ -68,6 +68,7 @@ void main() {
         return;
     }
     vec3 hdr = texture(TEX(push.param), uv).rgb * frame.ambient.w;
+    if (push.aux != uint64_t(0)) hdr += texture(TEX(uint(push.aux)-1u),uv).rgb*frame.ambient.w;
     hdr *= 1.0 - outline(frame, uv);
     vec3 ldr = push.param2 == 1u ? aces(hdr) : push.param2 == 2u ? hdr / (1.0 + hdr) : clamp(hdr, 0.0, 1.0);
     ldr = lut(frame, ldr);

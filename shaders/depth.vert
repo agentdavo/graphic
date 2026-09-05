@@ -5,6 +5,7 @@
 #include "scene_vertex.glsl"
 layout(location = 0) out vec2 v_uv;
 layout(location = 1) flat out uint v_material;
+layout(location = 2) flat out uint v_instance;
 
 void main() {
     Frame frame = FrameRef(push.frame).frame;
@@ -14,4 +15,5 @@ void main() {
     gl_Position = view.view_proj * vec4(v.world_pos, 1.0);
     v_uv = v.uv;
     v_material = inst.material;
+    v_instance = uint(gl_InstanceIndex);
 }

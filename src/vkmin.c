@@ -222,6 +222,7 @@ struct vkmin_ctx {
     VkBuffer arena_buf;
     VkDeviceAddress arena_addr;
     arena img_arena;
+    bool host_sampled_layout, host_transfer_src_layout;
     VkBuffer ring_buf;
     VkDeviceMemory ring_mem;
     VkDeviceAddress ring_addr;
@@ -891,7 +892,7 @@ static void create_memory(vkmin_ctx *c) {
 
     /* Images get their own arena; the memory type is whatever a depth image
      * and a colour image both accept, checked again at every bind. */
-    const VkImageCreateInfo probe_info = {
+    VkImageCreateInfo probe_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = VK_FORMAT_R8G8B8A8_UNORM,
@@ -903,13 +904,41 @@ static void create_memory(vkmin_ctx *c) {
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
-    VkImage probe = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateImage(c->dev, &probe_info, NULL, &probe));
-    VkMemoryRequirements probe_req;
-    vkGetImageMemoryRequirements(c->dev, probe, &probe_req);
-    vkDestroyImage(c->dev, probe, NULL);
-    arena_create(c, &c->img_arena, buf_cap, probe_req.memoryTypeBits,
+    uint32_t image_types = UINT32_MAX;
+    /* HOST_TRANSFER may change memoryTypeBits (identicalMemoryTypeRequirements
+     * is not guaranteed). Intersect actual colour, depth and upload usages. */
+    for (uint32_t kind = 0; kind < (c->path == VKMIN_PATH_MODERN ? 3u : 2u); ++kind) {
+        probe_info.format = kind == 1 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        probe_info.usage = kind == 1 ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            (kind == 2 ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u);
+        VkImage probe = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateImage(c->dev, &probe_info, NULL, &probe));
+        VkMemoryRequirements probe_req;
+        vkGetImageMemoryRequirements(c->dev, probe, &probe_req);
+        image_types &= probe_req.memoryTypeBits;
+        vkDestroyImage(c->dev, probe, NULL);
+    }
+    arena_create(c, &c->img_arena, buf_cap, image_types,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, "vkmin.image_arena");
+
+    if (c->path == VKMIN_PATH_MODERN) {
+        VkPhysicalDeviceHostImageCopyPropertiesEXT host = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host};
+        vkGetPhysicalDeviceProperties2(c->phys, &props);
+        VkImageLayout *src = calloc(host.copySrcLayoutCount, sizeof *src);
+        VkImageLayout *dst = calloc(host.copyDstLayoutCount, sizeof *dst);
+        VKMIN_ASSERT(src && dst, "out of memory querying host copy layouts");
+        host.pCopySrcLayouts = src; host.pCopyDstLayouts = dst;
+        vkGetPhysicalDeviceProperties2(c->phys, &props);
+        bool reads = false, writes = false;
+        for (uint32_t k = 0; k < host.copySrcLayoutCount; ++k) reads |= src[k] == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        for (uint32_t k = 0; k < host.copyDstLayoutCount; ++k) writes |= dst[k] == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        c->host_sampled_layout = reads && writes && cvar_get_bool(CV_r_host_layouts);
+        for (uint32_t k = 0; k < host.copySrcLayoutCount; ++k) c->host_transfer_src_layout |= src[k] == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        c->host_transfer_src_layout &= cvar_get_bool(CV_r_host_layouts);
+        free(src); free(dst);
+    }
 
     /* The host ring: staging at init, per-frame data thereafter. Split into
      * one region per frame in flight so a frame never overwrites data the
@@ -1497,6 +1526,12 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         c->desc.height = (int)dh.height;
     }
     c->frame_last = -1;
+    if (c->desc.history && c->frame_count) {
+        for (int i = 0; i < c->frame_count; ++i)
+            VKMIN_ASSERT(c->frame_list[i] >= 0 && (i == 0 || c->frame_list[i] > c->frame_list[i-1]),
+                         "history frame list must be nonnegative and strictly increasing");
+        fprintf(stderr, "vkmin: history enabled; simulating preceding frames from 0 for requested captures (+taa 0 restores isolation)\n");
+    }
     for (int i = 0; i < c->frame_count; ++i) c->frame_last = c->frame_list[i] > c->frame_last ? c->frame_list[i] : c->frame_last;
     if (c->desc.headless && c->frame_count == 0 && !c->replaying && !c->demo_in) { c->frame_count = 1; c->frame_list[0] = 0; }
     VKMIN_ASSERT(c->desc.width > 0 && c->desc.height > 0, "vkmin_init: width and height must be > 0");
@@ -1839,11 +1874,31 @@ static void legacy_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
 /* --- end legacy-only ------------------------------------------------------ */
 
 /* --- modern-only: host image copy straight into the image ---------------- */
+/* Host copy guarantees GENERAL, not SHADER_READ_ONLY. Devices with only
+ * GENERAL use a GPU layout barrier at upload time; pixels still copy on host. */
+static void modern_layout_transition(vkmin_ctx *c, const VkHostImageLayoutTransitionInfoEXT *t, bool host) {
+    if (host) {
+        VK_CHECK(c->fp_transition_image_layout(c->dev, 1, t));
+        return;
+    }
+    const VkImageMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .oldLayout = t->oldLayout, .newLayout = t->newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = t->image, .subresourceRange = t->subresourceRange};
+    const VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier};
+    vkCmdPipelineBarrier2(imm_begin(c), &dependency);
+    imm_end(c);
+}
 static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint32_t mw, uint32_t mh,
                                 const void *data, size_t bytes) {
     (void)bytes;
     upload_prepare(c);
-    /* Layout transitions happen on the host too: no command buffer anywhere. */
+    /* Host transitions when supported; otherwise an upload-time GPU barrier. */
     const VkHostImageLayoutTransitionInfoEXT to_general = {
         .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
         .image = s->img,
@@ -1851,7 +1906,7 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
         .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
     };
-    VK_CHECK(c->fp_transition_image_layout(c->dev, 1, &to_general));
+    modern_layout_transition(c, &to_general, c->host_sampled_layout || to_general.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
     const VkMemoryToImageCopyEXT region = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
         .pHostPointer = data,
@@ -1873,7 +1928,7 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
         .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
     };
-    VK_CHECK(c->fp_transition_image_layout(c->dev, 1, &to_sampled));
+    modern_layout_transition(c, &to_sampled, c->host_sampled_layout);
     s->use = VKMIN_USE_SAMPLED;
 }
 /* --- end modern-only ------------------------------------------------------ */
@@ -2292,7 +2347,7 @@ bool vkmin_running(vkmin_ctx *c) {
         c->input = dr.input;
     } else if (c->desc.headless) {
         if (c->frame_cursor >= c->frame_count) return false;
-        c->frame_index = (uint32_t)c->frame_list[c->frame_cursor];
+        c->frame_index = c->desc.history ? c->frames_rendered : (uint32_t)c->frame_list[c->frame_cursor];
     } else {
         plat_poll();
         if (plat_should_close()) return false;
@@ -2411,7 +2466,7 @@ void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc) {
     {
         const rec_barrier rb = {.flags = (desc->compute_to_indirect_draw ? 1u : 0u) | (desc->compute_to_fragment ? 2u : 0u) |
                                          (desc->transfer_to_compute ? 4u : 0u) | (desc->frame_start ? 8u : 0u) |
-                                         (desc->compute_to_transfer ? 16u : 0u),
+                                         (desc->compute_to_transfer ? 16u : 0u) | (desc->compute_to_compute ? 32u : 0u),
                                 .image_count = (uint32_t)desc->image_count};
         RECORD(c, OP_BARRIER, rb, desc->images, sizeof(vkmin_transition) * (size_t)desc->image_count);
     }
@@ -2450,9 +2505,16 @@ void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc) {
          * so an execution dependency with no source access mask. */
         mem.srcStageMask |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
                             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+                            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         mem.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
         mem.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+    if (desc->compute_to_compute) {
+        mem.srcStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mem.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     }
     if (desc->compute_to_transfer) {
         mem.srcStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -2944,6 +3006,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
         return;
     }
     if (c->desc.headless) {
+        if (c->desc.history && rendered_index != (uint32_t)c->frame_list[c->frame_cursor]) { RECORD_LEAVE(c); return; }
         c->frame_cursor++;
         last = c->frame_cursor >= c->frame_count;
     } else {
@@ -3098,7 +3161,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             JCHECK(rec.image_count <= VKMIN_MAX_IMAGES && (uint64_t)rec.image_count * sizeof(vkmin_transition) == rh.data_bytes, "invalid barrier payload");
             vkmin_barrier(c, &(vkmin_barrier_desc){.images = (const vkmin_transition *)(void *)data, .image_count = (int)rec.image_count,
                 .compute_to_indirect_draw = rec.flags & 1u, .compute_to_fragment = rec.flags & 2u, .transfer_to_compute = rec.flags & 4u,
-                .frame_start = rec.flags & 8u, .compute_to_transfer = rec.flags & 16u}); break; }
+                .frame_start = rec.flags & 8u, .compute_to_transfer = rec.flags & 16u, .compute_to_compute = rec.flags & 32u}); break; }
         case OP_FILL: { HDR(rec_indirect); vkmin_fill_buffer(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, rec.max_draws); break; }
         case OP_COPY_TO_RING: { HDR(rec_indirect);
             JCHECK(rh.data_bytes == 8, "invalid copy payload");
@@ -3156,6 +3219,19 @@ static bool legacy_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t byt
 /* --- end legacy-only ------------------------------------------------------ */
 
 /* --- modern-only: host image copy, no command, no staging ---------------- */
+static void modern_read_image(vkmin_ctx *c, VkImage image, const VkImageToMemoryCopyEXT *region) {
+    VkHostImageLayoutTransitionInfoEXT transition = {
+        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT, .image = image,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1}};
+    if (!c->host_transfer_src_layout) modern_layout_transition(c, &transition, false);
+    const VkCopyImageToMemoryInfoEXT info = {.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT,
+        .srcImage = image, .srcImageLayout = c->host_transfer_src_layout ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+        .regionCount = 1, .pRegions = region};
+    VK_CHECK(c->fp_copy_image_to_memory(c->dev, &info));
+    transition.oldLayout = VK_IMAGE_LAYOUT_GENERAL; transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    if (!c->host_transfer_src_layout) modern_layout_transition(c, &transition, false);
+}
 static bool modern_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t bytes) {
     (void)bytes;
     VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
@@ -3167,14 +3243,7 @@ static bool modern_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t byt
         .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
         .imageExtent = {c->extent.width, c->extent.height, 1},
     };
-    const VkCopyImageToMemoryInfoEXT info = {
-        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT,
-        .srcImage = c->offscreen_img,
-        .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .regionCount = 1,
-        .pRegions = &region,
-    };
-    VK_CHECK(c->fp_copy_image_to_memory(c->dev, &info));
+    modern_read_image(c, c->offscreen_img, &region);
     return true;
 }
 /* --- end modern-only ------------------------------------------------------ */
@@ -3209,9 +3278,7 @@ uint32_t vkmin_pick(vkmin_ctx *c, vkmin_image img, int x, int y) {
             /* --- modern-only: host image copy of one texel ----------------- */
             const VkImageToMemoryCopyEXT region = {.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT, .pHostPointer = &result,
                                                    .imageSubresource = layers, .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
-            const VkCopyImageToMemoryInfoEXT info = {.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT, .srcImage = s->img,
-                                                     .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .regionCount = 1, .pRegions = &region};
-            VK_CHECK(c->fp_copy_image_to_memory(c->dev, &info));
+            modern_read_image(c, s->img, &region);
             /* --- end modern-only ------------------------------------------- */
         }
     }
@@ -3312,4 +3379,136 @@ bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     free(rgba);
     if (!ok) fprintf(stderr, "vkmin: failed to write '%s'\n", path);
     return ok;
+}
+/* Four levels, fixed fanout, no allocator. The normal/flow calculation uses
+ * one-sided differences at edges: a tilted plane stays tilted at the border. */
+static vec4 terrain_derivative(const vkmin_heightfield_desc *d, uint32_t x, uint32_t z) {
+    const uint32_t w = (uint32_t)d->width, h = (uint32_t)d->height;
+    const uint32_t xl = x ? x-1 : x, xr = x+1 < w ? x+1 : x;
+    const uint32_t zl = z ? z-1 : z, zr = z+1 < h ? z+1 : z;
+    const float cell = d->cell > 0 ? d->cell : 1;
+    const float dx = (d->heights[z*w+xr] - d->heights[z*w+xl]) / ((float)(xr-xl)*cell);
+    const float dz = (d->heights[zr*w+x] - d->heights[zl*w+x]) / ((float)(zr-zl)*cell);
+    VKMIN_ASSERT(isfinite(dx) && isfinite(dz) && isfinite(d->heights[z*w+x]), "terrain: non-finite height or derivative");
+    return (vec4){dx, 0, dz, hypotf(dx, dz)};
+}
+
+void vkmin_terrain_normal(const vkmin_heightfield_desc *d, vec4 *out, size_t capacity) {
+    const vkmin_heightfield_size size = vkmin_heightfield_sizes(d);
+    VKMIN_ASSERT(out && capacity >= size.vertices, "terrain normal: output too small");
+    for (uint32_t z = 0; z < (uint32_t)d->height; ++z) for (uint32_t x = 0; x < (uint32_t)d->width; ++x) {
+        const vec4 a = terrain_derivative(d, x, z);
+        const float inv = 1.0f / hypotf(a.w, 1.0f);
+        out[z*(uint32_t)d->width+x] = (vec4){-a.x*inv, inv, -a.z*inv, 0};
+    }
+}
+
+void vkmin_terrain_flow(const vkmin_heightfield_desc *d, vec4 *out, size_t capacity) {
+    const vkmin_heightfield_size size = vkmin_heightfield_sizes(d);
+    VKMIN_ASSERT(out && capacity >= size.vertices, "terrain flow: output too small");
+    for (uint32_t z = 0; z < (uint32_t)d->height; ++z) for (uint32_t x = 0; x < (uint32_t)d->width; ++x) {
+        const vec4 a = terrain_derivative(d, x, z);
+        const float inv = a.w > 0 ? 1.0f/a.w : 0;
+        out[z*(uint32_t)d->width+x] = (vec4){-a.x*inv, 0, -a.z*inv, a.w};
+    }
+}
+
+vkmin_heightfield_size vkmin_terrain_sizes(const vkmin_terrain_desc *d) {
+    VKMIN_ASSERT(d, "terrain: null desc");
+    (void)vkmin_heightfield_sizes(&d->heightfield);
+    const uint64_t n = d->heightfield.chunk ? (uint32_t)d->heightfield.chunk : 32u;
+    VKMIN_ASSERT(d->heightfield.width == d->heightfield.height && (uint64_t)d->heightfield.width == 8*n+1 &&
+                 isfinite(d->skirt) && d->skirt >= 0, "terrain: expected square 8*chunk+1 samples and nonnegative skirt");
+    const uint64_t vn = 85*((n+1)*(n+1)+4*(n+1)), in = 85*(6*n*n+24*n);
+    VKMIN_ASSERT(vn <= UINT32_MAX && in <= UINT32_MAX && vn <= SIZE_MAX/sizeof(Vertex) && in <= SIZE_MAX/sizeof(uint32_t),
+                 "terrain: output overflow");
+    return (vkmin_heightfield_size){(uint32_t)vn, (uint32_t)in, 85};
+}
+
+void vkmin_terrain(const vkmin_terrain_desc *d, Vertex *v, uint32_t *idx, Mesh *mesh) {
+    const vkmin_heightfield_size size = vkmin_terrain_sizes(d);
+    VKMIN_ASSERT(v && idx && mesh, "terrain: null output");
+    const vkmin_heightfield_desc *h = &d->heightfield;
+    const uint32_t n = h->chunk ? (uint32_t)h->chunk : 32u, row = n+1;
+    const uint32_t per = row*row+4*row, w = (uint32_t)h->width;
+    const float cell = h->cell > 0 ? h->cell : 1, skirt = d->skirt > 0 ? d->skirt : cell*8;
+    uint32_t ox[85] = {0}, oz[85] = {0}, step[85] = {8}, at = 0;
+    for (uint32_t m = 0; m < 85; ++m) {
+        if (m) {
+            const uint32_t parent = (m-1)/4, corner = (m-1)%4;
+            step[m] = step[parent]/2;
+            ox[m] = ox[parent] + (corner&1u)*n*step[m];
+            oz[m] = oz[parent] + (corner>>1u)*n*step[m];
+        }
+        const uint32_t base = m*per, first = at;
+        float lo = INFINITY, hi = -INFINITY;
+        for (uint32_t z = oz[m]; z <= oz[m]+n*step[m]; ++z) for (uint32_t x = ox[m]; x <= ox[m]+n*step[m]; ++x) {
+            VKMIN_ASSERT(isfinite(h->heights[z*w+x]), "terrain: non-finite height");
+            lo = fminf(lo, h->heights[z*w+x]); hi = fmaxf(hi, h->heights[z*w+x]);
+        }
+        for (uint32_t z = 0; z <= n; ++z) for (uint32_t x = 0; x <= n; ++x) {
+            const uint32_t sx = ox[m]+x*step[m], sz = oz[m]+z*step[m];
+            const vec4 a = terrain_derivative(h, sx, sz);
+            v[base+z*row+x] = (Vertex){.px = (float)sx*cell, .py = h->heights[sz*w+sx], .pz = (float)sz*cell,
+                .normal = oct_encode(-a.x, 1, -a.z), .tangent = pack_tangent(1, a.x, 0, 1),
+                .uv = pack_half2((float)sx*cell, (float)sz*cell)};
+            if (x < n && z < n) {
+                const uint32_t a0 = base+z*row+x, q[6] = {a0, a0+row, a0+1, a0+1, a0+row, a0+row+1};
+                for (uint32_t k = 0; k < 6; ++k) idx[at++] = q[k];
+            }
+        }
+        /* Edge order follows the surface boundary; skirts face outward. */
+        for (uint32_t edge = 0; edge < 4; ++edge) for (uint32_t k = 0; k <= n; ++k) {
+            const uint32_t top = edge == 0 ? k : edge == 1 ? k*row+n : edge == 2 ? n*row+n-k : (n-k)*row;
+            const uint32_t bottom = base+row*row+edge*row+k;
+            v[bottom] = v[base+top]; v[bottom].py -= skirt;
+            if (k < n) {
+                const uint32_t next = edge == 0 ? top+1 : edge == 1 ? top+row : edge == 2 ? top-1 : top-row;
+                const uint32_t q[6] = {base+top, base+next, bottom, bottom, base+next, bottom+1};
+                for (uint32_t j = 0; j < 6; ++j) idx[at++] = q[j];
+            }
+        }
+        lo -= skirt;
+        VKMIN_ASSERT(isfinite(lo) && isfinite(hi-lo), "terrain: height/skirt range overflow");
+        const float half = (float)(n*step[m])*cell*0.5f, ey = (hi-lo)*0.5f;
+        VKMIN_ASSERT(isfinite(half) && isfinite((float)(w-1)*cell), "terrain: extent overflow");
+        mesh[m] = (Mesh){.first_index = first, .index_count = at-first, .skin_offset = VKMIN_NONE,
+            .bounds = {(float)ox[m]*cell+half, lo+ey, (float)oz[m]*cell+half, hypotf(hypotf(half,half),ey)}};
+    }
+    VKMIN_ASSERT(at == size.indices, "terrain: internal index count");
+}
+
+uint32_t vkmin_terrain_select(const Mesh *nodes, vec4 camera, float lod_scale, bool one_level, uint32_t *out, size_t capacity) {
+    VKMIN_ASSERT(nodes && out && capacity >= 64 && isfinite(lod_scale) && lod_scale >= 0 &&
+                 isfinite(camera.x) && isfinite(camera.y) && isfinite(camera.z), "terrain select: invalid argument");
+    if (one_level) { for (uint32_t i = 0; i < 64; ++i) out[i] = 21+i; return 64; }
+    uint32_t stack[85] = {0}, todo = 1, count = 0;
+    const float scale = lod_scale > 0 ? lod_scale : 2;
+    while (todo) {
+        const uint32_t m = stack[--todo];
+        const vec4 b = nodes[m].bounds;
+        const float dist = hypotf(hypotf(camera.x-b.x, camera.z-b.z), camera.y-b.y);
+        if (m < 21 && dist < b.w*scale) {
+            for (uint32_t k = 4; k > 0; --k) stack[todo++] = 4*m+k;
+        } else out[count++] = m;
+    }
+    return count;
+}
+
+vec4 vkmin_sun_direction(float time_of_day) {
+    VKMIN_ASSERT(isfinite(time_of_day), "sun: non-finite time of day");
+    const float angle = (fmodf(time_of_day,24.0f)-6.0f)/12.0f*3.14159265359f;
+    const float inv = 1.0f/sqrtf(1.09f);
+    return (vec4){cosf(angle)*inv,sinf(angle)*inv,0.3f*inv,0};
+}
+
+vec2 vkmin_taa_jitter(uint32_t frame) {
+    float jitter[2] = {0};
+    for (uint32_t dim = 0; dim < 2; ++dim) {
+        uint32_t index = frame%16u+1u;
+        const uint32_t radix = dim == 0 ? 2u : 3u;
+        float digit = 1;
+        while (index) { digit /= (float)radix; jitter[dim] += digit*(float)(index%radix); index /= radix; }
+    }
+    return (vec2){jitter[0]-0.5f,jitter[1]-0.5f};
 }

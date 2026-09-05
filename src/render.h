@@ -12,6 +12,34 @@
  * There is no scene graph, no entity, no physics: a game is arrays in, one
  * call, pixels out, and the ID target answers "what is under the mouse".
  *
+ * Outside (v0.5, opt in with vkr_desc.outdoor): scatter -> existing cull,
+ * shadows/prepass -> analytic sky -> opaque -> grass -> impostor batcher ->
+ * water composite -> TAA -> bloom -> existing tonemap/overlay. Outdoor and
+ * Scatter are plain shared.h descriptors. Indirect storage is sized to the
+ * caller's max_instances, up to 16384; at most 16 scatter layers. Scatter
+ * requires r_gpu_cull=1 and d_check_cull=0 (there is no CPU scatter list).
+ * Terrain nodes remain ordinary instances. A tree cell reserves two instance
+ * slots and one quad; its leaf part shares the trunk's hash/scale/rotation.
+ * Mipmapped alpha textures are the caller's; the valley demonstrates coverage
+ * preservation at upload. Tree impostors crossfade over 50..60% of the layer's
+ * distance limit, and the mesh continues casting shadows in that interval.
+ *
+ * Pure reusable primitives: terrain/flow/scatter/grass/foliage/wind/sky/water
+ * can serve 10_shooter and 11_rts; bloom/TAA can serve those or 14_anime.
+ * These are integration candidates, not claims that those games use them yet.
+ * No core feature is valley-only. Its camera route, morning schedule and
+ * authored assets are demo features labelled in examples/20_valley.c.
+ *
+ * Set vkmin_desc.history when enabling cvar taa BEFORE vkmin_init, so frame
+ * selection warms from zero. TAA reprojects camera motion, rejects depth
+ * disocclusions, and clamps a 3x3 neighbourhood. It has no animated-object
+ * velocity target: rapid foliage motion can still ghost. Exposure is fixed.
+ * Water intersects a flat bounded plane analytically in a fullscreen shader;
+ * it samples completed colour/depth, never the attachment it is writing.
+ * Reflection is analytic sky. The noted parallel alternative is rendering
+ * the actual scene with a mirrored camera into a planar reflection target;
+ * that implementation (trees visible in water) is not included in v0.5.
+ *
  * The caller owns the frame: vkr_frame records between the caller's
  * vkmin_frame_begin(ctx, NULL) and vkmin_frame_end(ctx).
  */
@@ -28,6 +56,7 @@ typedef struct {
     size_t max_vertices, max_indices, max_skin_vertices;
     uint32_t max_meshes, max_materials, max_instances;
     vkmin_bytes fs;            /* game's SPIR-V composed from shaders/lib; empty = canonical PBR */
+    bool outdoor;             /* create sky, scatter, water, bloom and temporal resources */
     const char *fs_path;       /* optional compiled shader path for hot reload */
 } vkr_desc;
 
@@ -63,11 +92,14 @@ typedef struct {
     const Quad *quads; uint32_t quad_count;  /* sprites, particles, billboards, UI; drawn in order */
     const char *overlay_text;  /* '\n'-separated lines drawn at the top left, may be NULL */
     vkr_look look;
+    const Outdoor *outdoor;    /* required with scatter; sky/water/material parameters */
+    const Scatter *scatter; uint32_t scatter_count; /* regenerated on GPU every frame */
     vkmin_frame frame;         /* what vkmin_frame_begin returned: index, slot, size */
 } vkr_frame_desc;
 
 typedef struct {
     double pass_ms[8];         /* cull, shadows, prepass, clusters, opaque, transparent, tonemap, overlay */
+    double outside_ms[5];     /* scatter, grass, sky, water, TAA (separate timestamp pairs) */
     double frame_ms;
     uint32_t draws_camera;     /* visible instances in the camera view, one frame late */
     uint32_t draws_shadow;     /* visible instances summed over shadow views */

@@ -13,6 +13,10 @@
 #include <stdbool.h>
 
 #define VKMIN_CVAR_LIST(X)                                                           \
+    X(r_host_layouts, 1.0f, "1 supported host image transitions, 0 GPU transition reference") \
+    X(r_grass_patch, 1.0f, "valley grass: 1 48-blade patches, 0 single-blade reference") \
+    X(taa, 0.0f, "temporal AA; --frame N warms up 0..N when enabled")                \
+    X(bloom, 0.0f, "HDR bloom strength; fixed exposure via r_exposure")                 \
     X(r_width, 1280.0f, "render width in pixels (headless or window)")               \
     X(r_height, 720.0f, "render height in pixels")                                   \
     X(r_exposure, 1.0f, "tonemap exposure multiplier")                               \

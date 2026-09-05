@@ -9,6 +9,8 @@ layout(location = 1) out vec4 v_color;
 layout(location = 2) flat out uint v_texture;
 layout(location = 3) flat out uint v_flags;
 layout(location = 4) out float v_softness;
+layout(location = 5) out vec3 v_world;
+layout(location = 6) flat out float v_coverage;
 
 void main() {
     Frame frame = FrameRef(push.frame).frame;
@@ -16,6 +18,7 @@ void main() {
     uint corner = uint(gl_VertexIndex) % 6u;
     // 0,1,2 then 2,1,3 over the corners (0,0) (1,0) (0,1) (1,1)
     uint c = corner < 3u ? corner : (corner == 3u ? 2u : corner == 4u ? 1u : 3u);
+    v_world = q.pos.xyz; v_coverage = q.uv1.w > 0.0 ? q.uv1.w : 1.0;
     vec2 t = vec2(float(c & 1u), float(c >> 1u));
     vec2 local = (t - 0.5) * q.size_uv0.xy;                 // centred, +y up in world, +y down on screen
     float cs = cos(q.pos.w), sn = sin(q.pos.w);

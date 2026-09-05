@@ -14,6 +14,10 @@
  * frame index. Replay equality requires the same inputs, assets and settings
  * on a compatible implementation; floating-point pixels are not portable
  * across arbitrary drivers.
+ * History effects are the exception to isolated evaluation: when enabled,
+ * --frame N renders 0..N and prints that warm-up is taking place. +taa 0
+ * restores isolated frames. Golden images must come from journal replay;
+ * the journal includes every preceding frame, including temporal history.
  *
  * Every function carries a state contract in its trailing comment:
  *   pure        reads only its arguments
@@ -27,13 +31,13 @@
  */
 #ifndef VKMIN_H
 #define VKMIN_H
-#include "shared.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
+#include "shared.h"
 
 /* ---- compile-time configuration; every value has a default ------------- */
 #ifndef VKMIN_MAX_BUFFERS
@@ -106,6 +110,7 @@ typedef struct {
     int device_index;             /* physical device; also --device N */
     size_t device_arena_bytes;    /* 0 = 256 MB */
     size_t host_ring_bytes;       /* 0 = 64 MB */
+    bool history;                /* render preceding frames for --frame/--frames; set before init */
 } vkmin_desc;
 
 typedef struct {
@@ -169,6 +174,7 @@ typedef struct { vkmin_image image; vkmin_use use; } vkmin_transition;
 typedef struct {                  /* one batched barrier at a pass boundary */
     const vkmin_transition *images; int image_count;
     bool compute_to_indirect_draw, compute_to_fragment, transfer_to_compute, frame_start, compute_to_transfer;
+    bool compute_to_compute;      /* scatter instance writes -> cull reads */
 } vkmin_barrier_desc;
 
 typedef struct {                  /* an indexed indirect draw; set exactly one of cmds / host_cmds */
@@ -241,6 +247,27 @@ uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one tex
 vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *);            // pure
 /* Output arrays must hold the counts from sizes(); zero scale/chunk selects defaults. */
 void vkmin_heightfield(const vkmin_heightfield_desc *, Vertex *, uint32_t *, Mesh *);      // writes outputs
+
+/* Outdoor primitives. No allocation, clock or hidden state. Maps are world
+ * normals (xyz) and downhill unit directions (xz, w = slope); flats return
+ * zero flow. Output capacity is width*height vec4s; source is never modified. */
+void vkmin_terrain_normal(const vkmin_heightfield_desc *, vec4 *out, size_t capacity); // writes outputs
+void vkmin_terrain_flow(const vkmin_heightfield_desc *, vec4 *out, size_t capacity);   // writes outputs
+/* Four-level square quadtree, breadth-first: root, 4 children, 16, 64.
+ * width == height == 8*chunk+1; each node has chunk*chunk cells and skirts.
+ * Geometry is world space. All arrays use terrain_sizes counts. */
+typedef struct { vkmin_heightfield_desc heightfield; float skirt; } vkmin_terrain_desc;
+vkmin_heightfield_size vkmin_terrain_sizes(const vkmin_terrain_desc *); // pure
+void vkmin_terrain(const vkmin_terrain_desc *, Vertex *, uint32_t *, Mesh *); // writes outputs
+/* Writes a disjoint covering of the quadtree as mesh indices, capacity >=64.
+ * lod_scale is distance / chunk width (default 2); one_level selects all 64 finest nodes. */
+uint32_t vkmin_terrain_select(const Mesh *nodes, vec4 camera, float lod_scale, bool one_level,
+                             uint32_t *out, size_t capacity); // writes outputs
+
+/* Unit sun direction, +Y up: hours since midnight, sunrise 6, sunset 18.
+ * The orbital approximation is fixed; a game's latitude model can replace it. */
+vec4 vkmin_sun_direction(float time_of_day); // pure
+vec2 vkmin_taa_jitter(uint32_t frame);       // pure; centred 16-sample Halton(2,3), in pixels
 
 /* ---- recording: in order, into one command buffer, no reordering --------- */
 void vkmin_barrier(vkmin_ctx *, const vkmin_barrier_desc *);                 // gpu

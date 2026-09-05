@@ -290,5 +290,7 @@ else
     [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" 2>/dev/null
 fi
 
+. ./tests/outside.sh
+
 printf '\n%d checks, %d failures\n' "$checks" "$failures"
 [ "$failures" -eq 0 ]

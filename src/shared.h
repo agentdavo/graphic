@@ -39,7 +39,7 @@ typedef struct { float m[16]; } mat4; /* column-major, as GLSL */
 #define VKMIN_MAX_TEXTURES 4096u   /* bindless array size */
 #define VKMIN_MAX_LIGHTS 256u
 #define VKMIN_MAX_VIEWS 40u        /* camera + shadow views culled per frame */
-#define VKMIN_MAX_DRAWS 4096u      /* indirect commands per view */
+#define VKMIN_MAX_DRAWS 16384u      /* indirect commands per view */
 #define VKMIN_CASCADES 4u
 
 #define VKMIN_CLUSTER_X 16u
@@ -67,6 +67,10 @@ typedef struct { float m[16]; } mat4; /* column-major, as GLSL */
 
 #define VKMIN_INST_SKINNED 1u
 #define VKMIN_INST_HIDDEN 2u
+#define VKMIN_INST_GRASS 4u
+#define VKMIN_INST_LEAF 8u
+#define VKMIN_INST_TREE 16u
+#define VKMIN_MAT_TERRAIN 16u
 
 #define VKMIN_LIGHT_DIRECTIONAL 0u
 #define VKMIN_LIGHT_POINT 1u
@@ -82,10 +86,12 @@ typedef struct { float m[16]; } mat4; /* column-major, as GLSL */
 #define VKMIN_DEBUG_SHADOW_ATLAS 6u /* tonemap shows the raw atlas */
 #define VKMIN_DEBUG_IDS 7u          /* instance id hashed to a colour: what vkmin_pick would return */
 
-/* Quad.flags: the batcher draws sprites, particles, billboards and UI alike. */
+/* Quad.flags: the batcher draws sprites, particles, billboards and UI alike.
+ * MASKED uses alpha cutoff .5; uv1.w is coverage (0 defaults to full). */
 #define VKMIN_QUAD_SCREEN 1u        /* pos.xy in pixels from the top left; drawn after tonemap */
 #define VKMIN_QUAD_BILLBOARD 2u     /* world space, faces the camera */
 #define VKMIN_QUAD_GROUND 4u        /* world space, lies in the XZ plane (default: XY, facing +Z) */
+#define VKMIN_QUAD_MASKED 16u
 #define VKMIN_QUAD_SDF 8u           /* texture is a signed distance field (text) */
 
 /* Frame.flags */
@@ -222,6 +228,31 @@ VKMIN_STRUCT(Frame) {
     U32 lut_tex;         /* 256x16 colour grading strip; 0 = identity */
     U32 normal_tex;      /* this frame's octahedral normal target */
     U32 depth_tex;       /* this frame's depth target */
+    ADDR outdoor;        /* 0 indoors; Outdoor descriptor otherwise */
+    U32 draw_capacity; U32 pad_outdoor;
+};
+
+/* Outdoor coordinates: map UV = (world.xz - terrain.xy) / terrain.zw.
+ * Heights in RG16 encoded as UNORM RG bytes, range height.xy. These plain
+ * descriptors are reusable by the RTS and shooter; none is valley-only. */
+VKMIN_STRUCT(Outdoor) {
+    vec4 terrain;
+    vec4 height;       /* min, range, water elevation, aerial density */
+    uvec4 maps;        /* height, splat, flow, cloud noise */
+    uvec4 albedo;      /* grass, dirt, rock, sand */
+    uvec4 normals;
+    uvec4 water_maps;  /* two normal maps; zw reserved */
+    vec4 weather;     /* cloud strength, wind strength, world UV scale, grass fade distance */
+    vec4 water;       /* absorption strength, foam width, flow speed, ripple scale */
+    mat4 previous_vp;  /* populated by renderer: last jittered camera */
+    uvec4 targets;    /* opaque colour, history colour+depth, history valid, reserved */
+};
+VKMIN_STRUCT(Scatter) {
+    vec4 origin_cell; /* xz origin, w cell spacing; snapped world cells, not camera-relative hashes */
+    vec4 scale;       /* min, max, density multiplier, maximum distance */
+    uvec4 data;       /* mesh, material, density map, seed */
+    uvec4 grid;       /* width, height, instance flags, output base (renderer) */
+    uvec4 foliage;    /* leaf mesh, leaf material, impostor atlas, horizontal atlas views; w=0 non-tree */
 };
 
 /* The one push constant block for every pipeline. */
@@ -259,7 +290,7 @@ VKMIN_STRUCT(ExPush) {
 VKMIN_STRUCT(Quad) {
     vec4 pos;           /* xyz world (or xy pixels for SCREEN); w rotation in radians */
     vec4 size_uv0;      /* xy size in world units or pixels; zw uv of the top-left corner */
-    vec4 uv1;           /* xy uv of the bottom-right corner; z SDF edge softness in texels (0 = 1); w unused */
+    vec4 uv1;           /* xy bottom-right UV; z SDF softness (0=1); w masked coverage (0=1) */
     U32 color;          /* rgba8, straight alpha */
     U32 texture;        /* bindless index; 0 is the renderer's white */
     U32 flags;          /* VKMIN_QUAD_* */
@@ -283,11 +314,13 @@ _Static_assert(sizeof(View) == 208 && offsetof(View, planes) == 64 &&
                    offsetof(View, atlas_rect) == 160 && offsetof(View, flags) == 192,
                "View");
 _Static_assert(sizeof(DrawCmd) == 20, "DrawCmd");
-_Static_assert(sizeof(Frame) == 576 && offsetof(Frame, camera_pos) == 256 &&
+_Static_assert(sizeof(Frame) == 592 && offsetof(Frame, camera_pos) == 256 &&
                    offsetof(Frame, sun) == 352 && offsetof(Frame, light_count) == 368 &&
                    offsetof(Frame, vertices) == 400 && offsetof(Frame, cluster_lights) == 480 &&
                    offsetof(Frame, cel) == 496 && offsetof(Frame, cel_ramp_tex) == 560,
                "Frame");
+_Static_assert(sizeof(Outdoor) == 208 && offsetof(Outdoor, previous_vp) == 128, "Outdoor");
+_Static_assert(sizeof(Scatter) == 80, "Scatter");
 _Static_assert(sizeof(Push) == 32 && offsetof(Push, view) == 16, "Push");
 _Static_assert(sizeof(Quad) == 64 && offsetof(Quad, color) == 48, "Quad");
 _Static_assert(sizeof(ExVertex) == 32, "ExVertex");

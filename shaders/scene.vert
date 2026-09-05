@@ -11,6 +11,12 @@ layout(location = 4) flat out uint v_instance;
 void main() {
     Frame frame = FrameRef(push.frame).frame;
     Instance inst = InstanceRef(frame.instances).i[gl_InstanceIndex];
+    bool grass = (inst.flags & VKMIN_INST_GRASS) != 0u;
+    bool skip = (push.param2 == 1u && grass) || (push.param2 == 2u && !grass);
+    if (skip) {
+        gl_Position = vec4(2,2,2,1); v_world_pos = vec3(0); v_normal = vec3(0,1,0);
+        v_tangent = vec4(1,0,0,1); v_uv = vec2(0); v_instance = uint(gl_InstanceIndex); return;
+    }
     FetchedVertex v = fetch_vertex(frame, inst, uint(gl_VertexIndex));
     gl_Position = frame.view_proj * vec4(v.world_pos, 1.0);
     v_world_pos = v.world_pos;

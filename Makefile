@@ -57,6 +57,10 @@ all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
 -include $(wildcard $(BUILD)/*.d)
 tools: $(BUILD)/imgdiff $(BUILD)/mktex $(BUILD)/mat4_test $(BUILD)/cook $(BUILD)/handles $(BUILD)/spirv_test $(BUILD)/layout.comp.spv $(BUILD)/lifecycle $(BUILD)/heightfield
 tools: $(BUILD)/reload $(BUILD)/reload.frag.spv $(BUILD)/journal
+tools: $(BUILD)/outside
+$(BUILD)/outside: tests/outside.c tests/process.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
 tools: $(BUILD)/play_test
 
 $(BUILD):

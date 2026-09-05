@@ -11,6 +11,10 @@
 #define VKMIN_GLSL
 #include "shared.h"
 
+layout(buffer_reference, scalar) readonly buffer OutdoorRef { Outdoor o; };
+layout(buffer_reference, scalar) readonly buffer ScatterRef { Scatter s[]; };
+layout(buffer_reference, scalar) buffer InstanceWrite { Instance i[]; };
+layout(buffer_reference, scalar) buffer QuadWrite { Quad q[]; };
 layout(buffer_reference, scalar) readonly buffer FrameRef { Frame frame; };
 layout(buffer_reference, scalar) readonly buffer VertexRef { Vertex v[]; };
 layout(buffer_reference, scalar) readonly buffer SkinVertexRef { SkinVertex v[]; };
