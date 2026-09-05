@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
+#include "vkmin.h"
+
 bool plat_window_open(int w, int h, const char *title);
 void plat_poll(void);
 bool plat_should_close(void);
@@ -23,6 +25,6 @@ const char **plat_required_instance_extensions(uint32_t *count);
 
 VkSurfaceKHR plat_create_surface(VkInstance instance);
 void plat_framebuffer_size(int *w, int *h);
-bool plat_key_hit(int key); /* true once per press */
+void plat_input(vkmin_inputs *out); /* fills down, mouse, axes, pad_buttons; the edges are vkmin's */
 
 #endif /* VKMIN_PLAT_H */

@@ -5,6 +5,8 @@
 #define VKMIN_MATH_H
 
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #include "shared.h" /* vec2, vec4, mat4: the same types the GPU sees */
 
@@ -180,6 +182,106 @@ static inline mat4 vkmin_mat4_inverse(mat4 a) {
     mat4 out;
     for (int i = 0; i < 16; ++i) out.m[i] = inv[i] / det;
     return out;
+}
+
+/* ---- cameras: pure functions returning a view/projection pair --------------
+ * There is no camera object and no camera state anywhere; a game keeps its
+ * own yaw, position or target and calls one of these every frame. */
+typedef struct { mat4 view, proj; vec3 pos; } vkmin_camera;
+
+static inline vec3 vkmin_vec3_lerp(vec3 a, vec3 b, float t) {
+    return (vec3){a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t};
+}
+
+/* First person: yaw about +Y (0 looks down -Z), pitch up positive, radians. */
+static inline vkmin_camera vkmin_camera_fps(vec3 pos, float yaw, float pitch, float fovy, float aspect, float znear, float zfar) {
+    const vec3 fwd = {-sinf(yaw) * cosf(pitch), sinf(pitch), -cosf(yaw) * cosf(pitch)};
+    return (vkmin_camera){.view = vkmin_mat4_look_at(pos, vkmin_vec3_add(pos, fwd), (vec3){0, 1, 0}),
+                          .proj = vkmin_mat4_perspective(fovy, aspect, znear, zfar), .pos = pos};
+}
+
+/* Strategy: orbits a ground target at a distance, tilted down by `tilt`
+ * radians from the horizon, rotated about +Y by `yaw`. */
+static inline vkmin_camera vkmin_camera_rts(vec3 target, float distance, float tilt, float yaw, float fovy, float aspect,
+                                            float znear, float zfar) {
+    const vec3 off = {sinf(yaw) * cosf(tilt) * distance, sinf(tilt) * distance, cosf(yaw) * cosf(tilt) * distance};
+    const vec3 pos = vkmin_vec3_add(target, off);
+    return (vkmin_camera){.view = vkmin_mat4_look_at(pos, target, (vec3){0, 1, 0}),
+                          .proj = vkmin_mat4_perspective(fovy, aspect, znear, zfar), .pos = pos};
+}
+
+/* Top down: orthographic, looking down -Y, screen-up is world -Z, `extent`
+ * is the half-height of the view in world units. */
+static inline vkmin_camera vkmin_camera_ortho_topdown(vec3 centre, float extent, float aspect, float height) {
+    const vec3 pos = {centre.x, centre.y + height, centre.z};
+    return (vkmin_camera){.view = vkmin_mat4_look_at(pos, centre, (vec3){0, 0, -1}),
+                          .proj = vkmin_mat4_ortho(-extent * aspect, extent * aspect, -extent, extent, 0.0f, 2.0f * height), .pos = pos};
+}
+
+/* Side on: orthographic in the XY plane, looking down -Z from `depth` away. */
+static inline vkmin_camera vkmin_camera_side(vec3 centre, float half_height, float aspect, float depth) {
+    const vec3 pos = {centre.x, centre.y, centre.z + depth};
+    return (vkmin_camera){.view = vkmin_mat4_look_at(pos, centre, (vec3){0, 1, 0}),
+                          .proj = vkmin_mat4_ortho(-half_height * aspect, half_height * aspect, -half_height, half_height, 0.0f, 2.0f * depth),
+                          .pos = pos};
+}
+
+/* ---- rays: coarse picking and collision without a physics opinion --------- */
+typedef struct { vec3 origin, dir; } vkmin_ray; /* dir normalised */
+
+/* The world-space ray through a pixel (top-left origin, +y down) of a w x h
+ * view. Works for perspective and orthographic projections alike. */
+static inline vkmin_ray vkmin_ray_from_pixel(mat4 view, mat4 proj, float px, float py, float w, float h) {
+    const mat4 inv = vkmin_mat4_inverse(vkmin_mat4_mul(proj, view));
+    const float nx = px / w * 2.0f - 1.0f, ny = py / h * 2.0f - 1.0f;
+    const vec3 a = vkmin_mat4_mul_point(inv, (vec3){nx, ny, 0.0f}); /* near plane (Vulkan depth 0) */
+    const vec3 b = vkmin_mat4_mul_point(inv, (vec3){nx, ny, 1.0f}); /* far plane */
+    return (vkmin_ray){.origin = a, .dir = vkmin_vec3_normalize(vkmin_vec3_sub(b, a))};
+}
+
+/* Slab test. Returns true with the entry distance in *t (0 when the origin
+ * is inside). */
+static inline bool vkmin_ray_aabb(vkmin_ray r, vec3 bmin, vec3 bmax, float *t) {
+    float t0 = 0.0f, t1 = INFINITY;
+    const float o[3] = {r.origin.x, r.origin.y, r.origin.z}, d[3] = {r.dir.x, r.dir.y, r.dir.z};
+    const float lo[3] = {bmin.x, bmin.y, bmin.z}, hi[3] = {bmax.x, bmax.y, bmax.z};
+    for (int k = 0; k < 3; ++k) {
+        const float inv = 1.0f / (d[k] == 0.0f ? 1e-30f : d[k]);
+        float ta = (lo[k] - o[k]) * inv, tb = (hi[k] - o[k]) * inv;
+        if (ta > tb) { const float tmp = ta; ta = tb; tb = tmp; }
+        t0 = ta > t0 ? ta : t0;
+        t1 = tb < t1 ? tb : t1;
+    }
+    *t = t0;
+    return t0 <= t1;
+}
+
+/* Moller-Trumbore, both faces. Returns true with the distance in *t. */
+static inline bool vkmin_ray_triangle(vkmin_ray r, vec3 a, vec3 b, vec3 c, float *t) {
+    const vec3 e1 = vkmin_vec3_sub(b, a), e2 = vkmin_vec3_sub(c, a);
+    const vec3 p = vkmin_vec3_cross(r.dir, e2);
+    const float det = vkmin_vec3_dot(e1, p);
+    if (det > -1e-8f && det < 1e-8f) return false;
+    const float inv = 1.0f / det;
+    const vec3 s = vkmin_vec3_sub(r.origin, a);
+    const float u = vkmin_vec3_dot(s, p) * inv;
+    if (u < 0.0f || u > 1.0f) return false;
+    const vec3 q = vkmin_vec3_cross(s, e1);
+    const float v = vkmin_vec3_dot(r.dir, q) * inv;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    *t = vkmin_vec3_dot(e2, q) * inv;
+    return *t >= 0.0f;
+}
+
+/* ---- fixed-step time ------------------------------------------------------
+ * Frames are nominally 60 Hz; simulation runs at `hz`. For frame N this is
+ * how many ticks have elapsed since frame 0 and how far into the next one
+ * the frame sits, for interpolation. Integer arithmetic: frame 3600 at 30 Hz
+ * is exactly 1800 ticks on every machine. */
+typedef struct { uint32_t ticks; float alpha; } vkmin_tick;
+static inline vkmin_tick vkmin_ticks_for_frame(uint32_t frame, uint32_t hz) {
+    const uint64_t scaled = (uint64_t)frame * hz;
+    return (vkmin_tick){.ticks = (uint32_t)(scaled / 60u), .alpha = (float)(scaled % 60u) / 60.0f};
 }
 
 #endif /* VKMIN_MATH_H */

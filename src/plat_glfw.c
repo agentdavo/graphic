@@ -10,7 +10,13 @@
 /* One window per process. A second one would need a handle in the API, and
  * nothing in this codebase wants a second one. */
 static GLFWwindow *g_window;
-static bool g_key_down[512];
+static double g_wheel; /* accumulated between polls */
+
+static void on_scroll(GLFWwindow *w, double dx, double dy) {
+    (void)w;
+    (void)dx;
+    g_wheel += dy;
+}
 
 bool plat_window_open(int w, int h, const char *title) {
     if (g_window) return false;
@@ -26,6 +32,7 @@ bool plat_window_open(int w, int h, const char *title) {
         glfwTerminate();
         return false;
     }
+    glfwSetScrollCallback(g_window, on_scroll);
     return true;
 }
 
@@ -65,10 +72,26 @@ void plat_framebuffer_size(int *w, int *h) {
     if (g_window) glfwGetFramebufferSize(g_window, w, h);
 }
 
-bool plat_key_hit(int key) {
-    if (!g_window || key < 0 || key >= (int)(sizeof g_key_down / sizeof g_key_down[0])) return false;
-    const bool down = glfwGetKey(g_window, key) == GLFW_PRESS;
-    const bool hit = down && !g_key_down[key];
-    g_key_down[key] = down;
-    return hit;
+void plat_input(vkmin_inputs *out) {
+    *out = (vkmin_inputs){0};
+    if (!g_window) return;
+    for (int key = 32; key < GLFW_KEY_LAST && key < (int)VKMIN_KEY_COUNT; ++key) {
+        if (glfwGetKey(g_window, key) == GLFW_PRESS) out->down[key / 32] |= 1u << (key % 32);
+    }
+    double mx = 0.0, my = 0.0;
+    glfwGetCursorPos(g_window, &mx, &my);
+    out->mouse_x = (float)mx;
+    out->mouse_y = (float)my;
+    out->wheel = (float)g_wheel;
+    g_wheel = 0.0;
+    for (int b = 0; b < 3; ++b) {
+        if (glfwGetMouseButton(g_window, b) == GLFW_PRESS) out->buttons |= 1u << b;
+    }
+    GLFWgamepadstate pad;
+    if (glfwJoystickIsGamepad(GLFW_JOYSTICK_1) && glfwGetGamepadState(GLFW_JOYSTICK_1, &pad)) {
+        for (int a = 0; a < 6; ++a) out->axes[a] = pad.axes[a];
+        for (int b = 0; b <= GLFW_GAMEPAD_BUTTON_LAST; ++b) {
+            if (pad.buttons[b] == GLFW_PRESS) out->pad_buttons |= 1u << b;
+        }
+    }
 }

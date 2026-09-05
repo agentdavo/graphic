@@ -63,13 +63,28 @@ typedef enum { VKMIN_USE_UNDEFINED = 0, VKMIN_USE_TRANSFER_DST, VKMIN_USE_TRANSF
 typedef enum { VKMIN_IMAGE_SAMPLED = 1, VKMIN_IMAGE_COLOR = 2, VKMIN_IMAGE_DEPTH = 4 } vkmin_image_usage;
 typedef enum { VKMIN_CMP_LESS = 0, VKMIN_CMP_LESS_EQUAL, VKMIN_CMP_EQUAL, VKMIN_CMP_ALWAYS } vkmin_compare;
 typedef enum { VKMIN_CULL_BACK = 0, VKMIN_CULL_NONE, VKMIN_CULL_FRONT } vkmin_cull;
-enum { VKMIN_KEY_ESCAPE = 256, VKMIN_KEY_F1 = 290, VKMIN_KEY_F12 = 301, VKMIN_KEY_SPACE = 32 };
+enum { VKMIN_KEY_SPACE = 32, VKMIN_KEY_ESCAPE = 256, VKMIN_KEY_ENTER, VKMIN_KEY_TAB, VKMIN_KEY_RIGHT = 262, VKMIN_KEY_LEFT,
+       VKMIN_KEY_DOWN, VKMIN_KEY_UP, VKMIN_KEY_F1 = 290, VKMIN_KEY_F12 = 301, VKMIN_KEY_SHIFT = 340, VKMIN_KEY_CTRL,
+       VKMIN_KEY_COUNT = 352 }; /* letters and digits are their ASCII uppercase; the codes are GLFW's */
+enum { VKMIN_MOUSE_LEFT = 1, VKMIN_MOUSE_RIGHT = 2, VKMIN_MOUSE_MIDDLE = 4 };
+
+typedef struct {                  /* one snapshot per frame: taken in vkmin_frame_begin, journalled, never polled */
+    uint32_t down[VKMIN_KEY_COUNT / 32], pressed[VKMIN_KEY_COUNT / 32];  /* bit per key: held / went down this frame */
+    float mouse_x, mouse_y;       /* pixels from the top left */
+    float wheel;                  /* scroll steps this frame */
+    uint32_t buttons, buttons_pressed;                    /* VKMIN_MOUSE_* bits */
+    float axes[6];                /* gamepad 0: left x y, right x y, triggers; -1..1 */
+    uint32_t pad_buttons;         /* gamepad 0 buttons, bit per GLFW_GAMEPAD_BUTTON_*; 0 when absent */
+} vkmin_inputs;
+#define vkmin_key_down(in, key) (((in)->down[(key) / 32] >> ((key) % 32)) & 1u)         /* pure */
+#define vkmin_key_pressed(in, key) (((in)->pressed[(key) / 32] >> ((key) % 32)) & 1u)   /* pure */
 
 typedef struct {
     int argc; char **argv;        /* command line: cvars as name=value or +name value, plus
                                    * --headless --frame N --frames a,b --out P --out-dir D --exit-after N
                                    * --size W H --path=legacy|modern --sync-naive --no-readback --device N
-                                   * --verbose --cvars --record FILE --replay FILE; unknown ones are the program's */
+                                   * --verbose --cvars --record FILE --replay FILE --demo FILE --play FILE;
+                                   * unknown ones are the program's */
     const char *title;            /* window title and PNG prefix; 0 = "vkmin" */
     int width, height;            /* 0 = cvars r_width x r_height */
     bool headless;                /* also set by --headless, --frame, --frames */
@@ -171,7 +186,8 @@ uint32_t vkmin_frame_slot(const vkmin_ctx *);    /* 0 or 1: which frame in fligh
 void vkmin_size(const vkmin_ctx *, int *w, int *h);                          // reads ctx
 float vkmin_aspect(const vkmin_ctx *);                                       // reads ctx
 void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame host memory */ // writes ctx
-bool vkmin_key_hit(const vkmin_ctx *, int key);  /* edge-triggered; false when headless */  // io
+const vkmin_inputs *vkmin_input(const vkmin_ctx *);  /* this frame's snapshot; zero headless */  // reads ctx
+bool vkmin_key_hit(const vkmin_ctx *, int key);  /* vkmin_key_pressed on the snapshot */         // reads ctx
 
 /* ---- resources -------------------------------------------------------------- */
 vkmin_buffer vkmin_make_buffer(vkmin_ctx *, const vkmin_buffer_desc *);      // writes ctx, gpu
@@ -213,7 +229,9 @@ void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, re
  * addresses inside pushed data are relocated by exact match against the
  * addresses vkmin issued, so a journal replays across runs and paths. */
 bool vkmin_replay(vkmin_ctx *, const char *path);                            // writes ctx, gpu, io
-
+/* A demo is the input half of a journal: --demo FILE writes each frame's
+ * index and vkmin_inputs; --play FILE feeds them back, one frame per record,
+ * so a deterministic game replays itself with no journal of GPU calls. */
 /* ---- output and introspection ----------------------------------------------- */
 bool vkmin_save_png(vkmin_ctx *, const char *path);  /* last completed frame */   // io
 vkmin_stats vkmin_stats_get(const vkmin_ctx *);                              // reads ctx

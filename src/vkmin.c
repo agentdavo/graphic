@@ -74,7 +74,7 @@ void plat_close(void) {}
 const char **plat_required_instance_extensions(uint32_t *n) { *n = 0; return NULL; }
 VkSurfaceKHR plat_create_surface(VkInstance i) { (void)i; return VK_NULL_HANDLE; }
 void plat_framebuffer_size(int *w, int *h) { *w = 0; *h = 0; }
-bool plat_key_hit(int k) { (void)k; return false; }
+void plat_input(vkmin_inputs *o) { *o = (vkmin_inputs){0}; }
 #endif
 
 /* ------------------------------------------------------------- the state -- */
@@ -200,6 +200,13 @@ struct vkmin_ctx {
     VkDeviceSize ring_issued[256];          /* ring offsets handed out this frame */
     int ring_issued_count;
     const char *record_path, *replay_path;
+
+    /* Input: one snapshot a frame, taken in frame_begin and read nowhere else.
+     * A demo file is the snapshots alone, without the GPU calls. */
+    vkmin_inputs input, prev_input;
+    FILE *demo_out, *demo_in;
+    const char *demo_path, *play_path;
+    int frame_last;              /* highest --frame asked for, or -1 */
 
     VkCommandBuffer imm_cmd;
     VkFence imm_fence;
@@ -356,7 +363,9 @@ typedef struct { uint64_t size; uint32_t result, has_data; char label[VKMIN_LABE
 typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; } rec_image;
 typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result; char label[VKMIN_LABEL]; } rec_pipe;
 typedef struct { uint32_t id, mip; uint64_t offset; } rec_upload;
-typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; } rec_frame;
+typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; vkmin_inputs input; } rec_frame;
+typedef struct { uint32_t magic, version, width, height; } demo_header;
+typedef struct { uint32_t frame_index; vkmin_inputs input; } demo_record;
 typedef struct { uint32_t color, depth, clear_color, clear_depth; float clear[4]; int32_t x, y, w, h; } rec_pass;
 typedef struct { uint32_t pipe, push_bytes, a, b, cnt; } rec_draw;
 typedef struct { uint32_t pipe, push_bytes, indices, cmds, counts, max_draws, host_count; uint64_t cmd_offset, count_offset, host_cmds; } rec_indirect;
@@ -1420,6 +1429,10 @@ static void parse_command_line(vkmin_ctx *c, int argc, char **argv) {
         } else if (!strcmp(a, "--replay") && next) {
             c->replay_path = argv[++i];
             c->desc.headless = true;
+        } else if (!strcmp(a, "--demo") && next) {
+            c->demo_path = argv[++i];
+        } else if (!strcmp(a, "--play") && next) {
+            c->play_path = argv[++i];
         } else if (!strcmp(a, "--verbose")) {
             c->verbose = true;
         } else if (!strcmp(a, "--cvars")) {
@@ -1456,7 +1469,17 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         c->rec_ring_base = jh.ring_base;
         c->replaying = true;
     }
-    if (c->desc.headless && c->frame_count == 0 && !c->replaying) { c->frame_count = 1; c->frame_list[0] = 0; }
+    if (c->play_path) { /* the demo was recorded at a size; mouse positions are in its pixels */
+        c->demo_in = fopen(c->play_path, "rb");
+        demo_header dh;
+        VKMIN_ASSERT(c->demo_in && fread(&dh, sizeof dh, 1, c->demo_in) == 1 && dh.magic == 0x444d4b56u && dh.version == 1,
+                     "cannot read demo '%s'", c->play_path);
+        c->desc.width = (int)dh.width;
+        c->desc.height = (int)dh.height;
+    }
+    c->frame_last = -1;
+    for (int i = 0; i < c->frame_count; ++i) c->frame_last = c->frame_list[i] > c->frame_last ? c->frame_list[i] : c->frame_last;
+    if (c->desc.headless && c->frame_count == 0 && !c->replaying && !c->demo_in) { c->frame_count = 1; c->frame_list[0] = 0; }
     VKMIN_ASSERT(c->desc.width > 0 && c->desc.height > 0, "vkmin_init: width and height must be > 0");
     if (c->verbose) cvar_print_all();
 #ifdef NDEBUG
@@ -1544,12 +1567,20 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         VKMIN_ASSERT(fwrite(&jh, sizeof jh, 1, c->rec) == 1, "journal write failed");
         fprintf(stderr, "vkmin: recording to %s\n", c->record_path);
     }
+    if (c->demo_path) {
+        c->demo_out = fopen(c->demo_path, "wb");
+        VKMIN_ASSERT(c->demo_out != NULL, "cannot write demo '%s'", c->demo_path);
+        const demo_header dh = {0x444d4b56u, 1, (uint32_t)desc->width, (uint32_t)desc->height};
+        VKMIN_ASSERT(fwrite(&dh, sizeof dh, 1, c->demo_out) == 1, "demo write failed");
+    }
     return c;
 }
 
 void vkmin_shutdown(vkmin_ctx *c) {
     if (!c) return;
     if (c->rec) fclose(c->rec);
+    if (c->demo_out) fclose(c->demo_out);
+    if (c->demo_in) fclose(c->demo_in);
     VK_CHECK(vkDeviceWaitIdle(c->dev));
     for (uint32_t i = 0; i < VKMIN_MAX_PIPES; ++i) {
         if (c->pipes[i].used) vkDestroyPipeline(c->dev, c->pipes[i].pipe, NULL);
@@ -1597,10 +1628,11 @@ void vkmin_size(const vkmin_ctx *c, int *w, int *h) {
     *h = (int)c->extent.height;
 }
 
+const vkmin_inputs *vkmin_input(const vkmin_ctx *c) { return &c->input; }
+
 bool vkmin_key_hit(const vkmin_ctx *c, int key) {
-    VKMIN_ASSERT(c != NULL, "vkmin_key_hit: null context");
-    if (c->desc.headless) return false;
-    return plat_key_hit(key);
+    VKMIN_ASSERT(c != NULL && key >= 0 && key < (int)VKMIN_KEY_COUNT, "vkmin_key_hit: bad argument");
+    return vkmin_key_pressed(&c->input, key) != 0u;
 }
 
 uint32_t vkmin_frame_slot(const vkmin_ctx *c) { return c->slot; }
@@ -2177,7 +2209,17 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
      * runs until the window closes or --exit-after is reached. A replay has
      * had its frame index set by the record being replayed. */
     if (c->replaying) {
-        /* nothing to decide: the journal decides */
+        /* nothing to decide: the journal decides, input included */
+    } else if (c->demo_in) {
+        demo_record dr;
+        if (fread(&dr, sizeof dr, 1, c->demo_in) != 1) return false;
+        if (c->frame_last >= 0 && (int)dr.frame_index > c->frame_last) return false;
+        if (!c->desc.headless) {
+            plat_poll();
+            if (plat_should_close()) return false;
+        }
+        c->frame_index = dr.frame_index;
+        c->input = dr.input;
     } else if (c->desc.headless) {
         if (c->frame_cursor >= c->frame_count) return false;
         c->frame_index = (uint32_t)c->frame_list[c->frame_cursor];
@@ -2186,12 +2228,26 @@ bool vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         if (plat_should_close()) return false;
         if (c->exit_after > 0 && (int)c->frames_rendered >= c->exit_after) return false;
     }
+    if (!c->replaying && !c->demo_in) {
+        /* The one place input is read. Edges are computed here so the
+         * snapshot, not the backend, is the whole truth of the frame. */
+        vkmin_inputs raw = {0};
+        if (!c->desc.headless) plat_input(&raw);
+        for (size_t k = 0; k < sizeof raw.down / sizeof raw.down[0]; ++k) raw.pressed[k] = raw.down[k] & ~c->prev_input.down[k];
+        raw.buttons_pressed = raw.buttons & ~c->prev_input.buttons;
+        c->prev_input = raw;
+        c->input = raw;
+    }
+    if (c->demo_out) {
+        const demo_record dr = {.frame_index = c->frame_index, .input = c->input};
+        VKMIN_ASSERT(fwrite(&dr, sizeof dr, 1, c->demo_out) == 1, "demo write failed");
+    }
     c->draws = 0;
     c->dispatches = 0;
     c->ring_issued_count = 0;
     if (cvar_get_bool(CV_r_hotreload)) hot_reload_check(c);
     {
-        rec_frame rf = {.frame_index = c->frame_index, .has_clear = clear != NULL};
+        rec_frame rf = {.frame_index = c->frame_index, .has_clear = clear != NULL, .input = c->input};
         if (clear) rf.clear = *clear;
         RECORD(c, OP_FRAME_BEGIN, rf, NULL, 0);
     }
@@ -2774,7 +2830,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
     /* --out / --out-dir: save what was asked for, then move on. */
     const uint32_t rendered_index = c->frame_index;
     bool last = false;
-    if (c->replaying) {
+    if (c->replaying || c->demo_in) {
         /* Save only frames named on the command line, or every frame if none were. */
         bool wanted = c->frame_count == 0;
         for (int i = 0; i < c->frame_count; ++i) wanted |= c->frame_list[i] == (int)rendered_index;
@@ -2873,7 +2929,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
                 .cs = cs, .cs_bytes = rec.cs_bytes, .color_format = (vkmin_format)rec.color_format, .depth = rec.depth, .depth_write = rec.depth_write,
                 .depth_compare = (vkmin_compare)rec.compare, .cull = (vkmin_cull)rec.cull, .blend = rec.blend, .depth_bias = rec.bias, .label = rec.label});
             SAME(p.id, rec.result); break; }
-        case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index;
+        case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index; c->input = rec.input;
             VKMIN_ASSERT(vkmin_frame_begin(c, rec.has_clear ? &rec.clear : NULL), "replay: frame_begin refused"); break; }
         case OP_RING_ALLOC: { HDR(rec_upload); uint64_t addr = 0; vkmin_ring_alloc(c, (size_t)rec.offset, &addr); break; }
         case OP_FRAME_END: { HDR(rec_upload);

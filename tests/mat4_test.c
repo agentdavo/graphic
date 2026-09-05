@@ -68,5 +68,24 @@ int main(void) {
     check(up_point.y < 0.0f, "projection does not flip Y for Vulkan's framebuffer");
 
     if (failures == 0) printf("mat4_test: ok\n");
+    /* cameras and rays: a pixel at the centre of an fps view looks along the
+     * camera's forward axis, and hits a box placed there. */
+    {
+        const vkmin_camera cam = vkmin_camera_fps((vec3){0, 1, 5}, 0.0f, 0.0f, 1.0f, 16.0f / 9.0f, 0.1f, 100.0f);
+        const vkmin_ray ray = vkmin_ray_from_pixel(cam.view, cam.proj, 640.0f, 360.0f, 1280.0f, 720.0f);
+        check(close_enough(ray.dir.x, 0.0f) && close_enough(ray.dir.y, 0.0f) && ray.dir.z < -0.999f, "centre ray is not the forward axis");
+        float t = 0.0f;
+        /* the ray starts on the near plane, 0.1 in front of the eye */
+        check(vkmin_ray_aabb(ray, (vec3){-1, 0, -1}, (vec3){1, 2, 1}, &t) && t > 3.85f && t < 3.95f, "ray misses the box in front of it");
+        check(!vkmin_ray_aabb(ray, (vec3){3, 0, -1}, (vec3){5, 2, 1}, &t), "ray hits a box beside it");
+        check(vkmin_ray_triangle(ray, (vec3){-1, 0, 0}, (vec3){1, 0, 0}, (vec3){0, 3, 0}, &t) && t > 4.85f && t < 4.95f, "ray misses the triangle");
+        check(!vkmin_ray_triangle(ray, (vec3){-1, 0, 10}, (vec3){1, 0, 10}, (vec3){0, 3, 10}, &t), "ray hits a triangle behind it");
+        const vkmin_camera top = vkmin_camera_ortho_topdown((vec3){0, 0, 0}, 10.0f, 1.0f, 50.0f);
+        const vkmin_ray down = vkmin_ray_from_pixel(top.view, top.proj, 100.0f, 100.0f, 200.0f, 200.0f);
+        check(down.dir.y < -0.999f, "top-down ray does not point down");
+        const vkmin_tick tk = vkmin_ticks_for_frame(3600, 30);
+        check(tk.ticks == 1800 && tk.alpha == 0.0f, "3600 frames at 30 Hz is not 1800 ticks");
+        check(vkmin_ticks_for_frame(1, 30).ticks == 0 && close_enough(vkmin_ticks_for_frame(1, 30).alpha, 0.5f), "half a tick is not alpha 0.5");
+    }
     return failures == 0 ? 0 : 1;
 }
