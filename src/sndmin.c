@@ -297,7 +297,7 @@ sndmin_stats sndmin_stats_get(sndmin_ctx *c) {
     const uint32_t w=atomic_load_explicit(&c->snapshot_write,memory_order_acquire);
     while(r!=w) c->latest=c->snapshots[r++%SND_SNAP];
     atomic_store_explicit(&c->snapshot_read,r,memory_order_release);
-    c->latest.stats.dropped_commands=c->failed?1:0; return c->latest.stats;
+    sndmin_stats s=c->latest.stats; if(c->failed) ++s.dropped_commands; return s;
 }
 void sndmin_pump_streams(sndmin_ctx *c,uint64_t when) {
     (void)sndmin_stats_get(c);
@@ -560,7 +560,10 @@ static void apply(sndmin_ctx *c,const snd_command *cmd) {
         }
         bool known=false;
         for(uint32_t i=0;i<c->stopped_count;++i) if(c->stopped_groups[i]==cmd->id) known=true;
-        if(group&&!known&&c->stopped_count<128) c->stopped_groups[c->stopped_count++]=cmd->id;
+        if(group&&!known) {
+            if(c->stopped_count<SND_STOPPED_GROUPS) c->stopped_groups[c->stopped_count++]=cmd->id;
+            else ++c->stats.dropped_commands; /* a later play for this group could slip through */
+        }
     }
     if(!v) return; /* expired/stolen generation is harmless */
     if(cmd->op==CMD_SET) {

@@ -6,7 +6,7 @@
 #include "sndmin_dsp.h"
 #include "jrnl.h"
 #include <stdatomic.h>
-enum { SND_RES=128, SND_STREAMS=8, SND_COMMAND_CAP=2048, SND_SNAP=16,
+enum { SND_RES=128, SND_STREAMS=8, SND_STOPPED_GROUPS=128, SND_COMMAND_CAP=2048, SND_SNAP=16,
     SND_BLOCK=512, SND_STREAM_BUFFER=65536, SND_ECHO=24000, SND_FDN=32768 };
 enum { CMD_PLAY=1,CMD_SET,CMD_STOP,CMD_ACOUSTIC,CMD_FRAME,CMD_PCM,CMD_GROUP_SET };
 typedef struct {
@@ -79,7 +79,7 @@ struct sndmin_ctx {
     snd_mix_voice voices[SNDMIN_MAX_VOICES]; snd_stream_mix stream_mix[SND_STREAMS];
     snd_bus buses[4]; uint64_t sample; sndmin_stats stats;
     uint32_t delay_length; float delay_feedback;
-    uint32_t stopped_groups[128],stopped_count;
+    uint32_t stopped_groups[SND_STOPPED_GROUPS],stopped_count; /* overflow counts in dropped_commands */
     snd_command group_updates[SND_RES]; uint32_t group_update_count;
     bool reference_pcm; /* test-only scalar interpolation comparison */
     float resample_a[8],resample_b[8],lfe;

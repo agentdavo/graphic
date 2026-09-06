@@ -148,6 +148,19 @@ $env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH
 .\build\omega-ucrt\ex_21_omega.exe --audio-only --audio-out build/omega-ucrt/blue-circuit-transit.wav
 ```
 
+Per-frame state (view-projection, camera, time, ship position, aperture and
+muzzle level) is one `OmegaScene` block in a ring allocation whose address
+rides in a 32-byte push block with the pass selector and image indices; the
+journal relocates that address on replay. A run of three frames or more
+prints the GPU cost of each pass, for example:
+
+```
+omega: gpu ms shadow=0.62 gate=2.95 scene=1.19 bloom=0.90 grade=2.54 total=8.19
+```
+
+That is frame 238 at 1280x720 on the Intel GPU; the flyby at frame 688 costs
+about 10 ms, so the 60 Hz budget holds with room to spare.
+
 Use `OMEGA.cmd` for interactive playback. A binary built with `HEADLESS=1` has
 no window backend; running it without arguments now prints that distinction
 instead of attempting to open a window and aborting.

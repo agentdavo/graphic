@@ -22,20 +22,32 @@
 #define OMEGA_GATE_CLOSE_START 17.5f
 #define OMEGA_GATE_CLOSE_END 19.5f
 VKMIN_STRUCT(OmegaVertex) { vec4 position; vec4 normal; vec4 color; };
-VKMIN_STRUCT(OmegaPush) {
+/* Per-frame state lives in a ring-allocated block addressed from the push
+ * constants, so the push carries only what varies per draw: the pass, the
+ * buffers and the images. Every field is a plain value with one meaning. */
+VKMIN_STRUCT(OmegaScene) {
     mat4 vp;
-    ADDR vertices;
-    vec4 eye;
+    vec4 eye;   /* xyz camera position */
     vec4 scene; /* seconds, aspect, ship translation, gate aperture */
+    F32 flash;  /* cannon muzzle level */
+    F32 reserved[3];
+};
+VKMIN_STRUCT(OmegaPush) {
+    ADDR vertices;
+    ADDR frame; /* OmegaScene for this frame */
     U32 texture_id;
     U32 bloom_id;
-    F32 flash;
-    F32 padding;
     U32 gate_id;
-    U32 reserved;
+    U32 pass;   /* OMEGA_PASS_* */
 };
+#define OMEGA_PASS_SCENE 0u
+#define OMEGA_PASS_SHADOW 1u
+#define OMEGA_PASS_BACKDROP 2u
+#define OMEGA_PASS_BLOOM 3u
+#define OMEGA_PASS_GRADE 4u
 #ifndef VKMIN_GLSL
 _Static_assert(sizeof(OmegaVertex)==48, "omega vertex layout");
-_Static_assert(sizeof(OmegaPush)==128, "omega push layout");
+_Static_assert(sizeof(OmegaScene)==112, "omega scene layout");
+_Static_assert(sizeof(OmegaPush)==32, "omega push layout");
 #endif
 #endif

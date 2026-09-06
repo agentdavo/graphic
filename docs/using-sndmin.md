@@ -53,6 +53,9 @@ Commands for the preceding frame are flushed on the next frame call. A late
 game can still miss this deadline; no claim that arbitrary lateness is inaudible
 is made. Late commands execute at the next sample and increment a counter.
 Queue overflow fails explicitly through `dropped_commands` and render failure.
+The same counter reports an overflow of the stopped-group list, the mixer's
+record of stopped groups whose late plays must be ignored, so a bookkeeping
+limit is never exceeded silently.
 
 The game thread decodes Vorbis ahead into inline PCM command packets. The mixer
 owns its stream buffers, voice state and effects. Only two mutable structures

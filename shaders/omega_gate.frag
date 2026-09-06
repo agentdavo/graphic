@@ -36,9 +36,9 @@ void main() {
     // clip x/w and y/w equal this pixel's NDC satisfies (r0-x r3).d=0 and
     // (r1-y r3).d=0. No separate target, FOV or aspect needs passing.
     vec2 ndc=uv*2.-1.;
-    vec3 r0=vec3(o.vp[0][0],o.vp[1][0],o.vp[2][0]);
-    vec3 r1=vec3(o.vp[0][1],o.vp[1][1],o.vp[2][1]);
-    vec3 r3=vec3(o.vp[0][3],o.vp[1][3],o.vp[2][3]);
+    vec3 r0=vec3(F.vp[0][0],F.vp[1][0],F.vp[2][0]);
+    vec3 r1=vec3(F.vp[0][1],F.vp[1][1],F.vp[2][1]);
+    vec3 r3=vec3(F.vp[0][3],F.vp[1][3],F.vp[2][3]);
     vec3 ray=cross(r0-ndc.x*r3,r1-ndc.y*r3);
     if(dot(ray,r3)<0.) ray=-ray;
     ray=normalize(ray);
@@ -61,16 +61,16 @@ void main() {
     nebula=pow(max(nebula-.25,0.)*1.6,1.6);
     color+=vec3(.05,.08,.34)*band*nebula*.10;
     vec3 skyColor=color;
-    if(o.scene.w>.005) {
-        float aperture=o.scene.w,time=o.scene.x;
+    if(F.scene.w>.005) {
+        float aperture=F.scene.w,time=F.scene.x;
         float rotation=max(time-2.,0.)*.10;
         vec3 shape=omegaGateShape();
         float gateStart=shape.x,gateEnd=shape.y,scale=shape.z;
-        float hit=coneHit(o.eye.xyz,ray,gateStart,gateEnd,mouthRadius*scale,entranceRadius*scale);
+        float hit=coneHit(F.eye.xyz,ray,gateStart,gateEnd,mouthRadius*scale,entranceRadius*scale);
         bool throat=false;
         if(ray.z>1e-5) {
-            float end=(gateEnd-o.eye.z)/ray.z;
-            vec2 endXY=(o.eye.xyz+ray*end).xy;
+            float end=(gateEnd-F.eye.z)/ray.z;
+            vec2 endXY=(F.eye.xyz+ray*end).xy;
             if(end>0. && end<hit && length(endXY)<entranceRadius*scale) {
                 hit=end; throat=true;
             }
@@ -79,12 +79,12 @@ void main() {
         // fade with depth so the gate reads as a feathered ellipse, not a pipe.
         float outsideFade=1.;
         if(ray.z>1e-5) {
-            float near=(gateStart-o.eye.z)/ray.z;
-            float rMouth=length((o.eye.xyz+ray*near).xy)/(mouthRadius*scale);
+            float near=(gateStart-F.eye.z)/ray.z;
+            float rMouth=length((F.eye.xyz+ray*near).xy)/(mouthRadius*scale);
             outsideFade=1.-smoothstep(1.,1.32,rMouth);
         }
         if(hit<1e4) {
-            vec3 p=o.eye.xyz+ray*hit;
+            vec3 p=F.eye.xyz+ray*hit;
             // Logarithmic shading distance preserves visible flow near the
             // mouth while the actual tunnel extends far into the distance.
             float shadingLength=24.*(time>=OMEGA_GATE_CLOSE_START?scale:1.);
@@ -126,8 +126,8 @@ void main() {
         }
         // A soft mouth halo sits around, rather than across, the open exit.
         if(ray.z>1e-5 && !throat) {
-            float near=(gateStart-o.eye.z)/ray.z;
-            vec2 mouth=(o.eye.xyz+ray*near).xy;
+            float near=(gateStart-F.eye.z)/ray.z;
+            vec2 mouth=(F.eye.xyz+ray*near).xy;
             float r=length(mouth)/(mouthRadius*scale);
             float containment=1.-smoothstep(1.,1.16,r);
             float angle=atan(mouth.y,mouth.x);
@@ -149,12 +149,12 @@ void main() {
         // Arrival: a warm pink-white glow at the throat, where the hull will
         // appear, grows just before its silhouette shows and fades as it does.
         if(ray.z>1e-5) {
-            float near=(gateStart-o.eye.z)/ray.z;
-            float inside=1.-smoothstep(.9,1.,length((o.eye.xyz+ray*near).xy)/(mouthRadius*scale));
+            float near=(gateStart-F.eye.z)/ray.z;
+            float inside=1.-smoothstep(.9,1.,length((F.eye.xyz+ray*near).xy)/(mouthRadius*scale));
             float arrival=smoothstep(7.0,8.2,time)*(1.-smoothstep(8.6,9.4,time));
-            vec4 hull=o.vp*vec4(0,0,mix(gateStart,gateEnd,.9),1);
+            vec4 hull=F.vp*vec4(0,0,mix(gateStart,gateEnd,.9),1);
             if(arrival>0. && hull.w>0.) {
-                vec2 dp=uv-(hull.xy/hull.w*.5+.5); dp.x*=o.scene.y;
+                vec2 dp=uv-(hull.xy/hull.w*.5+.5); dp.x*=F.scene.y;
                 float d=length(dp),radius=mix(.015,.06,smoothstep(7.,9.,time));
                 color+=arrival*inside*(vec3(3.,1.7,1.3)*exp(-d*d/(radius*radius))
                     +vec3(.9,.28,.22)*exp(-d*d/pow(radius*2.5,2.)));

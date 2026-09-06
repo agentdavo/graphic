@@ -2,17 +2,19 @@
 #include "common.glsl"
 #include "../demo/omega_shared.h"
 layout(push_constant, scalar) uniform OmegaBlock { OmegaPush o; };
+layout(buffer_reference, scalar) readonly buffer OmegaFrame { OmegaScene s; };
+#define F OmegaFrame(o.frame).s
 const float O_PI=3.14159265359;
 // Mouth, throat, radius scale. Closing contracts about the fixed far throat.
 // Perspective compensation makes the visible contraction follow the aperture
 // envelope rather than vanishing immediately down the long corridor.
 vec3 omegaGateShape() {
-    float a=o.scene.w;
+    float a=F.scene.w;
     float nearZ=OMEGA_GATE_MOUTH_Z,farZ=OMEGA_GATE_THROAT_Z;
-    if(o.scene.x<OMEGA_GATE_CLOSE_START) return vec3(nearZ,mix(nearZ,farZ,a),a);
-    vec3 forward=normalize(vec3(o.vp[0][3],o.vp[1][3],o.vp[2][3])); // clip w row
-    float nearDepth=dot(vec3(0,0,nearZ)-o.eye.xyz,forward);
-    float farDepth=dot(vec3(0,0,farZ)-o.eye.xyz,forward);
+    if(F.scene.x<OMEGA_GATE_CLOSE_START) return vec3(nearZ,mix(nearZ,farZ,a),a);
+    vec3 forward=normalize(vec3(F.vp[0][3],F.vp[1][3],F.vp[2][3])); // clip w row
+    float nearDepth=dot(vec3(0,0,nearZ)-F.eye.xyz,forward);
+    float farDepth=dot(vec3(0,0,farZ)-F.eye.xyz,forward);
     float scale=a*farDepth/max(nearDepth+a*(farDepth-nearDepth),.001);
     return vec3(mix(farZ,nearZ,scale),farZ,scale);
 }
@@ -41,7 +43,7 @@ vec3 omegaFlares(vec2 uv) {
     // along each spine, travels toward the far cap brightening at every fin
     // station, swells into a pink-white sphere near the far end, and the four
     // spheres merge into one central white flash before the ring opens.
-    float t=o.scene.x;
+    float t=F.scene.x;
     float travel=smoothstep(.25,1.75,t);
     float along=mix(.30,.92,travel);
     float swell=smoothstep(1.55,2.2,t);
@@ -57,9 +59,9 @@ vec3 omegaFlares(vec2 uv) {
         local=vec3(0,OMEGA_GATE_PYLON_RADIAL+(local.y-OMEGA_GATE_PYLON_RADIAL)*cs-dz*sn,
                    OMEGA_GATE_PYLON_Z+(local.y-OMEGA_GATE_PYLON_RADIAL)*sn+dz*cs);
         vec3 anchorPos=vec3(cos(a)*local.x-sin(a)*local.y,sin(a)*local.x+cos(a)*local.y,local.z);
-        vec4 c=o.vp*vec4(anchorPos,1);
+        vec4 c=F.vp*vec4(anchorPos,1);
         if(c.w<=0.) continue;
-        vec2 dp=uv-(c.xy/c.w*.5+.5); dp.x*=o.scene.y;
+        vec2 dp=uv-(c.xy/c.w*.5+.5); dp.x*=F.scene.y;
         float d=length(dp);
         float level=charge*mix(stationPulse,1.,swell);
         color+=level*(core*exp(-d*d/(radius*radius))
@@ -69,8 +71,8 @@ vec3 omegaFlares(vec2 uv) {
     // The merge: one white sphere at the mouth centre with a pink halo, a
     // horizontal streak and a faint ring, then the ring of the opening gate.
     float ignition=smoothstep(1.9,2.3,t)*(1.-smoothstep(2.4,2.9,t));
-    vec4 center=o.vp*vec4(0,0,OMEGA_GATE_MOUTH_Z,1);
-    vec2 delta=uv-(center.xy/center.w*.5+.5); delta.x*=o.scene.y;
+    vec4 center=F.vp*vec4(0,0,OMEGA_GATE_MOUTH_Z,1);
+    vec2 delta=uv-(center.xy/center.w*.5+.5); delta.x*=F.scene.y;
     float d2=dot(delta,delta);
     color+=ignition*(vec3(14,12,10)*exp(-d2*120.)+vec3(1.2,.24,.18)*exp(-d2*16.)
         +vec3(.35,.05,.03)*exp(-pow((sqrt(d2)-.22)*22.,2.)));

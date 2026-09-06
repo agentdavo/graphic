@@ -3,9 +3,9 @@
 layout(location=0) in vec2 uv;
 layout(location=0) out vec4 result;
 void main() {
-    if(o.padding< -1.5) { result=vec4(texture(TEX(o.texture_id),uv).rgb,1); return; }
+    if(o.pass==OMEGA_PASS_BACKDROP) { result=vec4(texture(TEX(o.texture_id),uv).rgb,1); return; }
     vec2 px=1./vec2(textureSize(TEX(o.texture_id),0));
-    if(o.padding>0.5) {
+    if(o.pass==OMEGA_PASS_BLOOM) {
         vec3 sum=vec3(0); float total=0.;
         for(int y=-2;y<=2;y++) for(int x=-2;x<=2;x++) {
             float weight=exp(-float(x*x+y*y)*.32);
@@ -40,7 +40,7 @@ void main() {
     const vec3 lumaWeights=vec3(.299,.587,.114);
     c=wide-dot(wide,lumaWeights)+mix(dot(c,lumaWeights),dot(wide,lumaWeights),.35);
     // Fine grain, deterministic per tick.
-    c+=(hash21(floor(uv*vec2(textureSize(TEX(o.texture_id),0)))+floor(o.scene.x*60.))-.5)*.028;
+    c+=(hash21(floor(uv*vec2(textureSize(TEX(o.texture_id),0)))+floor(F.scene.x*60.))-.5)*.028;
     c*=1.-.22*dot(uv-.5,uv-.5);
     // Cinemascope framing is part of the presentation, never the HDR passes.
     if(uv.y<.065 || uv.y>.935) c=vec3(0);

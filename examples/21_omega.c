@@ -428,7 +428,7 @@ int main(int argc,char **argv) {
         .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH,.label="omega depth"});
     const vkmin_image shadow=vkmin_make_image(gpu,&(vkmin_image_desc){.width=2048,.height=2048,
         .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega key shadow"});
-    const uint32_t shadow_index=vkmin_index(gpu,shadow),hdr_index=vkmin_index(gpu,hdr);
+    const uint32_t shadow_index=vkmin_index(gpu,shadow),hdr_index=vkmin_index(gpu,hdr),glow_index=vkmin_index(gpu,glow);
     const vkmin_pipeline shadow_pipe=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_vert_spv),
         .fs=VKMIN_BYTES(omega_shadow_frag_spv),.push_size=sizeof(OmegaPush),.color_format=VKMIN_FMT_NONE,
         .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.label="omega key shadow"});
@@ -446,8 +446,7 @@ int main(int argc,char **argv) {
         .cull=VKMIN_CULL_NONE,.label="omega bloom extraction"});
     const vkmin_pipeline post=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
         .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
-    OmegaPush p={.vertices=vkmin_address(gpu,geometry),.texture_id=vkmin_index(gpu,hdr),.bloom_id=vkmin_index(gpu,glow),
-        .gate_id=vkmin_index(gpu,gate_layer)};
+    OmegaPush p={.vertices=vkmin_address(gpu,geometry),.gate_id=vkmin_index(gpu,gate_layer)};
     bool paused=false,muted=false,ok=true; uint32_t absolute=0,phase=0; float orbit=0,elevation=0;
     const double start=seconds_now();
     while(ok && vkmin_running(gpu)) {
@@ -486,31 +485,51 @@ int main(int argc,char **argv) {
         const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
         const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
         const vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
-        p.eye=(vec4){eye.x,eye.y,eye.z,0};
-        p.vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),
-            vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
-        p.scene=(vec4){t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))};
-        p.flash=cannon_flash(visual); p.padding=-1; p.texture_id=shadow_index;
+        // One per-frame block; the journal relocates its ring address on replay.
+        OmegaScene *scene=vkmin_ring_alloc(gpu,sizeof *scene,&p.frame);
+        *scene=(OmegaScene){
+            .vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0})),
+            .eye={eye.x,eye.y,eye.z,0},
+            .scene={t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))},
+            .flash=cannon_flash(visual)};
+        vkmin_timestamp(gpu,0);
+        p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.depth=shadow,.clear_depth=true,.label="omega shadow map"});
         vkmin_draw(gpu,shadow_pipe,&p,mesh.count,1); vkmin_pass_end(gpu);
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_SAMPLED}},.image_count=1});
-        p.padding=0;
+        vkmin_timestamp(gpu,1);
+        p.pass=OMEGA_PASS_SCENE;
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{gate_layer,VKMIN_USE_COLOR_TARGET}},.image_count=1});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=gate_layer,.clear_color=true,.label="omega gate energy"});
         vkmin_draw(gpu,gate,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,2);
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED},{hdr,VKMIN_USE_COLOR_TARGET},{depth,VKMIN_USE_DEPTH_TARGET}},.image_count=3});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=hdr,.depth=depth,.clear_color=true,.clear_depth=true,.clear={0,0,0,1},.label="omega HDR scene"});
-        p.padding=-2; p.texture_id=p.gate_id; vkmin_draw(gpu,background,&p,3,1);
-        p.padding=0; p.texture_id=shadow_index; vkmin_draw(gpu,ship,&p,mesh.count,1); vkmin_pass_end(gpu);
+        p.pass=OMEGA_PASS_BACKDROP; p.texture_id=p.gate_id; vkmin_draw(gpu,background,&p,3,1);
+        p.pass=OMEGA_PASS_SCENE; p.texture_id=shadow_index; vkmin_draw(gpu,ship,&p,mesh.count,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,3);
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{hdr,VKMIN_USE_SAMPLED},{glow,VKMIN_USE_COLOR_TARGET}},.image_count=2});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=glow,.clear_color=true,.label="omega glow"});
-        p.padding=1; p.texture_id=hdr_index; vkmin_draw(gpu,bloom,&p,3,1); vkmin_pass_end(gpu);
+        p.pass=OMEGA_PASS_BLOOM; p.texture_id=hdr_index; vkmin_draw(gpu,bloom,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,4);
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{glow,VKMIN_USE_SAMPLED},{vkmin_backbuffer(gpu),VKMIN_USE_COLOR_TARGET}},.image_count=2});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),.depth=vkmin_default_depth(gpu),.clear_color=true,.clear_depth=true,.label="omega presentation"});
-        p.padding=0; vkmin_draw(gpu,post,&p,3,1); vkmin_pass_end(gpu);
+        p.pass=OMEGA_PASS_GRADE; p.texture_id=hdr_index; p.bloom_id=glow_index; vkmin_draw(gpu,post,&p,3,1); vkmin_pass_end(gpu);
+        vkmin_timestamp(gpu,5);
         vkmin_frame_end(gpu);
         if(vkmin_key_pressed(&f.input,301)) ok=vkmin_save_png(gpu,"omega-capture.png") && ok;
+    }
+    // GPU cost of the last collected frame, so shader changes are measured
+    // rather than guessed. Timestamps 0..5 bracket the five passes; results
+    // are read when a frame slot is reused, so a run needs three frames or
+    // more (for example --frames 238,239,240) to report anything.
+    const vkmin_stats stats=vkmin_stats_get(gpu);
+    if(offline && stats.timestamps>=6) {
+        static const char *const names[5]={"shadow","gate","scene","bloom","grade"};
+        fprintf(stderr,"omega: gpu ms");
+        for(int k=0;k<5;++k) fprintf(stderr," %s=%.2f",names[k],stats.gpu_ms[k+1]-stats.gpu_ms[k]);
+        fprintf(stderr," total=%.2f\n",stats.gpu_ms[5]);
     }
     vkmin_shutdown(gpu);
     if(ok && wav) ok=sndmin_render(audio,absolute+120,wav,NULL);
