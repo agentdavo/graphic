@@ -101,6 +101,17 @@ make SANITIZE=1 BUILD=build_san build_san/corridor    # ASan + UBSan build
 ./build/corridor --cvars                                 # list them all
 ```
 
+Measure before optimising. gprof's sampler does not run under the MinGW
+runtime, so `tools/cprof.c` profiles through the compiler's entry hooks:
+build into a separate directory with
+`OPT="-O2 -g -finstrument-functions -finstrument-functions-exclude-file-list=tools,third_party"`
+and the compiled `cprof.o` appended to `LDLIBS`, run with `CPROF_OUT=file`,
+and resolve with `python tools/cprof_resolve.py <exe> <file>`. Sixty
+consecutive headless frames of each demo showed vkmin's own per-frame work
+(draws, passes, barriers) at about 1 ms, the rest being GPU time, the host
+readback and the PNG writer; startup was dominated by one submit-and-wait per
+mip upload, now batched into one barrier per frame.
+
 Goldens are environment-specific: they record one driver's and one compiler's
 output, and this set was made under lavapipe on Windows. Another environment
 compares against its own set by pointing `VKMIN_GOLDEN` (images) and
@@ -122,6 +133,7 @@ golden fails with that instruction rather than comparing across platforms.
 | `demo/corridor.c`, `demo/anim.h` | 498 + 89 | the demo and its skeletal animation sampler |
 | `tools/cook.c`, `tools/cook_image.c` | ~800 | glTF â†’ `.vkm` + BCn `.ktx2`, offline |
 | `tools/imgdiff.c`, `tools/mkfont.c`, â€¦ | | golden comparison, font baking, small checks |
+| `tools/cprof.c`, `tools/cprof_resolve.py` | | function profiler for measurement builds: `-finstrument-functions`, link the object, resolve with nm |
 
 Core (`src/`, excluding the baked font and the stb bridge) is **4056 lines**,
 about 3200 without comments and blanks. The budget was four to five thousand.

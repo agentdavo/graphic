@@ -246,9 +246,11 @@ int main(int argc, char **argv) {
         const vkmin_report r = vkmin_probe(opt.device);
         printf("device: %s (Vulkan %u.%u)\nhostImageCopy=%d maintenance5=%d pushDescriptor=%d pipelineRobustness=%d "
                "robustBufferAccess2=%d\nscalarBlockLayout=%d bufferDeviceAddress=%d descriptorIndexing=%d "
-               "drawIndirectCount=%d\npath: %s (%s)\n", r.device_name, r.api_major, r.api_minor, r.host_image_copy,
+               "drawIndirectCount=%d\nprobed only: descriptorBuffer=%d unifiedImageLayouts=%d\npath: %s (%s)\n",
+               r.device_name, r.api_major, r.api_minor, r.host_image_copy,
                r.maintenance5, r.push_descriptor, r.pipeline_robustness, r.robust_buffer_access2, r.scalar_block_layout,
                r.buffer_device_address, r.descriptor_indexing, r.draw_indirect_count,
+               r.descriptor_buffer, r.unified_image_layouts,
                r.would_choose == VKMIN_PATH_MODERN ? "modern" : "legacy", r.reason ? r.reason : "");
         return r.vulkan_1_3 ? 0 : 1;
     }

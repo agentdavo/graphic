@@ -215,6 +215,7 @@ typedef struct {                  /* what a device offers and what vkmin would d
     char device_name[256]; uint32_t api_major, api_minor; bool vulkan_1_3;
     bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
     bool scalar_block_layout, buffer_device_address, descriptor_indexing, draw_indirect_count;
+    bool descriptor_buffer, unified_image_layouts; /* probed only; vkmin never enables them */
     vkmin_path would_choose; const char *reason;
 } vkmin_report;
 

@@ -114,6 +114,7 @@ typedef struct {
     VkImageAspectFlags aspect;
     uint32_t w, h, mips;
     vkmin_use use;       /* what it was last transitioned for */
+    bool layout_pending; /* modern path: uploaded into GENERAL, promised SAMPLED at the next frame begin */
     uint32_t tex_index;  /* bindless slot from vkmin_index, or UINT32_MAX */
     uint32_t sampler;
     char label[VKMIN_LABEL];
@@ -143,6 +144,9 @@ typedef struct {
  * builds. Filled once; read at init and at the three seams. */
 typedef struct {
     bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
+    /* Probed and reported only, never enabled: the measurements behind two
+     * deferred designs, a descriptor heap and unified image layouts. */
+    bool descriptor_buffer, unified_image_layouts;
 } path_caps;
 
 struct vkmin_ctx {
@@ -179,6 +183,7 @@ struct vkmin_ctx {
     uint32_t last_slot;
     bool have_submitted;
     bool in_frame;
+    bool layouts_pending; /* some image slot has layout_pending set */
     bool in_pass;
     bool in_default_pass;
     uint32_t frame_index;      /* logical frame: what vkmin_frame_index reports */
@@ -540,17 +545,21 @@ static path_caps query_caps(VkPhysicalDevice phys) {
     VkExtensionProperties *ext = calloc(n ? n : 1, sizeof *ext);
     VKMIN_ASSERT(ext != NULL, "out of memory");
     VK_CHECK(vkEnumerateDeviceExtensionProperties(phys, NULL, &n, ext));
-    bool has_hic = false, has_m5 = false, has_pd = false, has_pr = false, has_r2 = false;
+    bool has_hic = false, has_m5 = false, has_pd = false, has_pr = false, has_r2 = false, has_db = false, has_uil = false;
     for (uint32_t i = 0; i < n; ++i) {
         if (!strcmp(ext[i].extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) has_hic = true;
         if (!strcmp(ext[i].extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) has_m5 = true;
         if (!strcmp(ext[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) has_pd = true;
         if (!strcmp(ext[i].extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) has_pr = true;
         if (!strcmp(ext[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) has_r2 = true;
+        if (!strcmp(ext[i].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) has_db = true;
+        if (!strcmp(ext[i].extensionName, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) has_uil = true;
     }
     free(ext);
     /* An extension that is present but whose feature bit is off is absent. */
-    VkPhysicalDeviceHostImageCopyFeaturesEXT hic = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT db = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT, .pNext = &uil};
+    VkPhysicalDeviceHostImageCopyFeaturesEXT hic = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, .pNext = &db};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &hic};
     VkPhysicalDevicePipelineRobustnessFeaturesEXT pr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT, .pNext = &m5};
     VkPhysicalDeviceRobustness2FeaturesEXT r2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &pr};
@@ -562,6 +571,8 @@ static path_caps query_caps(VkPhysicalDevice phys) {
         .push_descriptor = has_pd,
         .pipeline_robustness = has_pr && pr.pipelineRobustness,
         .robust_buffer_access2 = has_r2 && r2.robustBufferAccess2,
+        .descriptor_buffer = has_db && db.descriptorBuffer,
+        .unified_image_layouts = has_uil && uil.unifiedImageLayouts,
     };
 }
 
@@ -610,6 +621,8 @@ vkmin_report vkmin_probe(int device_index) {
     r.scalar_block_layout = f12.scalarBlockLayout;
     r.buffer_device_address = f12.bufferDeviceAddress;
     r.descriptor_indexing = f12.descriptorIndexing;
+    r.descriptor_buffer = k.descriptor_buffer;
+    r.unified_image_layouts = k.unified_image_layouts;
     r.draw_indirect_count = f12.drawIndirectCount;
     r.would_choose = choose_path(k, VKMIN_PATH_AUTO, &r.reason);
     vkDestroyInstance(inst, NULL);
@@ -698,6 +711,8 @@ static void pick_physical_device(vkmin_ctx *c) {
     fprintf(stderr, "vkmin: hostImageCopy=%d maintenance5=%d pushDescriptor=%d pipelineRobustness=%d "
                     "robustBufferAccess2=%d\n", c->caps.host_image_copy, c->caps.maintenance5,
             c->caps.push_descriptor, c->caps.pipeline_robustness, c->caps.robust_buffer_access2);
+    fprintf(stderr, "vkmin: probed only: descriptorBuffer=%d unifiedImageLayouts=%d\n",
+            c->caps.descriptor_buffer, c->caps.unified_image_layouts);
     fprintf(stderr, "vkmin: path = %s (%s)%s\n", c->path == VKMIN_PATH_MODERN ? "modern" : "legacy", reason,
             c->debug ? (c->caps.pipeline_robustness && c->caps.robust_buffer_access2
                             ? "; debug pipelines use robustBufferAccess2"
@@ -1907,15 +1922,23 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
                                 const void *data, size_t bytes) {
     (void)bytes;
     upload_prepare(c);
-    /* Host transitions when supported; otherwise an upload-time GPU barrier. */
-    const VkHostImageLayoutTransitionInfoEXT to_general = {
-        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
-        .image = s->img,
-        .oldLayout = use_lookup(s->use, s->aspect).layout,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
-    };
-    modern_layout_transition(c, &to_general, c->host_sampled_layout || to_general.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+    /* The image goes to GENERAL once, host-side when the driver allows it or
+     * the image is fresh, and stays there across every mip of this upload.
+     * The return to SAMPLED is one barrier for all such images at the next
+     * frame begin: measured, the per-mip submit-and-wait pair this replaces
+     * was 1 ms each and over a second of the corridor's start on Intel. */
+    if (!s->layout_pending) {
+        const VkHostImageLayoutTransitionInfoEXT to_general = {
+            .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+            .image = s->img,
+            .oldLayout = use_lookup(s->use, s->aspect).layout,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
+        };
+        modern_layout_transition(c, &to_general, c->host_sampled_layout || to_general.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+        s->layout_pending = true;
+        c->layouts_pending = true;
+    }
     const VkMemoryToImageCopyEXT region = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
         .pHostPointer = data,
@@ -1930,15 +1953,33 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
         .pRegions = &region,
     };
     VK_CHECK(c->fp_copy_memory_to_image(c->dev, &info));
-    const VkHostImageLayoutTransitionInfoEXT to_sampled = {
-        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
-        .image = s->img,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
-    };
-    modern_layout_transition(c, &to_sampled, c->host_sampled_layout);
-    s->use = VKMIN_USE_SAMPLED;
+    s->use = VKMIN_USE_SAMPLED; /* the layout follows at the next frame begin */
+}
+/* Every image uploaded since the last frame moves from GENERAL to SAMPLED in
+ * one barrier at the top of this frame's command buffer, before anything
+ * can sample it. Nothing between frames reads a sampled image. */
+static void modern_flush_pending_layouts(vkmin_ctx *c, VkCommandBuffer cmd) {
+    if (!c->layouts_pending) return;
+    static VkImageMemoryBarrier2 barriers[VKMIN_MAX_IMAGES];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < VKMIN_MAX_IMAGES; ++i) {
+        image_slot *s = &c->images[i];
+        if (!s->layout_pending) continue;
+        s->layout_pending = false;
+        if (!s->used) continue; /* uploaded, then destroyed before any frame */
+        barriers[n++] = (VkImageMemoryBarrier2){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = s->img,
+            .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1}};
+    }
+    c->layouts_pending = false;
+    const VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                         .imageMemoryBarrierCount = n, .pImageMemoryBarriers = barriers};
+    vkCmdPipelineBarrier2(cmd, &dependency);
 }
 /* --- end modern-only ------------------------------------------------------ */
 
@@ -2437,6 +2478,7 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
     vkCmdResetQueryPool(cmd, c->query_pool, c->slot * VKMIN_MAX_TIMESTAMPS, VKMIN_MAX_TIMESTAMPS);
+    if (c->path == VKMIN_PATH_MODERN) modern_flush_pending_layouts(c, cmd);
 
     /* The one and only descriptor bind of the frame, to both bind points. */
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe_layout, 0, 1, &c->set, 0, NULL);
