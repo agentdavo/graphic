@@ -181,9 +181,13 @@ struct vkmin_ctx {
 
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd[VKMIN_MAX_FRAMES];
-    VkFence fence[VKMIN_MAX_FRAMES];
     VkSemaphore acquired[VKMIN_MAX_FRAMES];
-    bool fence_pending[VKMIN_MAX_FRAMES];
+    /* One timeline for every submit, frames and immediate uploads alike:
+     * a submit signals the next value and a wait names the value it needs.
+     * slot_value is what the frame last submitted from that slot signals. */
+    VkSemaphore timeline;
+    uint64_t timeline_value;
+    uint64_t slot_value[VKMIN_MAX_FRAMES];
     uint32_t frames_in_flight;
     uint32_t slot;
     uint32_t last_slot;
@@ -230,7 +234,6 @@ struct vkmin_ctx {
     bool armed;                  /* vkmin_running said yes and frame_begin has not consumed it */
 
     VkCommandBuffer imm_cmd;
-    VkFence imm_fence;
 
     /* Memory: one device arena backing one buffer, one device arena for
      * images, one persistently mapped host ring. Bump allocated, never freed. */
@@ -721,6 +724,7 @@ static void pick_physical_device(vkmin_ctx *c) {
     NEED(f12.bufferDeviceAddress, "bufferDeviceAddress");
     NEED(f12.scalarBlockLayout, "scalarBlockLayout");
     NEED(f12.descriptorIndexing, "descriptorIndexing");
+    NEED(f12.timelineSemaphore, "timelineSemaphore");
     NEED(f12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound");
     NEED(f12.descriptorBindingSampledImageUpdateAfterBind, "sampledImageUpdateAfterBind");
     NEED(f12.shaderSampledImageArrayNonUniformIndexing, "sampledImageArrayNonUniformIndexing");
@@ -791,6 +795,7 @@ static void create_device(vkmin_ctx *c) {
         .scalarBlockLayout = VK_TRUE,
         .hostQueryReset = VK_TRUE,
         .bufferDeviceAddress = VK_TRUE,
+        .timelineSemaphore = VK_TRUE,
     };
     VkPhysicalDeviceVulkan13Features f13 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -1040,16 +1045,30 @@ static VkCommandBuffer imm_begin(vkmin_ctx *c) {
     return c->imm_cmd;
 }
 
+/* Block until the timeline reaches `value`; a value never signalled would
+ * block forever, so every caller names one a submit has issued. */
+static void timeline_wait(vkmin_ctx *c, uint64_t value) {
+    if (value == 0) return;
+    const VkSemaphoreWaitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                      .semaphoreCount = 1, .pSemaphores = &c->timeline, .pValues = &value};
+    VK_CHECK(vkWaitSemaphores(c->dev, &wait, UINT64_MAX));
+}
+static VkSemaphoreSubmitInfo timeline_signal(vkmin_ctx *c) {
+    return (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
+                                   .value = ++c->timeline_value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+}
 static void imm_end(vkmin_ctx *c) {
     VK_CHECK(vkEndCommandBuffer(c->imm_cmd));
     const VkCommandBufferSubmitInfo cmd_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = c->imm_cmd};
+    const VkSemaphoreSubmitInfo signal = timeline_signal(c);
     const VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
                                   .commandBufferInfoCount = 1,
-                                  .pCommandBufferInfos = &cmd_info};
-    VK_CHECK(vkResetFences(c->dev, 1, &c->imm_fence));
-    VK_CHECK(vkQueueSubmit2(c->queue, 1, &submit, c->imm_fence));
-    VK_CHECK(vkWaitForFences(c->dev, 1, &c->imm_fence, VK_TRUE, UINT64_MAX));
+                                  .pCommandBufferInfos = &cmd_info,
+                                  .signalSemaphoreInfoCount = 1,
+                                  .pSignalSemaphoreInfos = &signal};
+    VK_CHECK(vkQueueSubmit2(c->queue, 1, &submit, VK_NULL_HANDLE));
+    timeline_wait(c, signal.value);
 }
 
 /* Uploads go through the ring in chunks. Only legal outside a frame; if frames
@@ -1650,18 +1669,18 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     VK_CHECK(vkAllocateCommandBuffers(c->dev, &cbinfo, buffers));
     for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) {
         c->cmd[i] = buffers[i];
-        const VkFenceCreateInfo finfo = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VK_CHECK(vkCreateFence(c->dev, &finfo, NULL, &c->fence[i]));
         const VkSemaphoreCreateInfo sinfo = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(c->dev, &sinfo, NULL, &c->acquired[i]));
         set_name(c, VK_OBJECT_TYPE_COMMAND_BUFFER, (uint64_t)c->cmd[i], "vkmin.cmd[%u]", i);
-        set_name(c, VK_OBJECT_TYPE_FENCE, (uint64_t)c->fence[i], "vkmin.fence[%u]", i);
         set_name(c, VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)c->acquired[i], "vkmin.acquired[%u]", i);
     }
     c->imm_cmd = buffers[VKMIN_MAX_FRAMES];
-    const VkFenceCreateInfo finfo = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VK_CHECK(vkCreateFence(c->dev, &finfo, NULL, &c->imm_fence));
     set_name(c, VK_OBJECT_TYPE_COMMAND_BUFFER, (uint64_t)c->imm_cmd, "vkmin.cmd.immediate");
+    const VkSemaphoreTypeCreateInfo timeline_type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                                     .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
+    const VkSemaphoreCreateInfo timeline_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &timeline_type};
+    VK_CHECK(vkCreateSemaphore(c->dev, &timeline_info, NULL, &c->timeline));
+    set_name(c, VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)c->timeline, "vkmin.timeline");
 
     const VkQueryPoolCreateInfo qinfo = {
         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -1752,11 +1771,8 @@ void vkmin_shutdown(vkmin_ctx *c) {
     vkFreeMemory(c->dev, c->buf_arena.mem, NULL);
     vkFreeMemory(c->dev, c->img_arena.mem, NULL);
     vkDestroyQueryPool(c->dev, c->query_pool, NULL);
-    for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) {
-        vkDestroyFence(c->dev, c->fence[i], NULL);
-        vkDestroySemaphore(c->dev, c->acquired[i], NULL);
-    }
-    vkDestroyFence(c->dev, c->imm_fence, NULL);
+    for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) vkDestroySemaphore(c->dev, c->acquired[i], NULL);
+    vkDestroySemaphore(c->dev, c->timeline, NULL);
     vkDestroyCommandPool(c->dev, c->cmd_pool, NULL);
     vkDestroyDevice(c->dev, NULL);
     if (c->surface) vkDestroySurfaceKHR(c->instance, c->surface, NULL);
@@ -2513,11 +2529,7 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     }
     RECORD_ENTER(c);
 
-    if (c->fence_pending[c->slot]) {
-        VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->slot], VK_TRUE, UINT64_MAX));
-        c->fence_pending[c->slot] = false;
-    }
-    VK_CHECK(vkResetFences(c->dev, 1, &c->fence[c->slot]));
+    timeline_wait(c, c->slot_value[c->slot]);
 
     /* Timestamps from the frame that last used this slot are complete now. */
     c->ts_count = 0;
@@ -2690,7 +2702,7 @@ void vkmin_copy_to_ring(vkmin_ctx *c, vkmin_buffer src, size_t offset, size_t by
         RECORD(c, OP_COPY_TO_RING, rc, &dst, sizeof dst);
     }
     /* This slot's ring bytes were written by the copy two frames ago and read
-     * by the host since. The fence orders that on the CPU; the device needs
+     * by the host since. The timeline wait orders that on the CPU; the device needs
      * it said too, or the overwrite is an unordered write-after-write. */
     const VkBufferMemoryBarrier2 to_device = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
@@ -2709,7 +2721,7 @@ void vkmin_copy_to_ring(vkmin_ctx *c, vkmin_buffer src, size_t offset, size_t by
     vkCmdPipelineBarrier2(c->cmd[c->slot], &dep_dev);
     const VkBufferCopy copy = {.srcOffset = s->offset + offset, .dstOffset = ring_addr - c->ring_addr, .size = bytes};
     vkCmdCopyBuffer(c->cmd[c->slot], c->arena_buf, c->ring_buf, 1, &copy);
-    /* Make the copy visible to the host read that happens after the fence. */
+    /* Make the copy visible to the host read that happens after the timeline wait. */
     const VkBufferMemoryBarrier2 to_host = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -2971,7 +2983,7 @@ void vkmin_dump(const vkmin_ctx *c, FILE *out) {
  * reasons about what happened last. At 1080p the copy is real bandwidth, so
  * the alternative is kept alive: no_readback skips it and vkmin_save_png says
  * why it cannot. The modern path has no equivalent: it reads the image from
- * the host after the fence, with no command at all. */
+ * the host after the timeline wait, with no command at all. */
 static void legacy_record_readback(vkmin_ctx *c, VkCommandBuffer cmd, image_slot *bb) {
     cmd_transition(cmd, bb, VKMIN_USE_TRANSFER_SRC, false);
     const VkBufferMemoryBarrier2 to_device = {
@@ -3082,18 +3094,20 @@ void vkmin_frame_end(vkmin_ctx *c) {
     const VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                         .semaphore = c->acquired[c->slot],
                                         .stageMask = VK_PIPELINE_STAGE_2_BLIT_BIT};
-    const VkSemaphoreSubmitInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                          .semaphore = c->desc.headless ? VK_NULL_HANDLE : c->rendered[c->swap_index],
-                                          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    const uint32_t sem_count = c->desc.headless ? 0u : 1u;
+    const VkSemaphoreSubmitInfo signals[2] = {
+        timeline_signal(c),
+        {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+         .semaphore = c->desc.headless ? VK_NULL_HANDLE : c->rendered[c->swap_index],
+         .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    const uint32_t wait_count = c->desc.headless ? 0u : 1u;
     const VkSubmitInfo2 submit = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = sem_count, .pWaitSemaphoreInfos = &wait,
+        .waitSemaphoreInfoCount = wait_count, .pWaitSemaphoreInfos = &wait,
         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cmd_info,
-        .signalSemaphoreInfoCount = sem_count, .pSignalSemaphoreInfos = &signal,
+        .signalSemaphoreInfoCount = 1u + wait_count, .pSignalSemaphoreInfos = signals,
     };
-    VK_CHECK(vkQueueSubmit2(c->queue, 1, &submit, c->fence[c->slot]));
-    c->fence_pending[c->slot] = true;
+    VK_CHECK(vkQueueSubmit2(c->queue, 1, &submit, VK_NULL_HANDLE));
+    c->slot_value[c->slot] = signals[0].value;
     c->last_slot = c->slot;
     c->have_submitted = true;
 
@@ -3343,8 +3357,7 @@ invalid:
 
 /* --- legacy-only: read the mapped staging buffer ------------------------- */
 static bool legacy_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t bytes) {
-    VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
-    c->fence_pending[c->last_slot] = false;
+    timeline_wait(c, c->slot_value[c->last_slot]);
     memcpy(rgba, c->readback_mapped[c->last_slot], bytes);
     return true;
 }
@@ -3366,8 +3379,7 @@ static void modern_read_image(vkmin_ctx *c, VkImage image, const VkImageToMemory
 }
 static bool modern_read_backbuffer(vkmin_ctx *c, unsigned char *rgba, size_t bytes) {
     (void)bytes;
-    VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[c->last_slot], VK_TRUE, UINT64_MAX));
-    c->fence_pending[c->last_slot] = false;
+    timeline_wait(c, c->slot_value[c->last_slot]);
     const VkImageToMemoryCopyEXT region = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT,
         .pHostPointer = rgba,
@@ -3391,11 +3403,7 @@ uint32_t vkmin_pick(vkmin_ctx *c, vkmin_image img, int x, int y) {
     if (c->have_submitted && x >= 0 && y >= 0 && (uint32_t)x < s->w && (uint32_t)y < s->h) {
         VKMIN_ASSERT(s->use == VKMIN_USE_TRANSFER_SRC, "vkmin_pick: leave '%s' in TRANSFER_SRC at the end of the frame", s->label);
         /* Every frame in flight, so the texel is the last completed frame's. */
-        for (uint32_t i = 0; i < c->frames_in_flight; ++i) {
-            if (!c->fence_pending[i]) continue;
-            VK_CHECK(vkWaitForFences(c->dev, 1, &c->fence[i], VK_TRUE, UINT64_MAX));
-            c->fence_pending[i] = false;
-        }
+        timeline_wait(c, c->timeline_value);
         const VkImageSubresourceLayers layers = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1};
         if (c->path == VKMIN_PATH_LEGACY) {
             /* --- legacy-only: a one-texel copy into the readback tail ------- */
