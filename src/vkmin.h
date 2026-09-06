@@ -209,6 +209,9 @@ typedef struct {                  /* plain data, for humans and models to read *
     uint32_t frame_index, draws, dispatches, buffers, images, pipelines, textures;
     size_t device_used, device_cap, ring_used, ring_cap;
     vkmin_path path;
+    /* Wall clock between frame begins over the last 512 frames; the spread is
+     * what a viewer feels. --budget ms fails shutdown when p99 exceeds it. */
+    double frame_ms_min, frame_ms_mean, frame_ms_p99, frame_ms_max; uint32_t frames_timed;
 } vkmin_stats;
 
 typedef struct {                  /* what a device offers and what vkmin would do with it */

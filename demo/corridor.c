@@ -211,6 +211,7 @@ static const char *usage_text =
     "  --profile lavapipe      320x180, 8 lights, 1024 atlas, 1 cascade, no transparents, no overlay\n"
     "  --probe                 print what the device offers and which path would be chosen\n"
     "  plus every vkmin flag: --headless --frame N --frames a,b --out P --out-dir D --exit-after N\n"
+    "  --budget MS (fail at exit when the 99th-percentile frame interval exceeds MS)\n"
     "  --size W H --path=legacy|modern --sync-naive --no-readback --device N --verbose --cvars\n"
     "  windowed: F1 cycles debug views, Space pauses, F12 saves a PNG, Escape quits\n";
 

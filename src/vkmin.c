@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 #include <sys/stat.h>
@@ -45,12 +46,16 @@ static const char *vk_result_str(VkResult r) {
     }
 }
 
+/* A lost device is the one failure worth more than a message: the journal
+ * makes it a frame number that replays. Reported before the abort. */
+static void device_lost_report(void);
 #define VK_CHECK(expr)                                                            \
     do {                                                                          \
         const VkResult vkmin__r = (expr);                                         \
         if (vkmin__r != VK_SUCCESS) {                                             \
             fprintf(stderr, "%s:%d: %s -> %s\n", __FILE__, __LINE__, #expr,       \
                     vk_result_str(vkmin__r));                                     \
+            if (vkmin__r == VK_ERROR_DEVICE_LOST) device_lost_report();           \
             fflush(stderr);                                                       \
             abort();                                                              \
         }                                                                         \
@@ -90,7 +95,8 @@ enum {
     VKMIN_BACKBUFFER_SLOT = 0,      /* image slot reserved for the presentable image */
     VKMIN_ARENA_ALIGN = 256,
     VKMIN_RING_ALIGN = 64,
-    VKMIN_MAX_RING_ALLOCS = 1024 /* per frame; every one is registered for journal relocation */
+    VKMIN_MAX_RING_ALLOCS = 1024, /* per frame; every one is registered for journal relocation */
+    VKMIN_FRAME_TIMES = 512       /* wall-clock frame intervals kept for the stats */
 };
 
 _Static_assert(sizeof(DrawCmd) == sizeof(VkDrawIndexedIndirectCommand), "DrawCmd mirrors Vulkan");
@@ -195,6 +201,10 @@ struct vkmin_ctx {
     int frame_list[VKMIN_MAX_FRAME_LIST];
     int frame_count, frame_cursor;
     int exit_after;
+    double frame_wall_last;                  /* wall clock at the last frame begin, ms; 0 = none yet */
+    double frame_ms_ring[VKMIN_FRAME_TIMES]; /* intervals between frame begins */
+    uint32_t frame_ms_count;                 /* total recorded; the ring holds the last VKMIN_FRAME_TIMES */
+    float budget_ms;                         /* --budget: p99 above this fails at shutdown; 0 = off */
     const char *out, *out_dir;
     bool verbose;
 
@@ -428,6 +438,48 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
     VKMIN_ASSERT(ok, "journal write failed");
 }
 #define RECORD(c, op, hdr, data, bytes) journal_write((c), (op), &(hdr), sizeof(hdr), (data), (bytes))
+
+/* C11 wall clock in milliseconds; only differences are used. */
+static double wall_ms(void) {
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC) return 0;
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
+static int compare_double(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+/* Min, mean, 99th percentile and max of the recent frame intervals. Spread
+ * matters more than the mean: a uniformly slower frame beats a jittery one. */
+static void frame_ms_summary(const vkmin_ctx *c, vkmin_stats *s) {
+    const uint32_t n = c->frame_ms_count < VKMIN_FRAME_TIMES ? c->frame_ms_count : VKMIN_FRAME_TIMES;
+    s->frames_timed = n;
+    if (n == 0) return;
+    double sorted[VKMIN_FRAME_TIMES];
+    double sum = 0;
+    for (uint32_t i = 0; i < n; ++i) { sorted[i] = c->frame_ms_ring[i]; sum += sorted[i]; }
+    qsort(sorted, n, sizeof sorted[0], compare_double);
+    s->frame_ms_min = sorted[0];
+    s->frame_ms_max = sorted[n - 1];
+    s->frame_ms_mean = sum / n;
+    s->frame_ms_p99 = sorted[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1];
+}
+
+static vkmin_ctx *vkmin_lost_ctx; /* the context a device loss is reported for */
+static void device_lost_report(void) {
+    const vkmin_ctx *c = vkmin_lost_ctx;
+    if (!c) return;
+    if (c->rec) fflush(c->rec);
+    if (c->desc.journal) fflush(c->desc.journal);
+    fprintf(stderr, "vkmin: device lost during frame %u (%u rendered).\n", c->frame_index, c->frames_rendered);
+    if (c->record_path)
+        fprintf(stderr, "vkmin: the journal %s is flushed: replay the crash with --replay %s --frame %u\n",
+                c->record_path, c->record_path, c->frame_index);
+    else if (c->desc.journal)
+        fprintf(stderr, "vkmin: the shared journal is flushed through frame %u\n", c->frame_index);
+    else
+        fprintf(stderr, "vkmin: run with --record <file> to make this crash a replayable frame\n");
+}
 #define RECORD_ENTER(c) ((c)->rec_depth++)
 #define RECORD_LEAVE(c) ((c)->rec_depth--)
 
@@ -1473,6 +1525,8 @@ static void parse_command_line(vkmin_ctx *c, int argc, char **argv) {
             c->out_dir = argv[++i];
         } else if (!strcmp(a, "--exit-after") && next) {
             c->exit_after = atoi(argv[++i]);
+        } else if (!strcmp(a, "--budget") && next) {
+            c->budget_ms = (float)atof(argv[++i]);
         } else if (!strcmp(a, "--size") && i + 2 < argc) {
             /* Flags that are spellings of a cvar assignment go through the
              * assignment path so they count as set by the user. */
@@ -1651,11 +1705,23 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         const demo_header dh = {0x444d4b56u, 1, (uint32_t)desc->width, (uint32_t)desc->height};
         VKMIN_ASSERT(fwrite(&dh, sizeof dh, 1, c->demo_out) == 1, "demo write failed");
     }
+    vkmin_lost_ctx = c;
     return c;
 }
 
 void vkmin_shutdown(vkmin_ctx *c) {
     if (!c) return;
+    if (vkmin_lost_ctx == c) vkmin_lost_ctx = NULL;
+    /* Frame pacing, once per run: the spread is the number that matters. */
+    vkmin_stats pacing = {0};
+    frame_ms_summary(c, &pacing);
+    bool over_budget = false;
+    if (pacing.frames_timed >= 2) {
+        fprintf(stderr, "vkmin: frame ms over %u frames: min %.2f mean %.2f p99 %.2f max %.2f\n",
+                pacing.frames_timed, pacing.frame_ms_min, pacing.frame_ms_mean, pacing.frame_ms_p99, pacing.frame_ms_max);
+        over_budget = c->budget_ms > 0 && pacing.frame_ms_p99 > (double)c->budget_ms;
+    }
+    const float budget_ms = c->budget_ms;
     if (c->rec) fclose(c->rec);
     if (c->demo_out) fclose(c->demo_out);
     if (c->demo_in) fclose(c->demo_in);
@@ -1698,6 +1764,10 @@ void vkmin_shutdown(vkmin_ctx *c) {
     vkDestroyInstance(c->instance, NULL);
     if (!c->desc.headless) plat_close();
     free(c);
+    if (over_budget) {
+        fprintf(stderr, "vkmin: FAIL: p99 frame time %.2f ms exceeds --budget %.2f ms\n", pacing.frame_ms_p99, (double)budget_ms);
+        exit(2);
+    }
 }
 
 void vkmin_size(const vkmin_ctx *c, int *w, int *h) {
@@ -2427,6 +2497,11 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     VKMIN_ASSERT(!c->in_frame, "vkmin_frame_begin called twice without a frame_end");
     VKMIN_ASSERT(c->armed, "vkmin_frame_begin without vkmin_running saying yes");
     c->armed = false;
+    {
+        const double now = wall_ms();
+        if (c->frame_wall_last > 0) c->frame_ms_ring[c->frame_ms_count++ % VKMIN_FRAME_TIMES] = now - c->frame_wall_last;
+        c->frame_wall_last = now;
+    }
     c->draws = 0;
     c->dispatches = 0;
     c->ring_issued_count = 0;
@@ -2854,6 +2929,7 @@ vkmin_stats vkmin_stats_get(const vkmin_ctx *c) {
     s.timestamps = c->ts_count;
     for (int i = 0; i < c->ts_count; ++i) s.gpu_ms[i] = c->ts_ms[i];
     s.path = c->path;
+    frame_ms_summary(c, &s);
     s.textures = c->texture_count;
     for (uint32_t i = 0; i < VKMIN_MAX_BUFFERS; ++i) s.buffers += c->buffers[i].used;
     for (uint32_t i = 0; i < VKMIN_MAX_IMAGES; ++i) s.images += c->images[i].used;
