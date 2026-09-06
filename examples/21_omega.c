@@ -23,7 +23,7 @@
 enum { OMEGA_CAPACITY=160000, OMEGA_TICKS=1200, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1047 };
 typedef struct { OmegaVertex *v; uint32_t count; float part; } omega_mesh;
 typedef struct {
-    sndmin_sound drone, gate, closing, cannon, cannon_long;
+    sndmin_sound drone, gate, closing, cannon, cannon_long, tick;
     sndmin_voice engine, gate_voice;
     omega_score score;
 } omega_audio;
@@ -97,98 +97,93 @@ static void blade(omega_mesh *m,vec3 root,vec3 tip,vec3 chord,float root_len,flo
 static omega_mesh make_ship(void) {
     omega_mesh m={.v=calloc(OMEGA_CAPACITY,sizeof(OmegaVertex))};
     VKMIN_ASSERT(m.v,"omega mesh allocation");
-    // Armored command section: broad vertical prow and recessed red bridge.
-    hull(&m,(vec3){0,0,-6.7f},(vec3){3.8f,6.1f,4.1f},.65f,armor,0);
-    hull(&m,(vec3){0,-.4f,-8.8f},(vec3){3.2f,4.4f,.4f},.7f,steel,0);
-    // Layer the frame and window in front of the bow, never coplanar with it.
-    hull(&m,(vec3){0,1.8f,-9.02f},(vec3){2.8f,.9f,.22f},.20f,dark,0);
-    hull(&m,(vec3){0,1.8f,-9.16f},(vec3){2.4f,.58f,.10f},.15f,red,0);
-    hull(&m,(vec3){0,3.12f,-6.7f},(vec3){2.3f,.55f,2.4f},.12f,dark,0);
-    hull(&m,(vec3){0,3.45f,-6.5f},(vec3){1.3f,.2f,1.3f},.07f,steel,0);
+    const vec4 girder={.26f,.25f,.23f,1};
+    // Long, narrow forward command section with a recessed bridge, hangar
+    // flanks and window rows; the bow carries the two heavy laser mantlets.
+    hull(&m,(vec3){0,0,-15.6f},(vec3){2.6f,3.2f,7.2f},.42f,armor,0);
+    hull(&m,(vec3){0,-.2f,-19.3f},(vec3){2.2f,2.5f,.4f},.5f,steel,0);
+    hull(&m,(vec3){0,1.25f,-19.52f},(vec3){1.9f,.62f,.2f},.15f,dark,0);
+    hull(&m,(vec3){0,1.25f,-19.64f},(vec3){1.6f,.38f,.1f},.1f,red,0);
+    hull(&m,(vec3){0,1.85f,-15.6f},(vec3){1.5f,.42f,5.8f},.1f,dark,0);
+    hull(&m,(vec3){0,2.15f,-16.2f},(vec3){.9f,.2f,1.6f},.06f,steel,0);
     for(int side=-1;side<=1;side+=2) {
-        const float x=(float)side;
-        // Forward heavy laser barrels and stepped armored mantlets.
-        tube(&m,(vec3){x*1.25f,.55f,-8.9f},(vec3){x*1.25f,.55f,-9.45f},.47f,.32f,dark,0,16);
-        tube(&m,(vec3){x*1.25f,.55f,-9.45f},(vec3){x*1.25f,.55f,-10.0f},.23f,.19f,steel,0,16);
-        tube(&m,(vec3){x*1.25f,.55f,-10.01f},(vec3){x*1.25f,.55f,-10.04f},.13f,.13f,red,4,16);
-        tube(&m,(vec3){x*1.25f,.55f,-10.05f},(vec3){x*1.25f,.55f,-90.f},.042f,.034f,red,5,12);
-        for(int k=0;k<3;++k) {
-            tube(&m,(vec3){x*.95f,-1.7f,-8.98f+(float)k*.08f},(vec3){x*.95f,-.65f,-8.98f+(float)k*.08f},.27f,.27f,dark,0,12);
-        }
-        hull(&m,(vec3){x*1.94f,.3f,-6.6f},(vec3){.22f,2.4f,2.7f},.07f,dark,2);
-        hull(&m,(vec3){x*2.1f,.5f,-6.6f},(vec3){.18f,.4f,1.3f},.05f,red,0);
-        tube(&m,(vec3){x*.95f,3.5f,-6.6f},(vec3){x*.95f,5.7f,-6.6f},.045f,.012f,steel,0,6);
-        tube(&m,(vec3){x*1.1f,-2.6f,-8.5f},(vec3){x*1.1f,-4.7f,-8.5f},.035f,.012f,steel,0,6);
-        for(int k=0;k<8;++k) {
-            const float z=-7.9f+(float)k*.37f;
-            hull(&m,(vec3){x*1.92f,2.1f,z},(vec3){.06f,.07f,.12f},.01f,(vec4){1,.9f,.7f,1},4);
-        }
-    }
-    // Long central spine, pressure cylinders and exposed structural longerons.
-    tube(&m,(vec3){0,0,-4.6f},(vec3){0,0,7.8f},.68f,.68f,dark,2,16);
-    for(int k=0;k<17;++k) {
-        const float z=-4.4f+(float)k*.72f;
-        tube(&m,(vec3){0,0,z},(vec3){0,0,z+.12f},.84f,.84f,steel,0,16);
-    }
-    for(int side=-1;side<=1;side+=2) {
-        const float x=(float)side;
-        for(int k=0;k<8;++k) {
-            const float z=-4.4f+(float)k*1.45f;
-            tube(&m,(vec3){x*.84f,-.56f,z},(vec3){x*.84f,.56f,z+1.35f},.055f,.055f,steel,0,6);
-            tube(&m,(vec3){x*.84f,.56f,z},(vec3){x*.84f,-.56f,z+1.35f},.055f,.055f,steel,0,6);
-        }
-    }
-    // Counterbalanced rotating habitat: two large rectangular drums with X ribs.
-    m.part=1;
-    tube(&m,(vec3){0,0,-2.1f},(vec3){0,0,3.6f},1.05f,1.05f,steel,0,24);
-    for(int side=-1;side<=1;side+=2) {
-        const float y=(float)side;
-        hull(&m,(vec3){0,y*1.8f,.6f},(vec3){1.1f,2.4f,3.4f},.15f,dark,0);
-        hull(&m,(vec3){0,y*3.65f,.6f},(vec3){4.25f,2.45f,5.4f},.36f,dark,2);
-        hull(&m,(vec3){0,y*4.9f,.6f},(vec3){4.4f,.28f,5.55f},.14f,armor,0);
-        for(int end=-1;end<=1;end+=2) {
-            const float z=.6f+(float)end*2.77f;
-            hull(&m,(vec3){0,y*3.65f,z},(vec3){4.22f,2.4f,.13f},.2f,armor,0);
-            for(int panel=0;panel<2;++panel) {
-                const float cx=-1.04f+(float)panel*2.08f;
-                const vec3 a={cx-.93f,y*3.65f-1.02f,z+(float)end*.1f};
-                const vec3 b={cx+.93f,y*3.65f+1.02f,z+(float)end*.1f};
-                tube(&m,a,b,.09f,.09f,steel,0,6);
-                tube(&m,(vec3){a.x,b.y,a.z},(vec3){b.x,a.y,b.z},.09f,.09f,steel,0,6);
-            }
-        }
+        const float x=(float)side*OMEGA_MUZZLE_X;
+        tube(&m,(vec3){x,.4f,-19.2f},(vec3){x,.4f,-19.75f},.42f,.30f,dark,0,16);
+        tube(&m,(vec3){x,.4f,-19.75f},(vec3){x,.4f,OMEGA_MUZZLE_Z+.05f},.21f,.17f,steel,0,16);
+        tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z+.04f},(vec3){x,.4f,OMEGA_MUZZLE_Z+.01f},.12f,.12f,red,4,16);
+        tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z},(vec3){x,.4f,-100.f},.042f,.034f,red,5,12);
+        const float flank=(float)side;
+        hull(&m,(vec3){flank*1.38f,.1f,-15.4f},(vec3){.2f,2.2f,5.4f},.06f,dark,2);
+        hull(&m,(vec3){flank*1.5f,.35f,-15.4f},(vec3){.16f,.36f,2.6f},.05f,red,0);
+        tube(&m,(vec3){flank*.7f,2.05f,-17.f},(vec3){flank*.7f,4.6f,-17.f},.045f,.012f,steel,0,6);
+        tube(&m,(vec3){flank*.9f,-1.7f,-18.6f},(vec3){flank*.9f,-3.6f,-18.6f},.035f,.012f,steel,0,6);
         for(int k=0;k<14;++k) {
-            const float z=-1.8f+(float)k*.37f;
-            hull(&m,(vec3){-2.16f,y*3.65f,z},(vec3){.15f,1.9f,.075f},.02f,steel,0);
-            hull(&m,(vec3){2.16f,y*3.65f,z},(vec3){.15f,1.9f,.075f},.02f,steel,0);
-            for(int s=-1;s<=1;s+=2) hull(&m,(vec3){(float)s*2.25f,y*4.3f,z},
-                (vec3){.04f,.055f,.13f},.01f,(vec4){.7f,.8f,1,1},3);
+            const float z=-18.6f+(float)k*.46f;
+            hull(&m,(vec3){flank*1.32f,1.05f,z},(vec3){.06f,.07f,.12f},.01f,(vec4){1,.9f,.7f,1},4);
+        }
+    }
+    // Open forward spine: a pressure tube with rib rings and four lattice faces.
+    tube(&m,(vec3){0,0,-12.4f},(vec3){0,0,-3.4f},.6f,.6f,dark,2,16);
+    for(int k=0;k<11;++k) {
+        const float z=-12.2f+(float)k*.86f;
+        tube(&m,(vec3){0,0,z},(vec3){0,0,z+.12f},.76f,.76f,steel,0,16);
+    }
+    for(int face=0;face<4;++face) {
+        const float a=(float)face*omega_pi*.5f+omega_pi*.25f;
+        const float ux=cosf(a)*.9f,uy=sinf(a)*.9f,tx=-sinf(a)*.5f,ty=cosf(a)*.5f;
+        for(int k=0;k<6;++k) {
+            const float z=-12.2f+(float)k*1.45f;
+            tube(&m,(vec3){ux-tx,uy-ty,z},(vec3){ux+tx,uy+ty,z+1.35f},.05f,.05f,steel,0,5);
+            tube(&m,(vec3){ux+tx,uy+ty,z},(vec3){ux-tx,uy-ty,z+1.35f},.05f,.05f,steel,0,5);
+        }
+    }
+    // Rotating habitat: an open girder cage of rings and longerons around a
+    // ribbed pressure drum with rows of lit windows.
+    m.part=1;
+    tube(&m,(vec3){0,0,-3.2f},(vec3){0,0,7.2f},3.55f,3.55f,dark,2,24);
+    tube(&m,(vec3){0,0,-3.3f},(vec3){0,0,-3.1f},4.4f,4.4f,steel,0,24);
+    tube(&m,(vec3){0,0,7.1f},(vec3){0,0,7.3f},4.4f,4.4f,steel,0,24);
+    for(int ring=1;ring<5;++ring) {
+        const float z=-3.2f+(float)ring*2.08f;
+        tube(&m,(vec3){0,0,z},(vec3){0,0,z+.18f},4.45f,4.45f,girder,0,24);
+    }
+    for(int spoke=0;spoke<12;++spoke) {
+        const float a=(float)spoke*omega_pi/6,ca=cosf(a),sa=sinf(a);
+        const float b=a+omega_pi/6,cb=cosf(b),sb=sinf(b);
+        const float w=a+omega_pi/12,cw=cosf(w),sw=sinf(w);
+        tube(&m,(vec3){ca*4.4f,sa*4.4f,-3.2f},(vec3){ca*4.4f,sa*4.4f,7.2f},.14f,.14f,girder,0,6);
+        for(int k=0;k<5;++k) {
+            const float z=-3.0f+(float)k*2.0f;
+            tube(&m,(vec3){ca*4.4f,sa*4.4f,z},(vec3){cb*4.4f,sb*4.4f,z+1.9f},.06f,.06f,steel,0,4);
+        }
+        for(int k=0;k<4;++k) {
+            const float z=-1.9f+(float)k*2.3f;
+            hull(&m,(vec3){cw*3.62f,sw*3.62f,z},(vec3){.14f,.08f,.26f},.01f,(vec4){.35f,.8f,2.5f,1},4);
         }
     }
     m.part=0;
-    // Reactor block and four independent armored engine nacelles.
-    hull(&m,(vec3){0,0,6.7f},(vec3){3.1f,3.4f,3.5f},.5f,armor,0);
+    // Reactor block and four armored engine nacelles with wide bells whose
+    // glow is the ship's brightest light.
+    hull(&m,(vec3){0,0,9.9f},(vec3){3.2f,3.6f,5.0f},.5f,armor,0);
     for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2) {
-        const float x=(float)sx*1.8f,y=(float)sy*1.65f;
-        hull(&m,(vec3){x,y,7.2f},(vec3){1.6f,1.7f,3.7f},.34f,dark,2);
-        for(int k=0;k<5;++k) hull(&m,(vec3){x,y,5.7f+(float)k*.66f},
-            (vec3){1.75f,1.86f,.12f},.28f,steel,0);
-        tube(&m,(vec3){x,y,8.8f},(vec3){x,y,9.4f},.70f,.59f,steel,0,16);
-        tube(&m,(vec3){x,y,9.4f},(vec3){x,y,9.45f},.47f,.47f,(vec4){1,1,1,1},3,16);
-        tube(&m,(vec3){x,y,9.46f},(vec3){x,y,11.8f},.35f,.02f,(vec4){.25f,.5f,1,1},3,16);
+        const float x=(float)sx*2.05f,y=(float)sy*1.85f;
+        hull(&m,(vec3){x,y,11.6f},(vec3){1.5f,1.6f,5.6f},.32f,dark,2);
+        for(int k=0;k<5;++k) hull(&m,(vec3){x,y,9.6f+(float)k*.9f},(vec3){1.65f,1.75f,.12f},.28f,steel,0);
+        tube(&m,(vec3){x,y,14.3f},(vec3){x,y,15.7f},.78f,1.12f,steel,0,16);
+        tube(&m,(vec3){x,y,15.68f},(vec3){x,y,15.74f},1.0f,1.0f,(vec4){1,1,1,1},3,16);
+        tube(&m,(vec3){x,y,15.75f},(vec3){x,y,20.5f},.9f,.03f,(vec4){1,1,1,1},7,16);
     }
-    // Secondary turrets and hull equipment provide intermediate scale detail.
+    // Secondary turrets beside the reactor and the fleet insignia on the bow.
     for(int k=0;k<5;++k) for(int side=-1;side<=1;side+=2) {
-        const float x=(float)side,z=5.4f+(float)k*.47f;
-        hull(&m,(vec3){x*1.58f,.1f,z},(vec3){.20f,1.4f,.29f},.055f,dark,0);
+        const float x=(float)side,z=8.2f+(float)k*.6f;
+        hull(&m,(vec3){x*1.62f,.1f,z},(vec3){.2f,1.5f,.3f},.055f,dark,0);
     }
-    // Brass fleet insignia on the bow, slightly proud of its recessed plate.
-    hull(&m,(vec3){.68f,-1.75f,-9.04f},(vec3){.48f,.72f,.04f},.05f,dark,0);
-    hull(&m,(vec3){.68f,-1.51f,-9.08f},(vec3){.34f,.09f,.03f},.02f,(vec4){.65f,.39f,.10f,1},0);
-    hull(&m,(vec3){.68f,-1.79f,-9.08f},(vec3){.085f,.55f,.03f},.01f,(vec4){.65f,.39f,.10f,1},0);
+    hull(&m,(vec3){.6f,-1.45f,-19.55f},(vec3){.44f,.66f,.04f},.05f,dark,0);
+    hull(&m,(vec3){.6f,-1.23f,-19.6f},(vec3){.3f,.08f,.03f},.02f,(vec4){.65f,.39f,.10f,1},0);
+    hull(&m,(vec3){.6f,-1.49f,-19.6f},(vec3){.08f,.5f,.03f},.01f,(vec4){.65f,.39f,.10f,1},0);
     // Small four-wing escorts establish the capital ship's scale.
     m.part=2;
-    const vec3 escorts[3]={{-5.2f,-3.5f,-5.5f},{5.5f,3.8f,-1.0f},{-3.9f,4.9f,4.8f}};
+    const vec3 escorts[3]={{-6.2f,-3.8f,-12.f},{6.5f,4.2f,-3.f},{-4.6f,5.6f,9.f}};
     for(int i=0;i<3;++i) {
         const vec3 e=escorts[i];
         hull(&m,e,(vec3){.30f,.34f,.8f},.1f,dark,0);
@@ -273,6 +268,20 @@ static float cannon_flash(uint32_t tick) {
     const float age=(float)pulse.age/60.f,duration=(float)pulse.duration/60.f;
     return (1-smooth(duration-.07f,duration,age))*(.90f+.10f*cosf(age*80));
 }
+/* Screen position of a hull-space point in UV, or a negative w when behind the
+ * camera. Column-major, as vkmin_math builds its matrices. */
+static vec3 project_uv(mat4 m,vec3 p) {
+    const float x=m.m[0]*p.x+m.m[4]*p.y+m.m[8]*p.z+m.m[12];
+    const float y=m.m[1]*p.x+m.m[5]*p.y+m.m[9]*p.z+m.m[13];
+    const float w=m.m[3]*p.x+m.m[7]*p.y+m.m[11]*p.z+m.m[15];
+    return (vec3){w>0?x/w*.5f+.5f:0,w>0?y/w*.5f+.5f:0,w};
+}
+/* Which fin station the activation flare has reached; -1 before it starts. */
+static int activation_station(float t) {
+    if(t<.25f) return -1;
+    const float along=.30f+.62f*smooth(.25f,1.75f,t);
+    return (int)floorf(along*OMEGA_PYLON_STATIONS);
+}
 static double seconds_now(void) {
 #ifdef _WIN32
     LARGE_INTEGER counter,frequency;
@@ -330,6 +339,10 @@ static sndmin_sound sound_make(sndmin_ctx *audio,int kind) {
             const float envelope=smooth(0,.015f,t)*(1-smooth(closing?1.6f:3.1f,closing?2.45f:4.f,t));
             sample=envelope*(air*snap*.9f+(thunder*3.4f+body*.45f)*fronts*rolling
                 +sub*boom*.48f+thunder*charge*.8f)*(closing?.75f:1.f);
+        } else if(kind==5) {
+            // Activation tick: a short bright ping as the flare passes a station.
+            const float attack=smooth(0,.002f,t),tail=expf(-t*26);
+            sample=attack*tail*(sinf(2*omega_pi*1480*t+1.8f*sinf(2*omega_pi*2220*t))*.42f+low*.15f);
         } else {
             phase+=2*omega_pi*(48+720*expf(-t*8))/(float)SNDMIN_RATE;
             const float attack=smooth(0,.005f,t),tail=expf(-t*3.5f);
@@ -369,11 +382,21 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
         if(!a->gate_voice.id) return false;
     }
     if(!paused && !omega_score_tick(audio,&a->score,tick)) return false;
+    // The activation flares pass a fin station: a rising ping for each, in
+    // step with the lights.
+    if(!paused && tick>0) {
+        const int station=activation_station((float)tick/60),before=activation_station((float)(tick-1)/60);
+        if(station!=before && before>=0) {
+            const sndmin_voice ping=sndmin_play(audio,&(sndmin_play_desc){.sound=a->tick,
+                .voice={.gain=.55f,.pitch=powf(2.f,(float)station/6.f)}});
+            if(!ping.id) return false;
+        }
+    }
     const omega_pulse pulse=cannon_pulse(tick);
     if(!paused && pulse.duration && pulse.age==0) {
         for(int side=-1;side<=1;side+=2) {
             const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){.sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
-                .voice={.gain=.85f,.position={(float)side*1.25f,.55f,-10+ship_position((float)tick/60)},.min_radius=18,.max_radius=120}});
+                .voice={.gain=.85f,.position={(float)side*OMEGA_MUZZLE_X,.4f,OMEGA_MUZZLE_Z+ship_position((float)tick/60)},.min_radius=18,.max_radius=120}});
             if(!shot.id) return false;
         }
     }
@@ -400,7 +423,7 @@ int main(int argc,char **argv) {
     sndmin_ctx *audio=sndmin_init(&(sndmin_desc){.offline=offline});
     if(!audio) return 1;
     omega_audio a={.drone=sound_make(audio,0),.gate=sound_make(audio,1),.closing=sound_make(audio,4),
-        .cannon=sound_make(audio,2),.cannon_long=sound_make(audio,3),.score=omega_score_init(audio)};
+        .cannon=sound_make(audio,2),.cannon_long=sound_make(audio,3),.tick=sound_make(audio,5),.score=omega_score_init(audio)};
     if(!a.drone.id || !a.gate.id || !a.closing.id || !a.cannon.id || !a.cannon_long.id || !omega_score_ready(a.score)) {
         sndmin_shutdown(audio); return 1;
     }
@@ -448,6 +471,7 @@ int main(int argc,char **argv) {
         .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
     OmegaPush p={.vertices=vkmin_address(gpu,geometry),.gate_id=vkmin_index(gpu,gate_layer)};
     bool paused=false,muted=false,ok=true; uint32_t absolute=0,phase=0; float orbit=0,elevation=0;
+    mat4 previous_vp={{0}}; float previous_ship=0; bool have_previous=false;
     const double start=seconds_now();
     while(ok && vkmin_running(gpu)) {
         const vkmin_frame f=vkmin_frame_begin(gpu,NULL);
@@ -485,13 +509,24 @@ int main(int argc,char **argv) {
         const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
         const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
         const vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
+        const mat4 vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
+        // The hull's screen motion since the last frame drives a shutter smear;
+        // capped so the whip pan smears without dissolving.
+        const vec3 now=project_uv(vp,(vec3){0,0,ship_position(t)});
+        const vec3 before=have_previous?project_uv(previous_vp,(vec3){0,0,previous_ship}):now;
+        vec2 motion={now.x-before.x,now.y-before.y};
+        if(!have_previous || now.z<=0 || before.z<=0) motion=(vec2){0,0};
+        const float extent=sqrtf(motion.x*motion.x+motion.y*motion.y);
+        if(extent>.03f) { motion.x*=.03f/extent; motion.y*=.03f/extent; }
+        previous_vp=vp; previous_ship=ship_position(t); have_previous=true;
         // One per-frame block; the journal relocates its ring address on replay.
         OmegaScene *scene=vkmin_ring_alloc(gpu,sizeof *scene,&p.frame);
         *scene=(OmegaScene){
-            .vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0})),
+            .vp=vp,
             .eye={eye.x,eye.y,eye.z,0},
             .scene={t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))},
-            .flash=cannon_flash(visual)};
+            .flash=cannon_flash(visual),
+            .blur={motion.x,motion.y,.6f,0}};
         vkmin_timestamp(gpu,0);
         p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});

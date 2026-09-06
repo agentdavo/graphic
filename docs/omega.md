@@ -22,7 +22,7 @@ The 20-second loop follows the supplied gate-opening sequence:
 | Time | Action |
 | --- | --- |
 | 0–1 seconds | Dormant pylons against black space |
-| 0.25–2.2 seconds | A red-orange flare appears part way along each pylon, travels toward the far cap brightening at every fin station, and swells into a pink-white sphere |
+| 0.25–2.2 seconds | A red-orange flare appears part way along each pylon, travels toward the far cap brightening at every fin station, and swells into a pink-white sphere; a rising ping sounds as it passes each station |
 | 1.9–2.9 seconds | The four spheres merge into a central white flash, with halo, streak and ring, that lights the structures |
 | 2–4.5 seconds | A small blue ring with a dark centre expands into the funnel |
 | 4.5–9.55 seconds | Tiny ship cruises rapidly through the distant corridor; a warm glow at the throat from 7 to 9.4 seconds announces its arrival |
@@ -50,9 +50,14 @@ Each cannon burst has two 0.23-second shots spaced 0.55 seconds apart, followed
 by a 1.3-second sustained beam. Bursts repeat every 3.6 seconds, with a shared
 tick schedule driving the beams, muzzle lighting and short/sustained sounds.
 
-The ship has 11,184 triangles including three four-wing escorts, a rotating
-counterbalanced habitat, bow cannon mantlets, antennae, ribs, windows, a reactor
-block and four engine banks. Four fixed gate pylons bring the scene to 15,696
+The ship follows the Omega-class proportions: a long, narrow forward command
+section with a recessed bridge, hangar flanks and window rows, an open lattice
+spine, a rotating habitat that is a girder cage of rings and longerons around a
+ribbed pressure drum, a reactor block and four armored engine nacelles whose
+wide bells trail dissolving plumes, plus three four-wing escorts. Its hull is lit
+by a warm key from the side with cool fill from the engines, as in the ISN
+footage, and the bow cannons fire from `OMEGA_MUZZLE_Z`. The ship is about
+10,000 triangles; the four fixed gate pylons bring the scene to 14,672
 triangles. Each is an open box truss of four rust rails from z=38 inside the
 cone to z=-4 toward the camera, splayed outward by 4 degrees about its far
 cap, with a cross frame, a yellow window bay and a pair of long tangential
@@ -65,7 +70,9 @@ their metal surfaces.
 The rendering passes are a 2048-square directional shadow map, a separate HDR
 gate layer, the composite HDR scene, quarter-resolution bloom, and a period
 grade: highlights clip to white with a gentle knee, chroma bleeds sideways
-while luma stays sharp, and fine per-tick grain is added. Hull
+while luma stays sharp, fine per-tick grain is added, and the scene is smeared
+along the hull's screen motion since the previous frame, a shutter for the
+flyby and the whip pan, capped at 3% of the frame. Hull
 shading includes procedural armor panels, rivets, roughness, key lighting,
 gate-colored rim lighting and transient red muzzle lighting. The
 vortex is one analytic cone from the 14-unit mouth to a 1.5-unit throat 74

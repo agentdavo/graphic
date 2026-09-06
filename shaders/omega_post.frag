@@ -2,6 +2,15 @@
 #include "omega.glsl"
 layout(location=0) in vec2 uv;
 layout(location=0) out vec4 result;
+// Scene sample smeared along the hull's screen-space motion: a shutter for
+// the flyby and the whip pan, as the footage has. Free when nothing moves.
+vec3 scene(vec2 p) {
+    vec2 sweep=F.blur.xy*F.blur.z;
+    if(dot(sweep,sweep)<1e-9) return texture(TEX(o.texture_id),p).rgb;
+    vec3 sum=vec3(0);
+    for(int k=-2;k<=2;k++) sum+=texture(TEX(o.texture_id),p+sweep*(float(k)*.5)).rgb;
+    return sum/5.;
+}
 void main() {
     if(o.pass==OMEGA_PASS_BACKDROP) { result=vec4(texture(TEX(o.texture_id),uv).rgb,1); return; }
     vec2 px=1./vec2(textureSize(TEX(o.texture_id),0));
@@ -14,7 +23,7 @@ void main() {
         }
         result=vec4(sum/total,1); return;
     }
-    vec3 c=texture(TEX(o.texture_id),uv).rgb;
+    vec3 c=scene(uv);
     vec2 bp=1./vec2(textureSize(TEX(o.bloom_id),0));
     vec3 bloom=vec3(0);
     for(int k=-4;k<=4;k++) {
@@ -32,7 +41,7 @@ void main() {
     // Composite video softness: luma stays sharp, chroma bleeds sideways.
     vec3 wide=vec3(0);
     for(int k=-3;k<=3;k++) {
-        vec3 s=texture(TEX(o.texture_id),uv+vec2(k,0)*px*1.5).rgb;
+        vec3 s=scene(uv+vec2(k,0)*px*1.5);
         s+=bloom*.085+flares; s*=1.15; s=s/(1.+s*.06);
         wide+=pow(clamp(s,0.,1.),vec3(1./2.2))*exp(-float(k*k)*.22);
     }

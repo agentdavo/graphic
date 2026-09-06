@@ -17,7 +17,7 @@ void main() {
         p.xy=r*p.xy; n.xy=r*n.xy;
     }
     if(material==5) {
-        p.z=-9.9+(p.z+9.9)*step(.01,F.flash);
+        p.z=OMEGA_MUZZLE_Z+(p.z-OMEGA_MUZZLE_Z)*step(.01,F.flash);
     }
     if(v.normal.w<2.5) p.z+=F.scene.z;
     if(v.normal.w>1.5 && v.normal.w<2.5) p.y+=.15*sin(F.scene.x*.8+p.x);

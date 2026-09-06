@@ -19,7 +19,7 @@ vec3 omegaGateShape() {
     return vec3(mix(farZ,nearZ,scale),farZ,scale);
 }
 vec4 omegaShadow(vec3 world) {
-    vec3 light=normalize(vec3(-.6,.9,-.65));
+    vec3 light=normalize(vec3(-.85,.35,-.45)); // the hull shader's key
     vec3 right=normalize(cross(-light,vec3(0,1,0)));
     vec3 up=cross(right,-light);
     return vec4(dot(right,world)/25.,-dot(up,world)/25.,(60.-dot(light,world))/120.,1);

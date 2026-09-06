@@ -19,6 +19,9 @@
 #define OMEGA_GATE_THROAT_Z 75.0f
 #define OMEGA_GATE_THROAT_RADIUS 1.5f
 #define OMEGA_GATE_ENTRANCE_Z 1200.0f
+/* Bow cannon muzzles in hull space; the beams and their lights start here. */
+#define OMEGA_MUZZLE_Z -20.2f
+#define OMEGA_MUZZLE_X 0.9f
 #define OMEGA_GATE_CLOSE_START 17.5f
 #define OMEGA_GATE_CLOSE_END 19.5f
 VKMIN_STRUCT(OmegaVertex) { vec4 position; vec4 normal; vec4 color; };
@@ -31,6 +34,7 @@ VKMIN_STRUCT(OmegaScene) {
     vec4 scene; /* seconds, aspect, ship translation, gate aperture */
     F32 flash;  /* cannon muzzle level */
     F32 reserved[3];
+    vec4 blur;  /* xy: hull motion this frame in UV; z: shutter fraction */
 };
 VKMIN_STRUCT(OmegaPush) {
     ADDR vertices;
@@ -47,7 +51,7 @@ VKMIN_STRUCT(OmegaPush) {
 #define OMEGA_PASS_GRADE 4u
 #ifndef VKMIN_GLSL
 _Static_assert(sizeof(OmegaVertex)==48, "omega vertex layout");
-_Static_assert(sizeof(OmegaScene)==112, "omega scene layout");
+_Static_assert(sizeof(OmegaScene)==128, "omega scene layout");
 _Static_assert(sizeof(OmegaPush)==32, "omega push layout");
 #endif
 #endif

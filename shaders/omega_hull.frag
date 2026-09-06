@@ -46,6 +46,13 @@ void main() {
         float fres=pow(abs(dot(n,v)),.6);
         result=vec4(vec3(5.5, .02, .006)*F.flash+vec3(7,1.6,.6)*pow(fres,3.)*F.flash,1); return;
     }
+    if(material==7) {
+        // Engine plume: bright at the bell, dissolving along its length, and
+        // slightly hotter on the axis so the bloom reads as a glow, not a cone.
+        float along=clamp((local.z-15.75)/4.75,0.,1.);
+        float fres=pow(abs(dot(n,v)),1.5);
+        result=vec4(vec3(.3,.7,1.6)*(1.-along)*(1.-along)*(1.2+1.8*fres),1); return;
+    }
     if(material==3 || material==4) {
         vec3 emission=material==3?vec3(.12,2.3,4.4):vec3(3.2,.9,.12);
         float level=(structure>.5 && material==3)?.10:1.;
@@ -74,7 +81,8 @@ void main() {
         float ribs=smoothstep(.16,.24,fract(stripe));
         base*=.40+.60*mix(.8,ribs,1.-smoothstep(.3,1.,fwidth(stripe)));
     }
-    vec3 key=normalize(vec3(-.6,.9,-.65));
+    // A warm key from the side, as in the ISN footage, with cool engine fill.
+    vec3 key=normalize(vec3(-.85,.35,-.45));
     vec3 rim=normalize(vec3(.2,.2,1.));
     float ndl=max(dot(n,key),0.);
     vec3 sc=omegaShadow(world).xyz;
@@ -89,8 +97,9 @@ void main() {
     float spec=pow(max(dot(n,h),0.),mix(120.,14.,rough))*.9;
     float fres=pow(1.-max(dot(n,v),0.),4.);
     float ao=mix(.60,1.,smoothstep(.65,3.8,length(local.xy)));
-    vec3 c=base*(vec3(.06,.08,.13)*ao+vec3(1.4,1.32,1.18)*ndl*visibility);
-    c+=vec3(.8,.70,.57)*spec*visibility;
+    vec3 c=base*(vec3(.05,.07,.12)*ao+vec3(1.7,1.15,.75)*ndl*visibility);
+    c+=vec3(.9,.68,.48)*spec*visibility;
+    if(structure<.5) c+=base*vec3(.10,.35,1.1)*max(dot(n,vec3(0,0,1)),0.)*smoothstep(4.5,5.1,F.scene.x);
     c*=mix(1.,.38+.30*F.scene.w,structure);
     c+=vec3(.025,.42,1.)*(base*.7+fres*.18)*pow(max(dot(n,rim),0.),.65)*F.scene.w*1.4;
     // The fixed gate machinery receives blue light from its inward emitters.
@@ -99,7 +108,7 @@ void main() {
     if(structure>.5) c+=base*vec3(3.,2.6,2.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
     // The plasma muzzle lights illuminate the forward armor in world space.
     for(int j=0;j<2;j++) {
-        vec3 light=vec3(j==0?-1.25:1.25,.55,-10.1+F.scene.z)-world;
+        vec3 light=vec3(j==0?-OMEGA_MUZZLE_X:OMEGA_MUZZLE_X,.4,OMEGA_MUZZLE_Z-.1+F.scene.z)-world;
         float d=length(light);
         c+=vec3(1.3,.012,.003)*F.flash*max(dot(n,normalize(light)),0.)/(1.+d*d*.5);
     }
