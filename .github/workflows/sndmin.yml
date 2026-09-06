@@ -24,13 +24,18 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cppcheck mingw-w64-ucrt-x86_64-python
+          install: make diffutils mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cppcheck mingw-w64-ucrt-x86_64-python
       - name: Linux goldens, guard and threaded null test
         if: runner.os == 'Linux'
         run: |
           make -f Makefile.sndmin -j4 sndmin-test sndmin-live
       - name: macOS goldens (Clang and cppcheck)
         if: runner.os == 'macOS'
+        # The stream example decodes Ogg through stb_vorbis, whose libm use
+        # differs on arm64 Darwin, so this platform keeps its own golden set.
+        # Generate it on a Mac with the same variable and `make sndmin-golden`.
+        env:
+          SNDMIN_GOLDEN: tests/golden/sndmin-darwin-arm64
         run: make -f Makefile.sndmin CC=clang ANALYZER= -j4 sndmin-test sndmin-live
       - name: Windows goldens
         if: runner.os == 'Windows'

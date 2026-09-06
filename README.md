@@ -101,6 +101,13 @@ make SANITIZE=1 BUILD=build_san build_san/corridor    # ASan + UBSan build
 ./build/corridor --cvars                                 # list them all
 ```
 
+Goldens are environment-specific: they record one driver's and one compiler's
+output, and this set was made under lavapipe on Windows. Another environment
+compares against its own set by pointing `VKMIN_GOLDEN` (images) and
+`SNDMIN_GOLDEN` (audio) at a directory, and creates that set once with
+`make golden` or `make sndmin-golden` under the same variable. A missing
+golden fails with that instruction rather than comparing across platforms.
+
 ## What is where
 
 | | lines | |

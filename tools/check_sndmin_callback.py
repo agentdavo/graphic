@@ -18,7 +18,12 @@ for block in re.split(r"\n(?=\S)", initial):
     nodes[node] = (name, "Type: function definition" in block,
                    re.findall(r"\S+/\d+", calls.group(1)) if calls else [])
 root = next(n for n, (name, _, _) in nodes.items() if name == "sndmin_mix")
-allowed = {"memcpy", "memset", "__atomic_load_4", "__atomic_store_4"}
+# memcpy/memset appear as their fortified spellings when the distribution's
+# compiler enables _FORTIFY_SOURCE (Ubuntu's GCC does); the size builtin they
+# carry is a compile-time query, not a call that leaves the translation unit.
+allowed = {"memcpy", "memset", "__memcpy_chk", "__memset_chk",
+           "__builtin_object_size", "__builtin_dynamic_object_size",
+           "__atomic_load_4", "__atomic_store_4"}
 visited = set()
 pending = [root]
 while pending:

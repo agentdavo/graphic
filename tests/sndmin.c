@@ -49,9 +49,15 @@ int main(int argc,char **argv) {
     }
     if(argc==5&&strcmp(argv[1],"--replay")==0) {
         sndmin_ctx *c=sndmin_init(&(sndmin_desc){.offline=true}); CHECK(c);
-        CHECK(sndmin_replay(c,argv[2]));
-        CHECK(sndmin_render(c,(uint32_t)strtoul(argv[3],NULL,10),argv[4],NULL));
-        sndmin_dump(c,stdout); sndmin_shutdown(c); return 0;
+        // The malformed-journal cases drive this path and expect CHECK's message
+        // shape; failing through shutdown keeps the leak checker clean.
+        const bool replayed=sndmin_replay(c,argv[2]);
+        const bool rendered=replayed&&sndmin_render(c,(uint32_t)strtoul(argv[3],NULL,10),argv[4],NULL);
+        if(rendered) sndmin_dump(c,stdout);
+        sndmin_shutdown(c);
+        if(!replayed) { fprintf(stderr,"sndmin test: %s:%d: %s\n",__FILE__,__LINE__,"sndmin_replay(c,argv[2])"); return 1; }
+        if(!rendered) { fprintf(stderr,"sndmin test: %s:%d: %s\n",__FILE__,__LINE__,"sndmin_render(c,...)"); return 1; }
+        return 0;
     }
     CHECK(sndmin_init(&(sndmin_desc){.layout=(sndmin_layout)9})==NULL);
     sndmin_ctx *a=sequence(),*b=sequence(); CHECK(a&&b);

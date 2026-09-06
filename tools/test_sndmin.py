@@ -4,13 +4,16 @@ import gzip
 from pathlib import Path
 import struct
 import subprocess
+import os
 import sys
 
 build = Path(sys.argv[1])
 write = "--write-golden" in sys.argv[2:]
 exe = build / ("test.exe" if sys.platform == "win32" else "test")
 out = Path("tests/out/sndmin")
-golden = Path("tests/golden/sndmin")
+# Goldens are bytes from one platform's libm and compiler; SNDMIN_GOLDEN
+# selects the set for this platform (default: the Windows/Linux GCC set).
+golden = Path(os.environ.get("SNDMIN_GOLDEN", "tests/golden/sndmin"))
 golden.mkdir(parents=True, exist_ok=True)
 frozen = Path("tests/journals/sndmin")
 frozen.mkdir(parents=True, exist_ok=True)
@@ -25,6 +28,7 @@ for name, frames in [("01_beep", 120), ("02_song", 2400), ("03_room", 840), ("04
     if write:
         target.write_bytes(data)
         (frozen / f"{name}.jrnl.gz").write_bytes(gzip.compress((out / f"{name}.jrnl").read_bytes(), mtime=0))
+    assert target.exists(), f"{name}: no golden in {golden} (run `make sndmin-golden` with SNDMIN_GOLDEN={golden} on this platform)"
     assert data == target.read_bytes(), f"{name}: golden differs"
     journal = out / f"{name}-frozen.jrnl"
     journal.write_bytes(gzip.decompress((frozen / f"{name}.jrnl.gz").read_bytes()))

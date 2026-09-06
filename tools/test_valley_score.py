@@ -4,6 +4,7 @@ import gzip
 import hashlib
 from pathlib import Path
 import subprocess
+import os
 import sys
 import wave
 
@@ -14,12 +15,14 @@ exe = build / ("test.exe" if sys.platform == "win32" else "test")
 wav = out / f"{name}.wav"
 replay = out / f"{name}-replay.wav"
 frozen = Path("tests/journals/sndmin") / f"{name}.jrnl.gz"
-golden = Path("tests/golden/sndmin") / f"{name}.sha256"
+golden = Path(os.environ.get("SNDMIN_GOLDEN", "tests/golden/sndmin")) / f"{name}.sha256"
+golden.parent.mkdir(parents=True, exist_ok=True)
 data = wav.read_bytes()
 digest = hashlib.sha256(data).hexdigest()
 if "--write-golden" in sys.argv[2:]:
     frozen.write_bytes(gzip.compress((out / f"{name}.jrnl").read_bytes(), mtime=0))
     golden.write_text(digest + "\n", encoding="ascii")
+assert golden.exists(), f"no golden in {golden.parent} (run `make sndmin-golden` with SNDMIN_GOLDEN={golden.parent} on this platform)"
 assert digest == golden.read_text(encoding="ascii").strip(), "ambient WAV golden differs"
 frozen_input = out / f"{name}-frozen.jrnl"
 frozen_input.write_bytes(gzip.decompress(frozen.read_bytes()))

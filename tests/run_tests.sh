@@ -6,10 +6,13 @@
 #
 #   ./tests/run_tests.sh                 compare against the goldens
 #   VKMIN_WRITE_GOLDEN=1 ./tests/...     regenerate the goldens instead
+#   VKMIN_GOLDEN=dir ./tests/...         compare against, or write, another set
 set -u
 
 BUILD=${BUILD:-build}
-GOLDEN=tests/golden
+# Goldens are pixels from one driver and compiler; VKMIN_GOLDEN selects the
+# set for this environment (default: the set made here under lavapipe).
+GOLDEN=${VKMIN_GOLDEN:-tests/golden}
 OUT=${VKMIN_TEST_OUT:-tests/out}
 TOLERANCE=${VKMIN_TOLERANCE:-2}
 CORRIDOR="./$BUILD/corridor --profile lavapipe --headless"
@@ -46,7 +49,7 @@ compare() {
         return
     fi
     if [ ! -f "$GOLDEN/$name.png" ]; then
-        fail "no golden for $name (run 'make golden' to create one)"
+        fail "no golden $GOLDEN/$name.png (run 'make golden' with VKMIN_GOLDEN=$GOLDEN to create this set)"
         return
     fi
     if ./$BUILD/imgdiff "$GOLDEN/$name.png" "$OUT/$name.png" "$TOLERANCE" "$OUT/$name.diff.png"; then
@@ -69,7 +72,7 @@ compare_hash() {
         return
     fi
     if [ ! -f "$GOLDEN/$name.sha256" ]; then
-        fail "no golden for $name (run 'make golden' to create one)"
+        fail "no golden $GOLDEN/$name.sha256 (run 'make golden' with VKMIN_GOLDEN=$GOLDEN to create this set)"
         return
     fi
     if [ "$digest" = "$(cut -c1-64 "$GOLDEN/$name.sha256")" ]; then
