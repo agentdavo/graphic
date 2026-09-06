@@ -395,8 +395,10 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
     const omega_pulse pulse=cannon_pulse(tick);
     if(!paused && pulse.duration && pulse.age==0) {
         for(int side=-1;side<=1;side+=2) {
-            const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){.sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
-                .voice={.gain=.85f,.position={(float)side*OMEGA_MUZZLE_X,.4f,OMEGA_MUZZLE_Z+ship_position((float)tick/60)},.min_radius=18,.max_radius=120}});
+            const vec3 muzzle={(float)side*OMEGA_MUZZLE_X,.4f,OMEGA_MUZZLE_Z+ship_position((float)tick/60)};
+            const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){
+                .sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
+                .voice={.gain=.85f,.position=muzzle,.min_radius=18,.max_radius=120}});
             if(!shot.id) return false;
         }
     }
@@ -529,27 +531,37 @@ int main(int argc,char **argv) {
             .blur={motion.x,motion.y,.6f,0}};
         vkmin_timestamp(gpu,0);
         p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{shadow,VKMIN_USE_DEPTH_TARGET}},.image_count=1});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.depth=shadow,.clear_depth=true,.label="omega shadow map"});
         vkmin_draw(gpu,shadow_pipe,&p,mesh.count,1); vkmin_pass_end(gpu);
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{shadow,VKMIN_USE_SAMPLED}},.image_count=1});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{shadow,VKMIN_USE_SAMPLED}},.image_count=1});
         vkmin_timestamp(gpu,1);
         p.pass=OMEGA_PASS_SCENE;
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{gate_layer,VKMIN_USE_COLOR_TARGET}},.image_count=1});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_COLOR_TARGET}},.image_count=1});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=gate_layer,.clear_color=true,.label="omega gate energy"});
         vkmin_draw(gpu,gate,&p,3,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,2);
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED},{hdr,VKMIN_USE_COLOR_TARGET},{depth,VKMIN_USE_DEPTH_TARGET}},.image_count=3});
-        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=hdr,.depth=depth,.clear_color=true,.clear_depth=true,.clear={0,0,0,1},.label="omega HDR scene"});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED},{hdr,VKMIN_USE_COLOR_TARGET},{depth,VKMIN_USE_DEPTH_TARGET}},
+            .image_count=3});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=hdr,.depth=depth,.clear_color=true,.clear_depth=true,
+            .clear={0,0,0,1},.label="omega HDR scene"});
         p.pass=OMEGA_PASS_BACKDROP; p.texture_id=p.gate_id; vkmin_draw(gpu,background,&p,3,1);
         p.pass=OMEGA_PASS_SCENE; p.texture_id=shadow_index; vkmin_draw(gpu,ship,&p,mesh.count,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,3);
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{hdr,VKMIN_USE_SAMPLED},{glow,VKMIN_USE_COLOR_TARGET}},.image_count=2});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{hdr,VKMIN_USE_SAMPLED},{glow,VKMIN_USE_COLOR_TARGET}},.image_count=2});
         vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=glow,.clear_color=true,.label="omega glow"});
         p.pass=OMEGA_PASS_BLOOM; p.texture_id=hdr_index; vkmin_draw(gpu,bloom,&p,3,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,4);
-        vkmin_barrier(gpu,&(vkmin_barrier_desc){.images=(vkmin_transition[]){{glow,VKMIN_USE_SAMPLED},{vkmin_backbuffer(gpu),VKMIN_USE_COLOR_TARGET}},.image_count=2});
-        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),.depth=vkmin_default_depth(gpu),.clear_color=true,.clear_depth=true,.label="omega presentation"});
+        vkmin_barrier(gpu,&(vkmin_barrier_desc){
+            .images=(vkmin_transition[]){{glow,VKMIN_USE_SAMPLED},{vkmin_backbuffer(gpu),VKMIN_USE_COLOR_TARGET}},
+            .image_count=2});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),.depth=vkmin_default_depth(gpu),
+            .clear_color=true,.clear_depth=true,.label="omega presentation"});
         p.pass=OMEGA_PASS_GRADE; p.texture_id=hdr_index; p.bloom_id=glow_index; vkmin_draw(gpu,post,&p,3,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,5);
         vkmin_frame_end(gpu);
