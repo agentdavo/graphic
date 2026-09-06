@@ -1,5 +1,13 @@
 # vkmin / sndmin — v0.6 integration candidate
 
+The source is organized as **vkmin (GPU execution), sndmin (audio), and an
+optional render layer**. Common types/math are independent; terrain and scene
+layouts belong to render. See the [source ownership map and next engineering
+gates](src/README.md). `make packages` exports the libraries; `make package-test`
+checks consumers without access to the source include directory. vkmin retains
+its generated single-header distribution. The [consolidation verification](docs/source-consolidation.md)
+records the passing checks and the separate OMEGA artwork golden mismatch.
+
 **New demo: [OMEGA — Through the Blue](docs/omega.md).** A procedural destroyer
 emerges from a blue jump gate and fires its forward cannons, with a rotating
 habitat, escorts, custom shaders, shadows, bloom and synchronized sndmin audio.
@@ -23,7 +31,13 @@ This candidate adds persistent literal bus gains, transactional song loading,
 audio journal compatibility checks and a fix for unnamed rendering passes under
 Vulkan validation. See the [integration report and remaining gates](docs/v0.6-integration.md),
 [audio usage](docs/using-sndmin.md) and [review plan](docs/v0.6-review.md).
-Existing Corridor golden failures remain open; this is not full release acceptance.
+The historical Corridor goldens were resolved on 5 September; see the
+[source-commit comparison](docs/verification-2026-09-05.md#corridor-golden-resolution--5-september-2026-evening).
+This candidate still requires the remaining integration gates for release acceptance.
+
+**Frame inspection:** [capture a journal, step through passes or individual draw
+events, inspect raw buffers and compare checkpoints](docs/frame-inspection.md).
+Metrics now separate host work, waits, image writing, GPU rendering and readback.
 
 ## vkmin v0.5 — outside
 
@@ -53,7 +67,7 @@ comparisons, release checks, reuse candidates and remaining limitations.
 
 # vkmin v0.4 — a Doom 3-class world in a small C11 codebase, and five games on it
 
-**Current verification:** the isolated v0.4 Windows/lavapipe build for `main` completed 80
+**Historical v0.4 verification (superseded by the resolution linked above):** the isolated Windows/lavapipe build for `main` completed 80
 checks, with six historical Corridor golden mismatches still open. All five
 game journals replay exactly across Vulkan paths; gameplay traces and outcomes,
 static analysis, shader validation and runtime/reference checks passed. The

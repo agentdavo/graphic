@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-#include "vkmin_math.h"
+#include "min_types.h"
 #ifndef SNDMIN_MAX_VOICES
 #define SNDMIN_MAX_VOICES 64
 #endif

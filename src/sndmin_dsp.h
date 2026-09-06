@@ -4,7 +4,7 @@
 #define SNDMIN_DSP_H
 #include <stdint.h>
 #include <string.h>
-#include "vkmin_math.h"
+#include "min_math.h"
 static inline float snd_clamp(float x,float lo,float hi) { return x<lo?lo:(x>hi?hi:x); }
 static inline float snd_abs(float x) { return x<0?-x:x; }
 static inline float snd_zap(float x) { return snd_abs(x)<1e-20f?0:x; }
@@ -24,7 +24,7 @@ static inline float snd_exp2(float x) {
     float scale; memcpy(&scale,&bits,4); return scale*p;
 }
 static inline float snd_sin(float cycles) {
-    return vkmin_sin_cycles(cycles);
+    return min_sin_cycles(cycles);
 }
 static inline uint32_t snd_hash(uint32_t x) { x^=x>>16; x*=0x7feb352du; x^=x>>15; x*=0x846ca68bu; return x^(x>>16); }
 static inline float snd_noise(uint64_t sample,uint32_t salt) {

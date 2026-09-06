@@ -1,6 +1,7 @@
 /* 04_texture -- a texture is a number too: vkmin_index gives the bindless
  * index and the fragment shader samples textures[push.texture]. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "vkmin_math.h"
 #include "shaders.h"
 

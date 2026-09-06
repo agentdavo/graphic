@@ -3,6 +3,7 @@
  * the new one. Each rejection runs in a fresh child process: no Vulkan
  * threads or driver locks are inherited by a child that uses the driver. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "shaders.h"
 
 #include <stdio.h>

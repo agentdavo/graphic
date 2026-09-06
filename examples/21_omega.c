@@ -1,4 +1,4 @@
-/* OMEGA / THROUGH THE BLUE. Procedural geometry, materials and original audio.
+/* OMEGA / THROUGH THE BLUE. Blender-authored hull, native gate and original audio.
  * 20-second loop: ignition, opening, emergence, short-short-long fire, collapse.
  * Space pause; R restart; M mute; A/D orbit; W/S elevation; F12 capture.
  * --headless --frame 915 --out omega.png --audio-out omega.wav
@@ -9,6 +9,8 @@
 #include "sndmin.h"
 #include "omega_shared.h"
 #include "omega_score.h"
+#include "omega_model.h"
+#include "omega_surface.h"
 #include "shaders.h"
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +22,7 @@
 #include <threads.h>
 #endif
 
-enum { OMEGA_CAPACITY=160000, OMEGA_TICKS=1200, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1047 };
+enum { OMEGA_CAPACITY=240000, OMEGA_TICKS=1200, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1047 };
 typedef struct { OmegaVertex *v; uint32_t count; float part; } omega_mesh;
 typedef struct {
     sndmin_sound drone, gate, closing, cannon, cannon_long, tick;
@@ -97,90 +99,18 @@ static void blade(omega_mesh *m,vec3 root,vec3 tip,vec3 chord,float root_len,flo
 static omega_mesh make_ship(void) {
     omega_mesh m={.v=calloc(OMEGA_CAPACITY,sizeof(OmegaVertex))};
     VKMIN_ASSERT(m.v,"omega mesh allocation");
-    const vec4 girder={.26f,.25f,.23f,1};
-    // Long, narrow forward command section with a recessed bridge, hangar
-    // flanks and window rows; the bow carries the two heavy laser mantlets.
-    hull(&m,(vec3){0,0,-15.6f},(vec3){2.6f,3.2f,7.2f},.42f,armor,0);
-    hull(&m,(vec3){0,-.2f,-19.3f},(vec3){2.2f,2.5f,.4f},.5f,steel,0);
-    hull(&m,(vec3){0,1.25f,-19.52f},(vec3){1.9f,.62f,.2f},.15f,dark,0);
-    hull(&m,(vec3){0,1.25f,-19.64f},(vec3){1.6f,.38f,.1f},.1f,red,0);
-    hull(&m,(vec3){0,1.85f,-15.6f},(vec3){1.5f,.42f,5.8f},.1f,dark,0);
-    hull(&m,(vec3){0,2.15f,-16.2f},(vec3){.9f,.2f,1.6f},.06f,steel,0);
+    VKMIN_ASSERT(OMEGA_MODEL_COUNT+18000<OMEGA_CAPACITY,"omega authored mesh capacity");
+    for(size_t i=0;i<OMEGA_MODEL_COUNT;++i) {
+        const OmegaPackedVertex v=omega_model[i];
+        m.v[m.count++]=(OmegaVertex){
+            .position={(float)v.x*.001f,(float)v.y*.001f,(float)v.z*.001f,(float)v.material},
+            .normal={(float)v.nx/32767.f,(float)v.ny/32767.f,(float)v.nz/32767.f,(float)v.part},
+            .color={(float)v.r/255.f,(float)v.g/255.f,(float)v.b/255.f,1}};
+    }
     for(int side=-1;side<=1;side+=2) {
         const float x=(float)side*OMEGA_MUZZLE_X;
-        tube(&m,(vec3){x,.4f,-19.2f},(vec3){x,.4f,-19.75f},.42f,.30f,dark,0,16);
-        tube(&m,(vec3){x,.4f,-19.75f},(vec3){x,.4f,OMEGA_MUZZLE_Z+.05f},.21f,.17f,steel,0,16);
-        tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z+.04f},(vec3){x,.4f,OMEGA_MUZZLE_Z+.01f},.12f,.12f,red,4,16);
         tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z},(vec3){x,.4f,-100.f},.042f,.034f,red,5,12);
-        const float flank=(float)side;
-        hull(&m,(vec3){flank*1.38f,.1f,-15.4f},(vec3){.2f,2.2f,5.4f},.06f,dark,2);
-        hull(&m,(vec3){flank*1.5f,.35f,-15.4f},(vec3){.16f,.36f,2.6f},.05f,red,0);
-        tube(&m,(vec3){flank*.7f,2.05f,-17.f},(vec3){flank*.7f,4.6f,-17.f},.045f,.012f,steel,0,6);
-        tube(&m,(vec3){flank*.9f,-1.7f,-18.6f},(vec3){flank*.9f,-3.6f,-18.6f},.035f,.012f,steel,0,6);
-        for(int k=0;k<14;++k) {
-            const float z=-18.6f+(float)k*.46f;
-            hull(&m,(vec3){flank*1.32f,1.05f,z},(vec3){.06f,.07f,.12f},.01f,(vec4){1,.9f,.7f,1},4);
-        }
     }
-    // Open forward spine: a pressure tube with rib rings and four lattice faces.
-    tube(&m,(vec3){0,0,-12.4f},(vec3){0,0,-3.4f},.6f,.6f,dark,2,16);
-    for(int k=0;k<11;++k) {
-        const float z=-12.2f+(float)k*.86f;
-        tube(&m,(vec3){0,0,z},(vec3){0,0,z+.12f},.76f,.76f,steel,0,16);
-    }
-    for(int face=0;face<4;++face) {
-        const float a=(float)face*omega_pi*.5f+omega_pi*.25f;
-        const float ux=cosf(a)*.9f,uy=sinf(a)*.9f,tx=-sinf(a)*.5f,ty=cosf(a)*.5f;
-        for(int k=0;k<6;++k) {
-            const float z=-12.2f+(float)k*1.45f;
-            tube(&m,(vec3){ux-tx,uy-ty,z},(vec3){ux+tx,uy+ty,z+1.35f},.05f,.05f,steel,0,5);
-            tube(&m,(vec3){ux+tx,uy+ty,z},(vec3){ux-tx,uy-ty,z+1.35f},.05f,.05f,steel,0,5);
-        }
-    }
-    // Rotating habitat: an open girder cage of rings and longerons around a
-    // ribbed pressure drum with rows of lit windows.
-    m.part=1;
-    tube(&m,(vec3){0,0,-3.2f},(vec3){0,0,7.2f},3.55f,3.55f,dark,2,24);
-    tube(&m,(vec3){0,0,-3.3f},(vec3){0,0,-3.1f},4.4f,4.4f,steel,0,24);
-    tube(&m,(vec3){0,0,7.1f},(vec3){0,0,7.3f},4.4f,4.4f,steel,0,24);
-    for(int ring=1;ring<5;++ring) {
-        const float z=-3.2f+(float)ring*2.08f;
-        tube(&m,(vec3){0,0,z},(vec3){0,0,z+.18f},4.45f,4.45f,girder,0,24);
-    }
-    for(int spoke=0;spoke<12;++spoke) {
-        const float a=(float)spoke*omega_pi/6,ca=cosf(a),sa=sinf(a);
-        const float b=a+omega_pi/6,cb=cosf(b),sb=sinf(b);
-        const float w=a+omega_pi/12,cw=cosf(w),sw=sinf(w);
-        tube(&m,(vec3){ca*4.4f,sa*4.4f,-3.2f},(vec3){ca*4.4f,sa*4.4f,7.2f},.14f,.14f,girder,0,6);
-        for(int k=0;k<5;++k) {
-            const float z=-3.0f+(float)k*2.0f;
-            tube(&m,(vec3){ca*4.4f,sa*4.4f,z},(vec3){cb*4.4f,sb*4.4f,z+1.9f},.06f,.06f,steel,0,4);
-        }
-        for(int k=0;k<4;++k) {
-            const float z=-1.9f+(float)k*2.3f;
-            hull(&m,(vec3){cw*3.62f,sw*3.62f,z},(vec3){.14f,.08f,.26f},.01f,(vec4){.35f,.8f,2.5f,1},4);
-        }
-    }
-    m.part=0;
-    // Reactor block and four armored engine nacelles with wide bells whose
-    // glow is the ship's brightest light.
-    hull(&m,(vec3){0,0,9.9f},(vec3){3.2f,3.6f,5.0f},.5f,armor,0);
-    for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2) {
-        const float x=(float)sx*2.05f,y=(float)sy*1.85f;
-        hull(&m,(vec3){x,y,11.6f},(vec3){1.5f,1.6f,5.6f},.32f,dark,2);
-        for(int k=0;k<5;++k) hull(&m,(vec3){x,y,9.6f+(float)k*.9f},(vec3){1.65f,1.75f,.12f},.28f,steel,0);
-        tube(&m,(vec3){x,y,14.3f},(vec3){x,y,15.7f},.78f,1.12f,steel,0,16);
-        tube(&m,(vec3){x,y,15.68f},(vec3){x,y,15.74f},1.0f,1.0f,(vec4){1,1,1,1},3,16);
-        tube(&m,(vec3){x,y,15.75f},(vec3){x,y,20.5f},.9f,.03f,(vec4){1,1,1,1},7,16);
-    }
-    // Secondary turrets beside the reactor and the fleet insignia on the bow.
-    for(int k=0;k<5;++k) for(int side=-1;side<=1;side+=2) {
-        const float x=(float)side,z=8.2f+(float)k*.6f;
-        hull(&m,(vec3){x*1.62f,.1f,z},(vec3){.2f,1.5f,.3f},.055f,dark,0);
-    }
-    hull(&m,(vec3){.6f,-1.45f,-19.55f},(vec3){.44f,.66f,.04f},.05f,dark,0);
-    hull(&m,(vec3){.6f,-1.23f,-19.6f},(vec3){.3f,.08f,.03f},.02f,(vec4){.65f,.39f,.10f,1},0);
-    hull(&m,(vec3){.6f,-1.49f,-19.6f},(vec3){.08f,.5f,.03f},.01f,(vec4){.65f,.39f,.10f,1},0);
     // Small four-wing escorts establish the capital ship's scale.
     m.part=2;
     const vec3 escorts[3]={{-6.2f,-3.8f,-12.f},{6.5f,4.2f,-3.f},{-4.6f,5.6f,9.f}};
@@ -442,6 +372,15 @@ int main(int argc,char **argv) {
     const vkmin_buffer geometry=vkmin_make_buffer(gpu,&(vkmin_buffer_desc){
         .data={mesh.v,(size_t)mesh.count*sizeof(OmegaVertex)},.label="omega procedural destroyer"});
     free(mesh.v);
+    uint8_t *surface_pixels=malloc(256*256*4);
+    VKMIN_ASSERT(surface_pixels,"omega surface allocation");
+    for(size_t i=0;i<256*256;++i) {
+        surface_pixels[i*4]=surface_pixels[i*4+1]=surface_pixels[i*4+2]=omega_surface[i];
+        surface_pixels[i*4+3]=255;
+    }
+    const vkmin_image surface=vkmin_make_image(gpu,&(vkmin_image_desc){.width=256,.height=256,
+        .pixels={surface_pixels,256*256*4},.label="Blender weathered armor atlas"});
+    free(surface_pixels);
     int width,height; vkmin_size(gpu,&width,&height);
     const vkmin_image hdr=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
         .format=VKMIN_FMT_RGBA16_FLOAT,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega HDR"});
@@ -473,7 +412,7 @@ int main(int argc,char **argv) {
         .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
     OmegaPush p={.vertices=vkmin_address(gpu,geometry),.gate_id=vkmin_index(gpu,gate_layer)};
     bool paused=false,muted=false,ok=true; uint32_t absolute=0,phase=0; float orbit=0,elevation=0;
-    mat4 previous_vp={{0}}; float previous_ship=0; bool have_previous=false;
+    mat4 previous_vp={{0}}; float previous_ship=0; uint32_t previous_visual=0; bool have_previous=false;
     const double start=seconds_now();
     while(ok && vkmin_running(gpu)) {
         const vkmin_frame f=vkmin_frame_begin(gpu,NULL);
@@ -505,7 +444,7 @@ int main(int argc,char **argv) {
         // rise, so the reveal continues motion already under way rather than
         // starting from rest.
         const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
-        const float angle=-.16f-.007f*t-.28f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float angle=-.22f-.004f*t-.26f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
         const float radius=86.f-fminf(t,6.f)-18.f*reveal;
         const vec3 eye={sinf(angle)*radius,5.f+.17f*fminf(t,6.f)+6.f*reveal+elevation,cosf(angle)*-radius};
         const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
@@ -513,14 +452,15 @@ int main(int argc,char **argv) {
         const vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
         const mat4 vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
         // The hull's screen motion since the last frame drives a shutter smear;
-        // capped so the whip pan smears without dissolving.
+        // Use consecutive simulation ticks only; sparse captures are not motion.
+        // A small cap preserves the lattice and gate filaments.
         const vec3 now=project_uv(vp,(vec3){0,0,ship_position(t)});
         const vec3 before=have_previous?project_uv(previous_vp,(vec3){0,0,previous_ship}):now;
         vec2 motion={now.x-before.x,now.y-before.y};
-        if(!have_previous || now.z<=0 || before.z<=0) motion=(vec2){0,0};
+        if(!have_previous || visual!=previous_visual+1 || now.z<=0 || before.z<=0) motion=(vec2){0,0};
         const float extent=sqrtf(motion.x*motion.x+motion.y*motion.y);
-        if(extent>.03f) { motion.x*=.03f/extent; motion.y*=.03f/extent; }
-        previous_vp=vp; previous_ship=ship_position(t); have_previous=true;
+        if(extent>.004f) { motion.x*=.004f/extent; motion.y*=.004f/extent; }
+        previous_vp=vp; previous_ship=ship_position(t); previous_visual=visual; have_previous=true;
         // One per-frame block; the journal relocates its ring address on replay.
         OmegaScene *scene=vkmin_ring_alloc(gpu,sizeof *scene,&p.frame);
         *scene=(OmegaScene){
@@ -528,6 +468,7 @@ int main(int argc,char **argv) {
             .eye={eye.x,eye.y,eye.z,0},
             .scene={t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))},
             .flash=cannon_flash(visual),
+            .hull_texture=vkmin_index(gpu,surface),
             .blur={motion.x,motion.y,.6f,0}};
         vkmin_timestamp(gpu,0);
         p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;

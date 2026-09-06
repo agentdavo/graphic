@@ -2,6 +2,7 @@
  * cube with depth, in the lines below and no more. Animation is a pure
  * function of the frame index, so --frame 60 is the same pixels every run. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "vkmin_math.h"
 #include "shaders.h"
 #include "cube_data.h"

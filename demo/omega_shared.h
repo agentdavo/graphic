@@ -22,6 +22,9 @@
 /* Bow cannon muzzles in hull space; the beams and their lights start here. */
 #define OMEGA_MUZZLE_Z -20.2f
 #define OMEGA_MUZZLE_X 0.9f
+/* Engine centers after the official-book proportions pass. */
+#define OMEGA_ENGINE_X 1.804f
+#define OMEGA_ENGINE_Y 1.628f
 #define OMEGA_GATE_CLOSE_START 17.5f
 #define OMEGA_GATE_CLOSE_END 19.5f
 VKMIN_STRUCT(OmegaVertex) { vec4 position; vec4 normal; vec4 color; };
@@ -33,7 +36,8 @@ VKMIN_STRUCT(OmegaScene) {
     vec4 eye;   /* xyz camera position */
     vec4 scene; /* seconds, aspect, ship translation, gate aperture */
     F32 flash;  /* cannon muzzle level */
-    F32 reserved[3];
+    U32 hull_texture;
+    F32 reserved[2];
     vec4 blur;  /* xy: hull motion this frame in UV; z: shutter fraction */
 };
 VKMIN_STRUCT(OmegaPush) {

@@ -3,7 +3,7 @@
  * Shape: one context, passed first to everything. Resources are typed 32-bit
  * handles (zero invalid). A shader reaches a texture by its bindless index and
  * a buffer by its device address; both travel in the push block you define in
- * shared.h, so there is no binding model: a draw is a pipeline, a push block
+ * your shared header, so there is no binding model: a draw is a pipeline, a push block
  * and a count. The push block's size belongs to the pipeline and is checked
  * against the SPIR-V at creation. A pointer never travels without its size
  * (vkmin_bytes), and a frame reads the outside world at exactly one point:
@@ -37,7 +37,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "shared.h"
+#include "vkmin_gpu.h"
 
 #if defined(__GNUC__) && !defined(__clang__)
 /* MinGW's plain printf archetype still describes the older MSVCRT dialect;
@@ -108,7 +108,8 @@ typedef struct {
     int argc; char **argv;        /* command line: cvars as name=value or +name value, plus
                                    * --headless --frame N --frames a,b --out P --out-dir D --exit-after N
                                    * --size W H --path=legacy|modern --sync-naive --no-readback --device N
-                                   * --verbose --cvars --record FILE --replay FILE --demo FILE --play FILE;
+                                   * --verbose --cvars --record FILE --replay FILE --demo FILE --play FILE
+                                   * --events --inspect-dir D --stop-after-event N --metrics FILE --budget FILE;
                                    * unknown ones are the program's */
     const char *title;            /* window title and PNG prefix; 0 = "vkmin" */
     int width, height;            /* 0 = cvars r_width x r_height */
@@ -196,16 +197,16 @@ typedef struct {                  /* an indexed indirect draw; set exactly one o
     uint64_t host_cmds; uint32_t host_count;            /* DrawCmd records in ring memory */
 } vkmin_indirect_desc;
 
-typedef struct {                  /* heights in, one chunked grid mesh out; sizes from _sizes */
-    const float *heights; int width, height;   /* samples across and down; heights in world units */
-    float cell;                   /* world units between samples; 0 = 1 */
-    int chunk;                    /* cells per chunk side, each chunk one Mesh; 0 = 32 */
-    float uv_per_unit;            /* texture repeats per world unit; 0 = 1 */
-} vkmin_heightfield_desc;
-typedef struct { uint32_t vertices, indices, meshes; } vkmin_heightfield_size;
-
 typedef struct {                  /* plain data, for humans and models to read */
     double gpu_ms[VKMIN_MAX_TIMESTAMPS]; int timestamps;  /* since timestamp 0, last completed frame */
+    /* Host elapsed totals, not CPU cycles. Frame work excludes timeline waits;
+     * readback excludes those waits too. Frame work also excludes window operations.
+     * PNG includes encoding and file I/O. --metrics FILE writes totals at shutdown. */
+    /* Completed slots only; GPU work and copy overlap host work, so do not add them. */
+    double gpu_work_ms_total, gpu_readback_ms_total;
+    uint32_t gpu_frames_timed;
+    double cpu_ms_total, wait_ms_total, readback_ms_total, png_ms_total;
+    double window_ms_total; /* acquire/recreate/present elapsed time */
     uint32_t frame_index, draws, dispatches, buffers, images, pipelines, textures;
     size_t device_used, device_cap, ring_used, ring_cap;
     vkmin_path path;
@@ -261,31 +262,6 @@ vkmin_format vkmin_backbuffer_format(const vkmin_ctx *);                     // 
 vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipeline_desc *); // writes ctx, gpu
 uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one texel of the last
                                         completed frame's ID target, between frames; 0 off-image */ // gpu
-vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *);            // pure
-/* Output arrays must hold the counts from sizes(); zero scale/chunk selects defaults. */
-void vkmin_heightfield(const vkmin_heightfield_desc *, Vertex *, uint32_t *, Mesh *);      // writes outputs
-
-/* Outdoor primitives. No allocation, clock or hidden state. Maps are world
- * normals (xyz) and downhill unit directions (xz, w = slope); flats return
- * zero flow. Output capacity is width*height vec4s; source is never modified. */
-void vkmin_terrain_normal(const vkmin_heightfield_desc *, vec4 *out, size_t capacity); // writes outputs
-void vkmin_terrain_flow(const vkmin_heightfield_desc *, vec4 *out, size_t capacity);   // writes outputs
-/* Four-level square quadtree, breadth-first: root, 4 children, 16, 64.
- * width == height == 8*chunk+1; each node has chunk*chunk cells and skirts.
- * Geometry is world space. All arrays use terrain_sizes counts. */
-typedef struct { vkmin_heightfield_desc heightfield; float skirt; } vkmin_terrain_desc;
-vkmin_heightfield_size vkmin_terrain_sizes(const vkmin_terrain_desc *); // pure
-void vkmin_terrain(const vkmin_terrain_desc *, Vertex *, uint32_t *, Mesh *); // writes outputs
-/* Writes a disjoint covering of the quadtree as mesh indices, capacity >=64.
- * lod_scale is distance / chunk width (default 2); one_level selects all 64 finest nodes. */
-uint32_t vkmin_terrain_select(const Mesh *nodes, vec4 camera, float lod_scale, bool one_level,
-                             uint32_t *out, size_t capacity); // writes outputs
-
-/* Unit sun direction, +Y up: hours since midnight, sunrise 6, sunset 18.
- * The orbital approximation is fixed; a game's latitude model can replace it. */
-vec4 vkmin_sun_direction(float time_of_day); // pure
-vec2 vkmin_taa_jitter(uint32_t frame);       // pure; centred 16-sample Halton(2,3), in pixels
-
 /* ---- recording: in order, into one command buffer, no reordering --------- */
 void vkmin_barrier(vkmin_ctx *, const vkmin_barrier_desc *);                 // gpu
 void vkmin_fill_buffer(vkmin_ctx *, vkmin_buffer, size_t offset, size_t bytes, uint32_t value); // gpu

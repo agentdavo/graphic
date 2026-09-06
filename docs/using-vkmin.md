@@ -6,6 +6,12 @@ The first uses the Vulkan layer directly; the second uses the optional scene
 renderer. The games own their arrays and simulation. Neither layer owns a
 game object hierarchy or calls back into your code.
 
+The GPU header includes only common numeric types and its transport records.
+Include `render_shared.h` for scene layouts, `render_geometry.h` for terrain
+helpers, or `render.h` for the complete renderer API. `shared.h` remains the
+compatibility spelling for renderer layouts. See the [source map](../src/README.md)
+for standalone library and single-header packaging.
+
 ## What ctx owns
 
 `vkmin_ctx *ctx` is an opaque pointer to the Vulkan device, resource tables,

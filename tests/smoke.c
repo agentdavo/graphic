@@ -4,6 +4,7 @@
  * and the PNG readback. If this is right, the renderer is built on a floor
  * that has been stood on. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "ktx2.h"
 #include "shaders.h"
 

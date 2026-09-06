@@ -4,6 +4,7 @@
  * transparent sort, and the text layout for the overlay.
  */
 #include "render.h"
+_Static_assert(sizeof(Push) <= VKMIN_PUSH_BYTES, "renderer Push must fit");
 #include "cvar.h"
 #include "font.h"
 #include "vkmin_math.h"

@@ -1,0 +1,22 @@
+# Export only each consumer's declared public surface. Tests deliberately have
+# no -Isrc, -Idemo or build-root include path to mask a missing export.
+# Exported stb headers use a separate system include path, preserving the
+# build's third-party quarantine without disabling warnings for our header.
+PACKAGE := $(BUILD)/packages
+PACKAGE_GPU_HEADERS := vkmin.h vkmin_gpu.h min_types.h
+PACKAGE_RENDER_HEADERS := render.h render_geometry.h render_shared.h scene.h vkm_format.h ktx2.h cvar.h min_math.h vkmin_math.h shared.h pack.h
+.PHONY: packages package-test
+packages: libraries $(SND_BUILD)/libsndmin.a $(SND_BUILD)/sndmin_null.o $(BUILD)/vkmin_single.h
+	mkdir -p $(PACKAGE)/vkmin $(PACKAGE)/sndmin $(PACKAGE)/render $(PACKAGE)/third_party
+	cp $(addprefix src/,$(PACKAGE_GPU_HEADERS)) $(BUILD)/vkmin_single.h $(BUILD)/libvkmin.a $(PACKAGE)/vkmin/
+	cp third_party/stb_image.h third_party/stb_image_write.h $(PACKAGE)/third_party/
+	cp src/sndmin.h src/min_types.h $(SND_BUILD)/libsndmin.a $(SND_BUILD)/sndmin_null.o $(PACKAGE)/sndmin/
+	cp $(addprefix src/,$(PACKAGE_RENDER_HEADERS)) $(BUILD)/librender.a $(PACKAGE)/render/
+package-test: packages
+	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -DVKMIN_NO_PLATFORM -I$(PACKAGE)/vkmin -isystem $(PACKAGE)/third_party $(filter-out -Isrc -Idemo -Ithird_party -I$(BUILD),$(INCLUDES)) tests/amalg_check.c $(LDLIBS) -o $(PACKAGE)/gpu-check
+	$(CC) $(SND_WARN) -ffp-contract=off -fno-fast-math -I$(PACKAGE)/sndmin tests/package_audio.c $(PACKAGE)/sndmin/libsndmin.a $(PACKAGE)/sndmin/sndmin_null.o -lm -o $(PACKAGE)/audio-check
+	$(CC) $(WARN) -I$(PACKAGE)/render -I$(PACKAGE)/vkmin tests/package_render.c $(PACKAGE)/render/librender.a $(PACKAGE)/vkmin/libvkmin.a $(LDLIBS) $(GLFW_LIBS) -o $(PACKAGE)/render-check
+	cd $(PACKAGE) && ./gpu-check
+	cd $(PACKAGE) && ./audio-check audio.wav
+	cd $(PACKAGE) && ./render-check
+test: package-test

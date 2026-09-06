@@ -15,7 +15,7 @@
  * Outside (v0.5, opt in with vkr_desc.outdoor): scatter -> existing cull,
  * shadows/prepass -> analytic sky -> opaque -> grass -> impostor batcher ->
  * water composite -> TAA -> bloom -> existing tonemap/overlay. Outdoor and
- * Scatter are plain shared.h descriptors. Indirect storage is sized to the
+ * Scatter are plain render_shared.h descriptors. Indirect storage is sized to the
  * caller's max_instances, up to 16384; at most 16 scatter layers. Scatter
  * requires r_gpu_cull=1 and d_check_cull=0 (there is no CPU scatter list).
  * Terrain nodes remain ordinary instances. A tree cell reserves two instance
@@ -47,6 +47,7 @@
 #define VKMIN_RENDER_H
 
 #include "vkmin.h"
+#include "render_geometry.h"
 
 typedef struct vkr vkr;
 

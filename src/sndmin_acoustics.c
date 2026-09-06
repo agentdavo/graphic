@@ -20,16 +20,16 @@ static float ray(vec3 p,vec3 d,const sndmin_box *b,float limit,float *entry) {
 }
 static vec3 unit(vec3 v) {
     const float d=snd_sqrt(v.x*v.x+v.y*v.y+v.z*v.z);
-    return d>0?vkmin_vec3_scale(v,1/d):(vec3){0,0,-1};
+    return d>0?min_vec3_scale(v,1/d):(vec3){0,0,-1};
 }
 sndmin_acoustic sndmin_acoustics(const sndmin_frame_desc *f,const sndmin_voice_desc *v,sndmin_layout layout) {
     sndmin_acoustic a={0};
-    const vec3 delta=vkmin_vec3_sub(v->position,f->listener),d=unit(delta);
-    const float distance=snd_sqrt(vkmin_vec3_dot(delta,delta));
+    const vec3 delta=min_vec3_sub(v->position,f->listener),d=unit(delta);
+    const float distance=snd_sqrt(min_vec3_dot(delta,delta));
     const float min=v->min_radius>0?v->min_radius:1,max=v->max_radius>min?v->max_radius:100;
     a.gain=distance<=min?1:(distance>=max?0:min/distance*(max-distance)/(max-min));
     a.lowpass=1/(1+distance*0.035f);
-    a.doppler=snd_clamp((343+vkmin_vec3_dot(f->velocity,d))/(343+snd_clamp(vkmin_vec3_dot(v->velocity,d),-300,300)),0.5f,2);
+    a.doppler=snd_clamp((343+min_vec3_dot(f->velocity,d))/(343+snd_clamp(min_vec3_dot(v->velocity,d),-300,300)),0.5f,2);
     for(uint32_t i=0;i<f->box_count;++i) {
         float entry=0;
         const float inside=ray(f->listener,d,&f->boxes[i],distance,&entry);
@@ -39,9 +39,9 @@ sndmin_acoustic sndmin_acoustics(const sndmin_frame_desc *f,const sndmin_voice_d
         a.gain*=1-weight*0.8f; a.lowpass*=1-weight*0.95f;
     }
     const vec3 forward=unit(f->forward);
-    const vec3 up=vkmin_vec3_dot(f->up,f->up)>0?unit(f->up):(vec3){0,1,0};
-    const vec3 right=unit(vkmin_vec3_cross(forward,up));
-    const float x=vkmin_vec3_dot(d,right),z=vkmin_vec3_dot(d,forward);
+    const vec3 up=min_vec3_dot(f->up,f->up)>0?unit(f->up):(vec3){0,1,0};
+    const vec3 right=unit(min_vec3_cross(forward,up));
+    const float x=min_vec3_dot(d,right),z=min_vec3_dot(d,forward);
     if(layout==SNDMIN_STEREO) {
         a.pan[0]=snd_sqrt(0.5f*(1-snd_clamp(x,-1,1)));
         a.pan[1]=snd_sqrt(0.5f*(1+snd_clamp(x,-1,1)));
@@ -82,9 +82,9 @@ sndmin_acoustic sndmin_acoustics(const sndmin_frame_desc *f,const sndmin_voice_d
         }
         total+=nearest;
         if(nearest==250) { ++escaped; continue; }
-        const vec3 hit=vkmin_vec3_add(f->listener,vkmin_vec3_scale(direction,nearest));
-        const vec3 to=vkmin_vec3_sub(v->position,hit);
-        const float path=nearest+snd_sqrt(vkmin_vec3_dot(to,to));
+        const vec3 hit=min_vec3_add(f->listener,min_vec3_scale(direction,nearest));
+        const vec3 to=min_vec3_sub(v->position,hit);
+        const float path=nearest+snd_sqrt(min_vec3_dot(to,to));
         sndmin_tap tap={snd_clamp((path-distance)/343,1.0f/48000,0.49f),
             (1-absorption)/(1+path)*0.5f,1-0.9f*absorption};
         for(unsigned k=0;k<4;++k) if(tap.gain>a.taps[k].gain) {

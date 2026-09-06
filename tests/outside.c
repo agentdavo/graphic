@@ -1,4 +1,5 @@
 #include "vkmin.h"
+#include "render_geometry.h"
 #include "process.h"
 #include <math.h>
 #include <stdio.h>

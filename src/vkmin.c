@@ -4,9 +4,12 @@
  * VkFramebuffer, no VkPipelineVertexInputStateCreateInfo, and no
  * `if (extension_supported)` anywhere in this file.
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "vkmin.h"
 #include "cvar.h"
-#include "pack.h"
+#include <math.h>
 #include "plat.h"
 #include "stb_bridge.h"
 #include "jrnl.h"
@@ -15,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <string.h>
 
 #include <sys/stat.h>
@@ -100,7 +106,6 @@ enum {
 };
 
 _Static_assert(sizeof(DrawCmd) == sizeof(VkDrawIndexedIndirectCommand), "DrawCmd mirrors Vulkan");
-_Static_assert(sizeof(Push) <= VKMIN_PUSH_BYTES, "Push must fit the push constant block");
 
 typedef struct {
     uint16_t gen;
@@ -208,6 +213,12 @@ struct vkmin_ctx {
     double frame_wall_last;                  /* wall clock at the last frame begin, ms; 0 = none yet */
     double frame_ms_ring[VKMIN_FRAME_TIMES]; /* intervals between frame begins */
     uint32_t frame_ms_count;                 /* total recorded; the ring holds the last VKMIN_FRAME_TIMES */
+    const char *events_path, *inspect_dir, *metrics_path;
+    uint32_t stop_event;
+    bool inspect_targets[VKMIN_MAX_IMAGES];
+    double wait_ms_total, frame_wait_start, frame_cpu_start;
+    double cpu_ms_total, readback_ms_total, png_ms_total;
+    double window_ms_total, frame_window_start;
     float budget_ms;                         /* --budget: p99 above this fails at shutdown; 0 = off */
     const char *out, *out_dir;
     bool verbose;
@@ -258,7 +269,11 @@ struct vkmin_ctx {
     VkPipelineLayout pipe_layout;
     uint32_t texture_count;
 
-    VkQueryPool query_pool;
+    VkQueryPool query_pool, diagnostic_pool;
+    uint64_t timestamp_mask;
+    bool diagnostic_pending[VKMIN_MAX_FRAMES];
+    double gpu_work_ms_total, gpu_readback_ms_total;
+    uint32_t gpu_frames_timed;
     int ts_written[VKMIN_MAX_FRAMES];
     double ts_ms[VKMIN_MAX_TIMESTAMPS];
     int ts_count;
@@ -378,7 +393,7 @@ enum {
     OP_FILL, OP_COPY_TO_RING, OP_PASS_BEGIN, OP_PASS_END, OP_VIEWPORT, OP_DEPTH_BIAS, OP_DRAW,
     OP_DRAW_INDIRECT, OP_DISPATCH, OP_TIMESTAMP, OP_PICK, OP_REPLACE_PIPELINE
 };
-enum { JOURNAL_VERSION = 4 }; /* v4 adds pipeline replacement; the reader also accepts v3 */
+enum { JOURNAL_VERSION = 5 }; /* v4 adds pipeline replacement; v5 names passes; accepts v3/v4 */
 enum { RELOC_ARENA = 1, RELOC_RING = 2, VKMIN_MAX_RELOCS = 4096 };
 
 typedef struct { uint32_t magic, version, width, height; uint64_t arena_base, ring_base; } journal_header;
@@ -393,6 +408,7 @@ typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; vkmin_input
 typedef struct { uint32_t magic, version, width, height; } demo_header;
 typedef struct { uint32_t frame_index; vkmin_inputs input; } demo_record;
 typedef struct { uint32_t color, depth, clear_color, clear_depth; float clear[4]; int32_t x, y, w, h; uint32_t extra[2]; } rec_pass;
+typedef struct { rec_pass pass; char label[VKMIN_LABEL]; } rec_named_pass;
 typedef struct { uint32_t image, result; int32_t x, y; } rec_pick;
 typedef struct { uint32_t pipe, push_bytes, a, b, cnt; } rec_draw;
 typedef struct { uint32_t pipe, push_bytes, indices, cmds, counts, max_draws, host_count; uint64_t cmd_offset, count_offset, host_cmds; } rec_indirect;
@@ -442,11 +458,17 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
 }
 #define RECORD(c, op, hdr, data, bytes) journal_write((c), (op), &(hdr), sizeof(hdr), (data), (bytes))
 
-/* C11 wall clock in milliseconds; only differences are used. */
+/* Monotonic elapsed time: wall-clock corrections must not become frame spikes. */
 static double wall_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter, frequency;
+    VKMIN_ASSERT(QueryPerformanceCounter(&counter) && QueryPerformanceFrequency(&frequency), "performance clock unavailable");
+    return (double)counter.QuadPart * 1e3 / (double)frequency.QuadPart;
+#else
     struct timespec ts;
-    if (timespec_get(&ts, TIME_UTC) != TIME_UTC) return 0;
+    VKMIN_ASSERT(clock_gettime(CLOCK_MONOTONIC, &ts) == 0, "monotonic clock unavailable");
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+#endif
 }
 static int compare_double(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
@@ -703,7 +725,7 @@ static void pick_physical_device(vkmin_ctx *c) {
     VKMIN_ASSERT(props.apiVersion >= VK_API_VERSION_1_3,
                  "device '%s' reports Vulkan %u.%u; vkmin requires 1.3 core", props.deviceName,
                  VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
-    VKMIN_ASSERT(props.limits.maxPushConstantsSize >= sizeof(Push),
+    VKMIN_ASSERT(props.limits.maxPushConstantsSize >= VKMIN_PUSH_BYTES,
                  "device '%s' offers only %u push constant bytes", props.deviceName,
                  props.limits.maxPushConstantsSize);
     VKMIN_ASSERT(props.limits.timestampComputeAndGraphics, "device '%s' has no timestamps",
@@ -753,6 +775,7 @@ static void pick_physical_device(vkmin_ctx *c) {
         const VkQueueFlags need = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
         if ((qprops[i].queueFlags & need) == need && qprops[i].timestampValidBits >= 32) {
             c->queue_family = i;
+            c->timestamp_mask = qprops[i].timestampValidBits == 64 ? UINT64_MAX : (UINT64_C(1) << qprops[i].timestampValidBits) - 1;
             break;
         }
     }
@@ -1051,7 +1074,21 @@ static void timeline_wait(vkmin_ctx *c, uint64_t value) {
     if (value == 0) return;
     const VkSemaphoreWaitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                                       .semaphoreCount = 1, .pSemaphores = &c->timeline, .pValues = &value};
+    const double start = wall_ms();
     VK_CHECK(vkWaitSemaphores(c->dev, &wait, UINT64_MAX));
+    c->wait_ms_total += wall_ms() - start;
+}
+/* Called only after this slot has completed. Three dense queries avoid the
+ * sparse pass-query indices and include frames that are never reused. */
+static void collect_gpu_totals(vkmin_ctx *c, uint32_t slot) {
+    if (!c->diagnostic_pending[slot]) return;
+    uint64_t times[3] = {0};
+    VK_CHECK(vkGetQueryPoolResults(c->dev, c->diagnostic_pool, slot * 3, 3,
+        sizeof times, times, sizeof times[0], VK_QUERY_RESULT_64_BIT));
+    c->gpu_work_ms_total += (double)((times[1] - times[0]) & c->timestamp_mask) * (double)c->timestamp_period_ns * 1e-6;
+    c->gpu_readback_ms_total += (double)((times[2] - times[1]) & c->timestamp_mask) * (double)c->timestamp_period_ns * 1e-6;
+    c->gpu_frames_timed++;
+    c->diagnostic_pending[slot] = false;
 }
 static VkSemaphoreSubmitInfo timeline_signal(vkmin_ctx *c) {
     return (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
@@ -1544,6 +1581,18 @@ static void parse_command_line(vkmin_ctx *c, int argc, char **argv) {
             c->out_dir = argv[++i];
         } else if (!strcmp(a, "--exit-after") && next) {
             c->exit_after = atoi(argv[++i]);
+        } else if (!strcmp(a, "--events") && next) {
+            c->events_path = argv[++i];
+        } else if (!strcmp(a, "--metrics") && next) {
+            c->metrics_path = argv[++i];
+        } else if (!strcmp(a, "--inspect-dir") && next) {
+            c->inspect_dir = argv[++i];
+        } else if (!strcmp(a, "--stop-after-event") && next) {
+            char *end = NULL;
+            const unsigned long long n = strtoull(argv[++i], &end, 10);
+            VKMIN_ASSERT(argv[i][0] >= '0' && argv[i][0] <= '9' && end && !*end && n > 0 && n <= UINT32_MAX,
+                         "--stop-after-event requires a positive event number");
+            c->stop_event = (uint32_t)n;
         } else if (!strcmp(a, "--budget") && next) {
             c->budget_ms = (float)atof(argv[++i]);
         } else if (!strcmp(a, "--size") && i + 2 < argc) {
@@ -1689,6 +1738,9 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     };
     VK_CHECK(vkCreateQueryPool(c->dev, &qinfo, NULL, &c->query_pool));
     vkResetQueryPool(c->dev, c->query_pool, 0, VKMIN_MAX_FRAMES * VKMIN_MAX_TIMESTAMPS);
+    const VkQueryPoolCreateInfo diagnostic = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = VKMIN_MAX_FRAMES * 3};
+    VK_CHECK(vkCreateQueryPool(c->dev, &diagnostic, NULL, &c->diagnostic_pool));
 
     create_memory(c);
     create_bindless(c);
@@ -1740,6 +1792,27 @@ void vkmin_shutdown(vkmin_ctx *c) {
                 pacing.frames_timed, pacing.frame_ms_min, pacing.frame_ms_mean, pacing.frame_ms_p99, pacing.frame_ms_max);
         over_budget = c->budget_ms > 0 && pacing.frame_ms_p99 > (double)c->budget_ms;
     }
+    fprintf(stderr, "vkmin: host totals ms: frame-work %.3f timeline-wait %.3f readback %.3f png %.3f\n",
+            c->cpu_ms_total, c->wait_ms_total, c->readback_ms_total, c->png_ms_total);
+    timeline_wait(c, c->timeline_value);
+    for (uint32_t slot = 0; slot < c->frames_in_flight; ++slot) collect_gpu_totals(c, slot);
+    fprintf(stderr, "vkmin: GPU totals ms over %u frames: rendering %.3f readback-copy %.3f\n",
+        c->gpu_frames_timed, c->gpu_work_ms_total, c->gpu_readback_ms_total);
+    if (c->metrics_path) {
+        FILE *metrics = fopen(c->metrics_path, "w");
+        VKMIN_ASSERT(metrics, "cannot write metrics '%s'", c->metrics_path);
+        const int written = fprintf(metrics,
+            "{\n  \"frames\": %u, \"gpu_frames\": %u, \"inspection\": %s,\n"
+            "  \"host_frame_work_ms\": %.6f, \"timeline_wait_ms\": %.6f, \"window_ms\": %.6f,\n"
+            "  \"host_readback_ms\": %.6f, \"png_ms\": %.6f,\n"
+            "  \"gpu_render_ms\": %.6f, \"gpu_readback_copy_ms\": %.6f,\n"
+            "  \"frame_interval_samples\": %u, \"frame_interval_p99_ms\": %.6f\n}\n",
+            c->frames_rendered, c->gpu_frames_timed, c->inspect_dir ? "true" : "false",
+            c->cpu_ms_total, c->wait_ms_total, c->window_ms_total, c->readback_ms_total, c->png_ms_total,
+            c->gpu_work_ms_total, c->gpu_readback_ms_total, pacing.frames_timed, pacing.frame_ms_p99);
+        const bool closed = fclose(metrics) == 0;
+        VKMIN_ASSERT(written > 0 && closed, "metrics write failed");
+    }
     const float budget_ms = c->budget_ms;
     if (c->rec) fclose(c->rec);
     if (c->demo_out) fclose(c->demo_out);
@@ -1771,6 +1844,7 @@ void vkmin_shutdown(vkmin_ctx *c) {
     vkFreeMemory(c->dev, c->buf_arena.mem, NULL);
     vkFreeMemory(c->dev, c->img_arena.mem, NULL);
     vkDestroyQueryPool(c->dev, c->query_pool, NULL);
+    vkDestroyQueryPool(c->dev, c->diagnostic_pool, NULL);
     for (uint32_t i = 0; i < VKMIN_MAX_FRAMES; ++i) vkDestroySemaphore(c->dev, c->acquired[i], NULL);
     vkDestroySemaphore(c->dev, c->timeline, NULL);
     vkDestroyCommandPool(c->dev, c->cmd_pool, NULL);
@@ -1878,6 +1952,7 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     const uint32_t usage_bits = desc->usage ? desc->usage : (uint32_t)VKMIN_IMAGE_SAMPLED;
     uint32_t index = 0;
     VKMIN_SLOT_ALLOC(c->images, VKMIN_MAX_IMAGES, index);
+    c->inspect_targets[index] = false;
     image_slot *s = &c->images[index];
     snprintf(s->label, sizeof s->label, "%s", desc->label ? desc->label : "image");
     s->tex_index = UINT32_MAX;
@@ -1896,6 +1971,7 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
      * that are not attachments. On the modern path that is a host transfer. */
     const bool uploadable = (usage_bits & VKMIN_IMAGE_SAMPLED) && !(usage_bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH));
     if (uploadable) usage |= c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (c->inspect_dir && (usage_bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH))) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (usage_bits & VKMIN_IMAGE_COLOR) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (usage_bits & VKMIN_IMAGE_DEPTH) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     /* Readback mirrors the backbuffer: a transfer source, and on the modern
@@ -2513,6 +2589,9 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     VKMIN_ASSERT(!c->in_frame, "vkmin_frame_begin called twice without a frame_end");
     VKMIN_ASSERT(c->armed, "vkmin_frame_begin without vkmin_running saying yes");
     c->armed = false;
+    c->frame_cpu_start = wall_ms();
+    c->frame_wait_start = c->wait_ms_total;
+    c->frame_window_start = c->window_ms_total;
     {
         const double now = wall_ms();
         if (c->frame_wall_last > 0) c->frame_ms_ring[c->frame_ms_count++ % VKMIN_FRAME_TIMES] = now - c->frame_wall_last;
@@ -2531,6 +2610,8 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
 
     timeline_wait(c, c->slot_value[c->slot]);
 
+    collect_gpu_totals(c, c->slot);
+
     /* Timestamps from the frame that last used this slot are complete now. */
     c->ts_count = 0;
     if (c->ts_written[c->slot] > 0) {
@@ -2539,13 +2620,14 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         VK_CHECK(vkGetQueryPoolResults(c->dev, c->query_pool, first, (uint32_t)c->ts_written[c->slot],
                                        sizeof raw, raw, sizeof raw[0], VK_QUERY_RESULT_64_BIT));
         for (int i = 0; i < c->ts_written[c->slot]; ++i) {
-            c->ts_ms[i] = (double)(raw[i] - raw[0]) * (double)c->timestamp_period_ns * 1e-6;
+            c->ts_ms[i] = (double)((raw[i] - raw[0]) & c->timestamp_mask) * (double)c->timestamp_period_ns * 1e-6;
         }
         c->ts_count = c->ts_written[c->slot];
     }
     c->ts_written[c->slot] = 0;
 
     if (!c->desc.headless) {
+        const double window_start = wall_ms();
         if (c->need_recreate) recreate_swapchain(c);
         VkResult r = vkAcquireNextImageKHR(c->dev, c->swapchain, UINT64_MAX, c->acquired[c->slot],
                                            VK_NULL_HANDLE, &c->swap_index);
@@ -2555,6 +2637,7 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
                                       VK_NULL_HANDLE, &c->swap_index);
         }
         if (r != VK_SUBOPTIMAL_KHR) VK_CHECK(r);
+        c->window_ms_total += wall_ms() - window_start;
     }
     backbuffer_bind(c, c->offscreen_img, c->offscreen_view);
 
@@ -2565,6 +2648,8 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
     vkCmdResetQueryPool(cmd, c->query_pool, c->slot * VKMIN_MAX_TIMESTAMPS, VKMIN_MAX_TIMESTAMPS);
+    vkCmdResetQueryPool(cmd, c->diagnostic_pool, c->slot * 3, 3);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->diagnostic_pool, c->slot * 3);
     if (c->path == VKMIN_PATH_MODERN) modern_flush_pending_layouts(c, cmd);
 
     /* The one and only descriptor bind of the frame, to both bind points. */
@@ -2747,9 +2832,15 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
                              .extra = {desc->extra[0].id, desc->extra[1].id},
                              .clear_depth = desc->clear_depth, .clear = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]},
                              .x = desc->x, .y = desc->y, .w = desc->w, .h = desc->h};
-        RECORD(c, OP_PASS_BEGIN, rp, NULL, 0);
+        rec_named_pass named = {.pass = rp};
+        snprintf(named.label, sizeof named.label, "%s", desc->label ? desc->label : "vkmin.pass");
+        RECORD(c, OP_PASS_BEGIN, named, NULL, 0);
     }
     RECORD_ENTER(c);
+    if (c->inspect_dir) {
+        const uint32_t ids[4] = {desc->color.id, desc->depth.id, desc->extra[0].id, desc->extra[1].id};
+        for (int i = 0; i < 4; ++i) if (ids[i] && handle_index(ids[i]) < VKMIN_MAX_IMAGES) c->inspect_targets[handle_index(ids[i])] = true;
+    }
     VkCommandBuffer cmd = c->cmd[c->slot];
 
     VkImageMemoryBarrier2 barriers[4];
@@ -2940,6 +3031,14 @@ vkmin_stats vkmin_stats_get(const vkmin_ctx *c) {
     vkmin_stats s = c->stats;
     s.timestamps = c->ts_count;
     for (int i = 0; i < c->ts_count; ++i) s.gpu_ms[i] = c->ts_ms[i];
+    s.gpu_work_ms_total = c->gpu_work_ms_total;
+    s.gpu_readback_ms_total = c->gpu_readback_ms_total;
+    s.gpu_frames_timed = c->gpu_frames_timed;
+    s.cpu_ms_total = c->cpu_ms_total;
+    s.window_ms_total = c->window_ms_total;
+    s.wait_ms_total = c->wait_ms_total;
+    s.readback_ms_total = c->readback_ms_total;
+    s.png_ms_total = c->png_ms_total;
     s.path = c->path;
     frame_ms_summary(c, &s);
     s.textures = c->texture_count;
@@ -3082,7 +3181,10 @@ void vkmin_frame_end(vkmin_ctx *c) {
 
     /* Seam 1 of 3: the legacy path records its per-frame readback copy here;
      * the modern path records nothing and reads the image from the host. */
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->diagnostic_pool, c->slot * 3 + 1);
     if (c->path == VKMIN_PATH_LEGACY && !c->desc.no_readback) legacy_record_readback(c, cmd, bb);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->diagnostic_pool, c->slot * 3 + 2);
+    c->diagnostic_pending[c->slot] = true;
     if (!c->desc.headless) record_present_blit(c, cmd, bb);
     /* Leave the backbuffer in TRANSFER_SRC either way, so the modern path's
      * host copy reads it from a layout hostImageCopy accepts. */
@@ -3117,7 +3219,9 @@ void vkmin_frame_end(vkmin_ctx *c) {
             .waitSemaphoreCount = 1, .pWaitSemaphores = &c->rendered[c->swap_index],
             .swapchainCount = 1, .pSwapchains = &c->swapchain, .pImageIndices = &c->swap_index,
         };
+        const double window_start = wall_ms();
         const VkResult r = vkQueuePresentKHR(c->queue, &present);
+        c->window_ms_total += wall_ms() - window_start;
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
             c->need_recreate = true;
         } else {
@@ -3129,13 +3233,20 @@ void vkmin_frame_end(vkmin_ctx *c) {
             c->need_recreate = true;
         }
     }
-    if (c->desc.sync_naive) VK_CHECK(vkDeviceWaitIdle(c->dev));
+    if (c->desc.sync_naive) {
+        const double wait_start = wall_ms();
+        VK_CHECK(vkDeviceWaitIdle(c->dev));
+        c->wait_ms_total += wall_ms() - wait_start;
+    }
     c->slot = (c->slot + 1u) % c->frames_in_flight;
     c->in_frame = false;
     c->frames_rendered++;
     c->stats.draws = c->draws;
     c->stats.dispatches = c->dispatches;
     c->stats.frame_index = c->frame_index;
+
+    c->cpu_ms_total += wall_ms() - c->frame_cpu_start - (c->wait_ms_total - c->frame_wait_start)
+                       - (c->window_ms_total - c->frame_window_start);
 
     /* --out / --out-dir: save what was asked for, then move on. */
     const uint32_t rendered_index = c->frame_index;
@@ -3175,6 +3286,8 @@ void vkmin_frame_end(vkmin_ctx *c) {
     RECORD_LEAVE(c);
 }
 
+#include "vkmin_inspect.h"
+
 /* --------------------------------------------------------------- replay --- */
 
 void vkmin_wait(vkmin_ctx *c) {
@@ -3205,12 +3318,16 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
     if (!f) { fprintf(stderr, "cannot open journal '%s'\n", path); return false; }
     uint8_t *data = NULL;
     uint32_t records = 0;
+    bool stopped = false, finished = false;
+    FILE *events = c->events_path ? fopen(c->events_path, "w") : NULL;
+    if (c->events_path && !events) { fclose(f); return false; }
+    if (events) fprintf(events, "event\tframe\top\tdetail\n");
     /* File rejection is a reported false result, not a failed program invariant.
      * Bounds are checked before allocation, relocation or any API call. */
 #define JCHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "journal '%s', record %u: ", path, records); \
     fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); goto invalid; } } while (0)
     journal_header jh;
-    JCHECK(fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u && (jh.version == 3 || jh.version == JOURNAL_VERSION), "bad header");
+    JCHECK(fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u && (jh.version >= 3 && jh.version <= JOURNAL_VERSION), "bad header");
     JCHECK(jh.width == (uint32_t)c->desc.width && jh.height == (uint32_t)c->desc.height, "size differs from context");
     uint8_t hdr[256] = {0};
     static reloc relocs[VKMIN_MAX_RELOCS];
@@ -3238,6 +3355,8 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
                      "truncated journal");
         JCHECK(relocate(c, data, rh.data_bytes, relocs, rh.reloc_count), "invalid relocation");
         ++records;
+        if (events) inspect_event(c, events, records, &rh, hdr, data);
+        if (stopped && rh.op != OP_RING_ALLOC && rh.op != OP_FRAME_END) continue;
         /* Every record's header is exactly its struct; anything else is corruption. */
 #define HDR(T) T rec = {0}; JCHECK(rh.hdr_bytes == sizeof rec, "header size %u, expected %zu", rh.hdr_bytes, sizeof rec); memcpy(&rec, hdr, sizeof rec)
 #define SAME(got, want) JCHECK((got) == (want), "replay diverged: value differs from recording")
@@ -3302,7 +3421,14 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         case OP_FRAME_END: { HDR(rec_upload);
             JCHECK(rec.offset == c->ring_head[c->slot] && rh.data_bytes == rec.offset && rec.offset <= c->ring_region, "ring usage differs");
             memcpy(c->ring_mapped + c->slot * c->ring_region, data, rh.data_bytes);
-            vkmin_frame_end(c); break; }
+            if (stopped && c->in_pass) { vkmin_pass_end(c); c->in_default_pass = false; }
+            vkmin_frame_end(c);
+            if (c->inspect_dir && (stopped || (!c->stop_event && c->frame_count == 1 && c->frame_index == (uint32_t)c->frame_list[0]))) {
+                JCHECK(inspect_images(c, c->inspect_dir), "image export failed");
+                finished = true;
+            }
+            if (stopped) finished = true;
+            break; }
         case OP_BARRIER: { HDR(rec_barrier);
             JCHECK(rec.image_count <= VKMIN_MAX_IMAGES && (uint64_t)rec.image_count * sizeof(vkmin_transition) == rh.data_bytes, "invalid barrier payload");
             vkmin_barrier(c, &(vkmin_barrier_desc){.images = (const vkmin_transition *)(void *)data, .image_count = (int)rec.image_count,
@@ -3313,9 +3439,17 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             JCHECK(rh.data_bytes == 8, "invalid copy payload");
             uint64_t dst; memcpy(&dst, data, 8);
             vkmin_copy_to_ring(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, dst); break; }
-        case OP_PASS_BEGIN: { HDR(rec_pass);
+        case OP_PASS_BEGIN: {
+            rec_pass rec = {0};
+            rec_named_pass named = {0};
+            JCHECK(rh.hdr_bytes == (jh.version >= 5 ? sizeof named : sizeof rec), "invalid pass header");
+            if (jh.version >= 5) {
+                memcpy(&named, hdr, sizeof named);
+                JCHECK(named.label[sizeof named.label - 1] == 0, "invalid pass label");
+                rec = named.pass;
+            } else memcpy(&rec, hdr, sizeof rec);
             vkmin_pass_begin(c, &(vkmin_pass_desc){.color = {rec.color}, .extra = {{rec.extra[0]}, {rec.extra[1]}}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
-                .clear = {rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}, .x = rec.x, .y = rec.y, .w = rec.w, .h = rec.h, .label = "replay"}); break; }
+                .clear = {rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}, .x = rec.x, .y = rec.y, .w = rec.w, .h = rec.h, .label = jh.version >= 5 ? named.label : "replay"}); break; }
         case OP_PASS_END: { HDR(uint32_t); (void)rec; vkmin_pass_end(c); break; }
         case OP_VIEWPORT: { HDR(rec_pass); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
         case OP_DEPTH_BIAS: { HDR(vkmin_clear); vkmin_set_depth_bias(c, rec.r, rec.g); break; }
@@ -3341,12 +3475,35 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
 #undef HDR
 #undef SAME
 #undef JHANDLE
+        if (records == c->stop_event) {
+            JCHECK(c->in_frame || rh.op == OP_FRAME_END, "stop event must be inside a frame");
+            JCHECK(!c->inspect_dir || (c->frame_count == 1 && c->frame_index == (uint32_t)c->frame_list[0]),
+                   "stop event must belong to the selected --frame");
+            stopped = true;
+            if (rh.op == OP_FRAME_END) {
+                if (c->inspect_dir) JCHECK(inspect_images(c, c->inspect_dir), "image export failed");
+                finished = true;
+            }
+        }
+        if (finished) break;
+    }
+    JCHECK(!c->in_frame, "incomplete frame");
+    JCHECK(!c->stop_event || stopped, "stop event not found");
+    JCHECK(!c->inspect_dir || finished, "inspection frame not found; use --frame N");
+    if (events) {
+        const bool written = !ferror(events);
+        const bool closed = fclose(events) == 0;
+        events = NULL;
+        JCHECK(written && closed, "event write failed");
     }
     free(data);
     fclose(f);
     fprintf(stderr, "vkmin: replayed %u records from %s\n", records, path);
+    if (stopped) fprintf(stderr, "vkmin: stopped GPU work after event %u in frame %u; read through frame end for ring data\n",
+                         c->stop_event, c->frame_index);
     return true;
 invalid:
+    if (events) fclose(events);
     free(data);
     fclose(f);
     return false;
@@ -3427,75 +3584,6 @@ uint32_t vkmin_pick(vkmin_ctx *c, vkmin_image img, int x, int y) {
     return result;
 }
 
-/* ----------------------------------------------------------- heightfield --- */
-
-vkmin_heightfield_size vkmin_heightfield_sizes(const vkmin_heightfield_desc *d) {
-    VKMIN_ASSERT(d && d->heights && d->width >= 2 && d->height >= 2, "vkmin_heightfield: need a grid of at least 2x2 samples");
-    VKMIN_ASSERT(d->chunk >= 0 && isfinite(d->cell) && d->cell >= 0 && isfinite(d->uv_per_unit) && d->uv_per_unit >= 0,
-                 "vkmin_heightfield: invalid scale or chunk size");
-    const uint32_t chunk = d->chunk > 0 ? (uint32_t)d->chunk : 32u;
-    const uint32_t cx = ((uint32_t)d->width - 1u + chunk - 1u) / chunk, cz = ((uint32_t)d->height - 1u + chunk - 1u) / chunk;
-    const uint64_t vertices = (uint64_t)d->width * (uint64_t)d->height;
-    const uint64_t indices = ((uint64_t)d->width - 1u) * ((uint64_t)d->height - 1u) * 6u;
-    const uint64_t meshes = (uint64_t)cx * cz;
-    VKMIN_ASSERT(vertices <= UINT32_MAX && indices <= UINT32_MAX && meshes <= UINT32_MAX &&
-                 vertices <= SIZE_MAX / sizeof(Vertex) && indices <= SIZE_MAX / sizeof(uint32_t) && meshes <= SIZE_MAX / sizeof(Mesh),
-                 "vkmin_heightfield: grid exceeds index or allocation limits");
-    return (vkmin_heightfield_size){.vertices = (uint32_t)vertices, .indices = (uint32_t)indices, .meshes = (uint32_t)meshes};
-}
-
-/* One shared vertex grid (x along width, z along height, y up); each chunk
- * owns a contiguous index range and a bounding sphere, so a chunk is a Mesh
- * the cull rejects like any other. Normals by central differences. */
-void vkmin_heightfield(const vkmin_heightfield_desc *d, Vertex *verts, uint32_t *indices, Mesh *meshes) {
-    const vkmin_heightfield_size n = vkmin_heightfield_sizes(d);
-    VKMIN_ASSERT(verts && indices && meshes, "vkmin_heightfield: null output");
-    const uint32_t w = (uint32_t)d->width, h = (uint32_t)d->height;
-    const float cell = d->cell > 0.0f ? d->cell : 1.0f, uvs = d->uv_per_unit > 0.0f ? d->uv_per_unit : 1.0f;
-    const uint32_t chunk = d->chunk > 0 ? (uint32_t)d->chunk : 32u;
-    for (uint32_t z = 0; z < h; ++z) {
-        for (uint32_t x = 0; x < w; ++x) {
-            const uint32_t xl = x > 0 ? x - 1 : 0, xr = x + 1 < w ? x + 1 : w - 1;
-            const uint32_t zd = z > 0 ? z - 1 : 0, zu = z + 1 < h ? z + 1 : h - 1;
-            const float dx = (d->heights[z * w + xr] - d->heights[z * w + xl]) / ((float)(xr - xl) * cell);
-            const float dz = (d->heights[zu * w + x] - d->heights[zd * w + x]) / ((float)(zu - zd) * cell);
-            const float len = sqrtf(dx * dx + 1.0f + dz * dz);
-            const float px = (float)x * cell, pz = (float)z * cell;
-            VKMIN_ASSERT(isfinite(d->heights[z * w + x]) && isfinite(len) && isfinite(px) && isfinite(pz),
-                         "vkmin_heightfield: non-finite sample or extent");
-            verts[z * w + x] = (Vertex){.px = px, .py = d->heights[z * w + x], .pz = pz,
-                                        .normal = oct_encode(-dx / len, 1.0f / len, -dz / len),
-                                        .tangent = pack_tangent(1.0f, 0.0f, 0.0f, 1.0f), .uv = pack_half2(px * uvs, pz * uvs)};
-        }
-    }
-    const uint32_t cx = (w - 1u + chunk - 1u) / chunk;
-    uint32_t at = 0;
-    for (uint32_t m = 0; m < n.meshes; ++m) {
-        const uint32_t x0 = (m % cx) * chunk, z0 = (m / cx) * chunk;
-        const uint32_t x1 = x0 + chunk < w - 1u ? x0 + chunk : w - 1u, z1 = z0 + chunk < h - 1u ? z0 + chunk : h - 1u;
-        float ymin = INFINITY, ymax = -INFINITY;
-        const uint32_t first = at;
-        for (uint32_t z = z0; z < z1; ++z) {
-            for (uint32_t x = x0; x < x1; ++x) {
-                const uint32_t a = z * w + x, b = a + 1, c2 = a + w, e = c2 + 1;
-                /* counter-clockwise seen from above (+y) */
-                indices[at++] = a; indices[at++] = c2; indices[at++] = b;
-                indices[at++] = b; indices[at++] = c2; indices[at++] = e;
-            }
-        }
-        for (uint32_t z = z0; z <= z1; ++z) {
-            for (uint32_t x = x0; x <= x1; ++x) {
-                ymin = fminf(ymin, d->heights[z * w + x]);
-                ymax = fmaxf(ymax, d->heights[z * w + x]);
-            }
-        }
-        const float ex = (float)(x1 - x0) * cell * 0.5f, ez = (float)(z1 - z0) * cell * 0.5f, ey = (ymax - ymin) * 0.5f;
-        meshes[m] = (Mesh){.first_index = first, .index_count = at - first, .vertex_offset = 0, .skin_offset = VKMIN_NONE,
-                           .bounds = {(float)x0 * cell + ex, ymin + ey, (float)z0 * cell + ez, sqrtf(ex * ex + ey * ey + ez * ez)}};
-    }
-    VKMIN_ASSERT(at == n.indices, "heightfield index count mismatch");
-}
-
 bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     VKMIN_ASSERT(c && path && !c->in_frame, "vkmin_save_png: call it between frames");
     if (!c->have_submitted) {
@@ -3511,144 +3599,16 @@ bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     const int row_pitch = (int)(w * 4u); /* both paths copy tightly packed */
     unsigned char *rgba = malloc(bytes);
     VKMIN_ASSERT(rgba != NULL, "out of memory writing '%s'", path);
+    const double read_start = wall_ms(), wait_start = c->wait_ms_total;
     /* Seam 1 of 3, read side. */
     if (c->path == VKMIN_PATH_LEGACY) legacy_read_backbuffer(c, rgba, bytes);
     else modern_read_backbuffer(c, rgba, bytes);
     for (size_t i = 3; i < bytes; i += 4) rgba[i] = 255; /* the PNG is opaque by definition */
+    c->readback_ms_total += wall_ms() - read_start - (c->wait_ms_total - wait_start);
+    const double png_start = wall_ms();
     const bool ok = vkmin_png_write(path, (int)w, (int)h, rgba, row_pitch);
+    c->png_ms_total += wall_ms() - png_start;
     free(rgba);
     if (!ok) fprintf(stderr, "vkmin: failed to write '%s'\n", path);
     return ok;
-}
-/* Four levels, fixed fanout, no allocator. The normal/flow calculation uses
- * one-sided differences at edges: a tilted plane stays tilted at the border. */
-static vec4 terrain_derivative(const vkmin_heightfield_desc *d, uint32_t x, uint32_t z) {
-    const uint32_t w = (uint32_t)d->width, h = (uint32_t)d->height;
-    const uint32_t xl = x ? x-1 : x, xr = x+1 < w ? x+1 : x;
-    const uint32_t zl = z ? z-1 : z, zr = z+1 < h ? z+1 : z;
-    const float cell = d->cell > 0 ? d->cell : 1;
-    const float dx = (d->heights[z*w+xr] - d->heights[z*w+xl]) / ((float)(xr-xl)*cell);
-    const float dz = (d->heights[zr*w+x] - d->heights[zl*w+x]) / ((float)(zr-zl)*cell);
-    VKMIN_ASSERT(isfinite(dx) && isfinite(dz) && isfinite(d->heights[z*w+x]), "terrain: non-finite height or derivative");
-    return (vec4){dx, 0, dz, hypotf(dx, dz)};
-}
-
-void vkmin_terrain_normal(const vkmin_heightfield_desc *d, vec4 *out, size_t capacity) {
-    const vkmin_heightfield_size size = vkmin_heightfield_sizes(d);
-    VKMIN_ASSERT(out && capacity >= size.vertices, "terrain normal: output too small");
-    for (uint32_t z = 0; z < (uint32_t)d->height; ++z) for (uint32_t x = 0; x < (uint32_t)d->width; ++x) {
-        const vec4 a = terrain_derivative(d, x, z);
-        const float inv = 1.0f / hypotf(a.w, 1.0f);
-        out[z*(uint32_t)d->width+x] = (vec4){-a.x*inv, inv, -a.z*inv, 0};
-    }
-}
-
-void vkmin_terrain_flow(const vkmin_heightfield_desc *d, vec4 *out, size_t capacity) {
-    const vkmin_heightfield_size size = vkmin_heightfield_sizes(d);
-    VKMIN_ASSERT(out && capacity >= size.vertices, "terrain flow: output too small");
-    for (uint32_t z = 0; z < (uint32_t)d->height; ++z) for (uint32_t x = 0; x < (uint32_t)d->width; ++x) {
-        const vec4 a = terrain_derivative(d, x, z);
-        const float inv = a.w > 0 ? 1.0f/a.w : 0;
-        out[z*(uint32_t)d->width+x] = (vec4){-a.x*inv, 0, -a.z*inv, a.w};
-    }
-}
-
-vkmin_heightfield_size vkmin_terrain_sizes(const vkmin_terrain_desc *d) {
-    VKMIN_ASSERT(d, "terrain: null desc");
-    (void)vkmin_heightfield_sizes(&d->heightfield);
-    const uint64_t n = d->heightfield.chunk ? (uint32_t)d->heightfield.chunk : 32u;
-    VKMIN_ASSERT(d->heightfield.width == d->heightfield.height && (uint64_t)d->heightfield.width == 8*n+1 &&
-                 isfinite(d->skirt) && d->skirt >= 0, "terrain: expected square 8*chunk+1 samples and nonnegative skirt");
-    const uint64_t vn = 85*((n+1)*(n+1)+4*(n+1)), in = 85*(6*n*n+24*n);
-    VKMIN_ASSERT(vn <= UINT32_MAX && in <= UINT32_MAX && vn <= SIZE_MAX/sizeof(Vertex) && in <= SIZE_MAX/sizeof(uint32_t),
-                 "terrain: output overflow");
-    return (vkmin_heightfield_size){(uint32_t)vn, (uint32_t)in, 85};
-}
-
-void vkmin_terrain(const vkmin_terrain_desc *d, Vertex *v, uint32_t *idx, Mesh *mesh) {
-    const vkmin_heightfield_size size = vkmin_terrain_sizes(d);
-    VKMIN_ASSERT(v && idx && mesh, "terrain: null output");
-    const vkmin_heightfield_desc *h = &d->heightfield;
-    const uint32_t n = h->chunk ? (uint32_t)h->chunk : 32u, row = n+1;
-    const uint32_t per = row*row+4*row, w = (uint32_t)h->width;
-    const float cell = h->cell > 0 ? h->cell : 1, skirt = d->skirt > 0 ? d->skirt : cell*8;
-    uint32_t ox[85] = {0}, oz[85] = {0}, step[85] = {8}, at = 0;
-    for (uint32_t m = 0; m < 85; ++m) {
-        if (m) {
-            const uint32_t parent = (m-1)/4, corner = (m-1)%4;
-            step[m] = step[parent]/2;
-            ox[m] = ox[parent] + (corner&1u)*n*step[m];
-            oz[m] = oz[parent] + (corner>>1u)*n*step[m];
-        }
-        const uint32_t base = m*per, first = at;
-        float lo = INFINITY, hi = -INFINITY;
-        for (uint32_t z = oz[m]; z <= oz[m]+n*step[m]; ++z) for (uint32_t x = ox[m]; x <= ox[m]+n*step[m]; ++x) {
-            VKMIN_ASSERT(isfinite(h->heights[z*w+x]), "terrain: non-finite height");
-            lo = fminf(lo, h->heights[z*w+x]); hi = fmaxf(hi, h->heights[z*w+x]);
-        }
-        for (uint32_t z = 0; z <= n; ++z) for (uint32_t x = 0; x <= n; ++x) {
-            const uint32_t sx = ox[m]+x*step[m], sz = oz[m]+z*step[m];
-            const vec4 a = terrain_derivative(h, sx, sz);
-            v[base+z*row+x] = (Vertex){.px = (float)sx*cell, .py = h->heights[sz*w+sx], .pz = (float)sz*cell,
-                .normal = oct_encode(-a.x, 1, -a.z), .tangent = pack_tangent(1, a.x, 0, 1),
-                .uv = pack_half2((float)sx*cell, (float)sz*cell)};
-            if (x < n && z < n) {
-                const uint32_t a0 = base+z*row+x, q[6] = {a0, a0+row, a0+1, a0+1, a0+row, a0+row+1};
-                for (uint32_t k = 0; k < 6; ++k) idx[at++] = q[k];
-            }
-        }
-        /* Edge order follows the surface boundary; skirts face outward. */
-        for (uint32_t edge = 0; edge < 4; ++edge) for (uint32_t k = 0; k <= n; ++k) {
-            const uint32_t top = edge == 0 ? k : edge == 1 ? k*row+n : edge == 2 ? n*row+n-k : (n-k)*row;
-            const uint32_t bottom = base+row*row+edge*row+k;
-            v[bottom] = v[base+top]; v[bottom].py -= skirt;
-            if (k < n) {
-                const uint32_t next = edge == 0 ? top+1 : edge == 1 ? top+row : edge == 2 ? top-1 : top-row;
-                const uint32_t q[6] = {base+top, base+next, bottom, bottom, base+next, bottom+1};
-                for (uint32_t j = 0; j < 6; ++j) idx[at++] = q[j];
-            }
-        }
-        lo -= skirt;
-        VKMIN_ASSERT(isfinite(lo) && isfinite(hi-lo), "terrain: height/skirt range overflow");
-        const float half = (float)(n*step[m])*cell*0.5f, ey = (hi-lo)*0.5f;
-        VKMIN_ASSERT(isfinite(half) && isfinite((float)(w-1)*cell), "terrain: extent overflow");
-        mesh[m] = (Mesh){.first_index = first, .index_count = at-first, .skin_offset = VKMIN_NONE,
-            .bounds = {(float)ox[m]*cell+half, lo+ey, (float)oz[m]*cell+half, hypotf(hypotf(half,half),ey)}};
-    }
-    VKMIN_ASSERT(at == size.indices, "terrain: internal index count");
-}
-
-uint32_t vkmin_terrain_select(const Mesh *nodes, vec4 camera, float lod_scale, bool one_level, uint32_t *out, size_t capacity) {
-    VKMIN_ASSERT(nodes && out && capacity >= 64 && isfinite(lod_scale) && lod_scale >= 0 &&
-                 isfinite(camera.x) && isfinite(camera.y) && isfinite(camera.z), "terrain select: invalid argument");
-    if (one_level) { for (uint32_t i = 0; i < 64; ++i) out[i] = 21+i; return 64; }
-    uint32_t stack[85] = {0}, todo = 1, count = 0;
-    const float scale = lod_scale > 0 ? lod_scale : 2;
-    while (todo) {
-        const uint32_t m = stack[--todo];
-        const vec4 b = nodes[m].bounds;
-        const float dist = hypotf(hypotf(camera.x-b.x, camera.z-b.z), camera.y-b.y);
-        if (m < 21 && dist < b.w*scale) {
-            for (uint32_t k = 4; k > 0; --k) stack[todo++] = 4*m+k;
-        } else out[count++] = m;
-    }
-    return count;
-}
-
-vec4 vkmin_sun_direction(float time_of_day) {
-    VKMIN_ASSERT(isfinite(time_of_day), "sun: non-finite time of day");
-    const float angle = (fmodf(time_of_day,24.0f)-6.0f)/12.0f*3.14159265359f;
-    const float inv = 1.0f/sqrtf(1.09f);
-    return (vec4){cosf(angle)*inv,sinf(angle)*inv,0.3f*inv,0};
-}
-
-vec2 vkmin_taa_jitter(uint32_t frame) {
-    float jitter[2] = {0};
-    for (uint32_t dim = 0; dim < 2; ++dim) {
-        uint32_t index = frame%16u+1u;
-        const uint32_t radix = dim == 0 ? 2u : 3u;
-        float digit = 1;
-        while (index) { digit /= (float)radix; jitter[dim] += digit*(float)(index%radix); index /= radix; }
-    }
-    return (vec2){jitter[0]-0.5f,jitter[1]-0.5f};
 }

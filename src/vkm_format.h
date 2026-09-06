@@ -18,7 +18,7 @@
 #ifndef VKM_FORMAT_H
 #define VKM_FORMAT_H
 
-#include "shared.h"
+#include "render_shared.h"
 
 #define VKM_MAGIC 0x314d4b56u /* "VKM1" little-endian */
 #define VKM_VERSION 1u

@@ -13,6 +13,7 @@
 #include "render.h"
 #include "scene.h"
 #include "vkmin.h"
+#include "render_shared.h"
 #include "vkmin_math.h"
 
 #include <stdio.h>

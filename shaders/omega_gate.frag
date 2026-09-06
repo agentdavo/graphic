@@ -59,7 +59,7 @@ void main() {
     vec2 streak=vec2(sky.x*3.+sky.y*9.,sky.y*28.-sky.x*4.);
     float nebula=fbm(streak+vec2(3.1,7.9));
     nebula=pow(max(nebula-.25,0.)*1.6,1.6);
-    color+=vec3(.05,.08,.34)*band*nebula*.10;
+    color+=vec3(.05,.08,.34)*band*nebula*.025;
     vec3 skyColor=color;
     if(F.scene.w>.005) {
         float aperture=F.scene.w,time=F.scene.x;
@@ -106,9 +106,11 @@ void main() {
             // rather than saturated fine streaks.
             // Big soft billows dominate; fine strands only add texture.
             float billow=fbm(around*1.6+vec2(depth*2.2-time*.05,depth*1.1+time*.02));
-            float light=.04+pow(cloud,2.)*.55+pow(billow,2.)*.85+pow(strands,2.)*.22+pow(eddies,2.)*.15+pow(silk,2.)*.50;
+            float filament=pow(clamp(1.-abs(strands*2.-1.),0.,1.),3.);
+            float light=.07+pow(cloud,2.)*.25+pow(billow,2.)*.38
+                +filament*(.22+.28*cloud)+pow(eddies,2.)*.46+pow(silk,2.)*.28;
             // Mid-blue body, with strands allowed past 1 for whitish highlights.
-            color=mix(vec3(.006,.02,.08),vec3(.06,.22,.82),clamp(light,0.,1.35));
+            color=mix(vec3(.006,.025,.085),vec3(.085,.34,.92),clamp(light,0.,1.35));
             // The tunnel falls into a black throat, with a gradual extinction
             // through the last section instead of a bright disk or hard ring.
             color*=mix(1.,.32,depth);

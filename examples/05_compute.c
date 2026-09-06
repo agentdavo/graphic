@@ -2,6 +2,7 @@
  * to the draw. Both address the same buffer through the same push block. The
  * dispatch must sit outside a pass, so this one manages its own pass. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "vkmin_math.h"
 #include "shaders.h"
 

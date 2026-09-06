@@ -20,7 +20,8 @@ On Windows, put `w64devkit/bin` and cppcheck on PATH, or use MSYS2 UCRT64.
 Link `libsndmin.a` with exactly one of `sndmin_null.o` or
 `sndmin_miniaudio.o`. The latter is the miniaudio device layer alone.
 The archive has no dependency on Vulkan, GLFW, the renderer or its platform
-code. It includes `vkmin_math.h` and therefore the shared numeric type header.
+code. Its public header includes only `min_types.h` and standard C headers;
+the implementation uses the independent `min_math.h` helpers.
 Third-party source revisions and SHA256s are in `third_party/sndmin-sources.txt`.
 
 ```

@@ -65,7 +65,8 @@ for index, bad in enumerate(cases):
         result.stderr.rstrip().endswith(b"sndmin_replay(c,argv[2])"), \
         f"malformed journal {index}: unexpected exit {result.returncode}: {result.stderr!r}"
 print(f"{len(cases)} malformed/incompatible journal cases rejected.")
-core = list(Path("src").glob("sndmin*.c")) + list(Path("src").glob("sndmin*.h")) + [Path("src/jrnl.h")]
+core = list(Path("src").glob("sndmin*.c")) + list(Path("src").glob("sndmin*.h")) + [
+    Path("src/jrnl.h"), Path("src/min_types.h"), Path("src/min_math.h")]
 lines = sum(len(p.read_text().splitlines()) for p in core)
 header = len(Path("src/sndmin.h").read_text().splitlines())
 song = len(Path("examples/sndmin/02_song.snd").read_text().splitlines())

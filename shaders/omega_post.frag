@@ -31,6 +31,17 @@ void main() {
         bloom+=texture(TEX(o.bloom_id),uv+vec2(0,k)*bp*2.).rgb*exp(-float(k*k)*.16);
     }
     c+=bloom*.085;
+    // Compact optical scatter from visible HDR sources. Dense pixel taps keep
+    // tiny antenna beacons from dropping between the broad bloom's samples.
+    // Sampling the rendered scene also respects hull and habitat occlusion.
+    vec3 pinGlow=vec3(0);
+    for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+        vec3 source=texture(TEX(o.texture_id),uv+vec2(x,y)*px).rgb;
+        float peak=max(source.r,max(source.g,source.b));
+        pinGlow+=source*(max(peak-1.,0.)/max(peak,.001))*exp(-float(x*x+y*y)*.8);
+    }
+    pinGlow*=.16;
+    c+=pinGlow;
     vec3 flares=omegaFlares(uv);
     c+=flares;
     // Period look: no filmic curve, highlights clip to white the way a
@@ -42,7 +53,7 @@ void main() {
     vec3 wide=vec3(0);
     for(int k=-3;k<=3;k++) {
         vec3 s=scene(uv+vec2(k,0)*px*1.5);
-        s+=bloom*.085+flares; s*=1.15; s=s/(1.+s*.06);
+        s+=bloom*.085+pinGlow+flares; s*=1.15; s=s/(1.+s*.06);
         wide+=pow(clamp(s,0.,1.),vec3(1./2.2))*exp(-float(k*k)*.22);
     }
     wide/=1.+2.*(exp(-.22)+exp(-.88)+exp(-1.98));

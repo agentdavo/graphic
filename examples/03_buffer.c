@@ -1,6 +1,7 @@
 /* 03_buffer -- vertices in a buffer, reached by device address. The address
  * rides in the push block; the shader pulls ExVertex records from it. */
 #include "vkmin.h"
+#include "render_shared.h"
 #include "vkmin_math.h"
 #include "shaders.h"
 

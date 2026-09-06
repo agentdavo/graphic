@@ -1,4 +1,5 @@
 # vkmin v0.1 -- C11 only, everywhere, including this build.
+.DEFAULT_GOAL := all
 
 CC      ?= cc
 BUILD   ?= build
@@ -13,6 +14,7 @@ WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes \
         -Wformat=2 -Wdouble-promotion -Wwrite-strings -Wcast-align \
         -Winit-self -Wredundant-decls
 ANALYZER ?= -fanalyzer
+CPPCHECK_JOBS ?= 4
 OPT      ?= -O2 -g
 # SANITIZE=1 adds ASan + UBSan. Leak detection is off because the loader and
 # GLFW own allocations that outlive us; everything else is on.
@@ -41,15 +43,25 @@ SPV        := $(patsubst shaders/%,$(BUILD)/%.spv,$(SHADER_SRC))
 # the optional shaderDemoteToHelperInvocation feature without asking us.
 GLSL_FLAGS := -V --target-env vulkan1.3 --target-env spirv1.5 -Isrc -Ishaders -P"\#extension GL_GOOGLE_include_directive : require"
 
-CORE_OBJS := $(BUILD)/vkmin.o $(BUILD)/plat_glfw.o $(BUILD)/stb_bridge.o $(BUILD)/cvar.o $(BUILD)/ktx2.o $(BUILD)/scene.o $(BUILD)/render.o
+VKMIN_OBJS := $(addprefix $(BUILD)/,vkmin.o plat_glfw.o stb_bridge.o cvar.o)
+RENDER_OBJS := $(addprefix $(BUILD)/,ktx2.o scene.o render.o render_geometry.o)
 ifeq ($(HEADLESS),1)
 CFLAGS += -DVKMIN_NO_PLATFORM
-CORE_OBJS := $(filter-out $(BUILD)/plat_glfw.o,$(CORE_OBJS))
+VKMIN_OBJS := $(filter-out $(BUILD)/plat_glfw.o,$(VKMIN_OBJS))
 GLFW_LIBS :=
 endif
+CORE_OBJS := $(VKMIN_OBJS) $(RENDER_OBJS)
+
+.PHONY: libraries
+libraries: $(BUILD)/libvkmin.a $(BUILD)/librender.a
+$(BUILD)/libvkmin.a: $(VKMIN_OBJS)
+	$(AR) rcs $@ $^
+$(BUILD)/librender.a: $(RENDER_OBJS)
+	$(AR) rcs $@ $^
 
 .PHONY: all clean test golden texture analyze tools validate-shaders
 EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/*.c))
+GPU_EXAMPLES := $(patsubst examples/%.c,$(BUILD)/ex_%,$(wildcard examples/0*.c))
 
 all: tools $(BUILD)/smoke $(BUILD)/pick $(BUILD)/corridor $(EXAMPLES)
 include Makefile.sndmin
@@ -62,7 +74,7 @@ endif
 .PHONY: omega
 omega: $(BUILD)/ex_21_omega
 all: omega
-$(BUILD)/ex_21_omega: examples/21_omega.c demo/omega_shared.h demo/omega_score.h $(BUILD)/shaders.h $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND)
+$(BUILD)/ex_21_omega: examples/21_omega.c demo/omega_shared.h demo/omega_score.h demo/omega_model.h demo/omega_surface.h $(BUILD)/shaders.h $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND)
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ $< $(CORE_OBJS) $(SND_OBJECTS) $(OMEGA_AUDIO_BACKEND) $(LDLIBS) $(GLFW_LIBS) $(OMEGA_AUDIO_LIBS)
 all: sndmin
 test: sndmin-test $(BUILD)/sndmin_valley
@@ -90,7 +102,7 @@ $(BUILD):
 
 # --- shaders: compiled offline, embedded as uint32_t arrays. No runtime
 # --- shader compiler, no file-path failure mode in the binary.
-$(BUILD)/%.spv: shaders/% Makefile $(wildcard shaders/*.glsl shaders/lib/*.glsl) src/shared.h demo/omega_shared.h | $(BUILD)
+$(BUILD)/%.spv: shaders/% Makefile $(wildcard shaders/*.glsl shaders/lib/*.glsl) src/shared.h src/render_shared.h src/vkmin_gpu.h src/min_types.h demo/omega_shared.h | $(BUILD)
 	$(GLSLANG) $(GLSL_FLAGS) $< -o $@
 
 $(BUILD)/bin2c: tools/bin2c.c | $(BUILD)
@@ -106,8 +118,10 @@ $(BUILD)/shaders.h: $(SPV) $(BUILD)/bin2c
 	@printf '#endif\n' >> $@
 
 # --- objects
-$(BUILD)/%.o: src/%.c src/vkmin.h src/spirv.h src/shared.h src/plat.h src/stb_bridge.h src/cvar.h src/ktx2.h src/scene.h src/vkm_format.h src/render.h src/vkmin_math.h src/font.h $(BUILD)/shaders.h | $(BUILD)
+$(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/render.o: $(BUILD)/shaders.h src/font.h
 
 $(BUILD)/stb_bridge.o: src/stb_bridge.c src/stb_bridge.h | $(BUILD)
 	$(CC) $(THIRD_PARTY_CFLAGS) -c -o $@ $<
@@ -146,6 +160,9 @@ $(BUILD)/journal: tests/journal.c $(CORE_OBJS)
 # header, and each produces a golden image in make test.
 $(BUILD)/ex_%: examples/%.c examples/cube_data.h demo/gamekit.h demo/play.h demo/anim.h src/vkmin.h src/vkmin_math.h src/render.h $(BUILD)/shaders.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+
+$(GPU_EXAMPLES): $(BUILD)/ex_%: examples/%.c $(BUILD)/shaders.h $(VKMIN_OBJS)
+	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(VKMIN_OBJS) $(LDLIBS) $(GLFW_LIBS)
 
 $(BUILD)/corridor: demo/corridor.c demo/anim.h demo/gamekit.h src/render.h src/scene.h src/vkmin_math.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
@@ -203,10 +220,10 @@ validate-shaders: $(SPV) $(BUILD)/layout.comp.spv $(BUILD)/reload.frag.spv
 # The single-header form is generated, never edited, and must compile alone.
 .PHONY: amalgamate
 amalgamate: $(BUILD)/vkmin_single.h
-$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/shared.h src/vkmin.h src/spirv.h src/jrnl.h src/vkmin_math.h src/pack.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c | $(BUILD)
+$(BUILD)/vkmin_single.h: tools/amalgamate.sh src/min_types.h src/vkmin_gpu.h src/vkmin.h src/spirv.h src/jrnl.h src/cvar.h src/cvar.c src/plat.h src/plat_glfw.c src/stb_bridge.h src/stb_bridge.c src/vkmin.c src/vkmin_inspect.h | $(BUILD)
 	./tools/amalgamate.sh > $@
 $(BUILD)/amalg_check: $(BUILD)/vkmin_single.h tests/amalg_check.c
-	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function $(INCLUDES) $(filter -DVKMIN_NO_PLATFORM,$(CFLAGS)) -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
+	$(CC) -std=c11 -O1 -Wall -Wextra -Werror $(filter-out -Ithird_party,$(INCLUDES)) -isystem third_party $(filter -DVKMIN_NO_PLATFORM,$(CFLAGS)) -o $@ tests/amalg_check.c $(LDLIBS) $(GLFW_LIBS)
 
 golden: all
 	VKMIN_WRITE_GOLDEN=1 ./tests/run_tests.sh
@@ -215,7 +232,10 @@ golden: all
 # a failure, not a skip: a check that silently vanishes is the failure mode.
 analyze:
 	@command -v cppcheck >/dev/null || { echo "cppcheck not installed; it is required by make test"; exit 1; }
+	@mkdir -p $(BUILD)/cppcheck-cache
 	cppcheck --std=c11 --enable=warning,style,performance,portability \
+	    -j$(CPPCHECK_JOBS) --cppcheck-build-dir=$(BUILD)/cppcheck-cache \
+	    --library=tools/cppcheck-vkmin.cfg \
 	    --inline-suppr --error-exitcode=1 --quiet \
 	    --suppress=missingIncludeSystem --suppress=missingInclude \
         -Isrc -Idemo -I$(BUILD) -i third_party -i src/stb_bridge.c -i src/sndmin_io.c -i src/sndmin_miniaudio.c -UVKMIN_NO_PLATFORM \
@@ -223,3 +243,12 @@ analyze:
 
 clean:
 	rm -rf $(BUILD) tests/out
+
+.PHONY: inspection-test
+$(BUILD)/inspection: tests/inspection.c $(CORE_OBJS) $(BUILD)/shaders.h
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS) $(GLFW_LIBS)
+inspection-test: $(BUILD)/inspection $(BUILD)/ex_07_replay
+	python tools/test_inspection.py --build $(BUILD)
+test: inspection-test
+
+include Makefile.packages

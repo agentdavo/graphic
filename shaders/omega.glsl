@@ -19,7 +19,10 @@ vec3 omegaGateShape() {
     return vec3(mix(farZ,nearZ,scale),farZ,scale);
 }
 vec4 omegaShadow(vec3 world) {
-    vec3 light=normalize(vec3(-.85,.35,-.45)); // the hull shader's key
+    // Follow the emerging hull so its recessed machinery keeps casting shadows
+    // after it has travelled outside the gate's fixed shadow-map footprint.
+    world.z-=min(F.scene.z,0.);
+    vec3 light=normalize(vec3(-.35,.82,-.45)); // the hull shader's key
     vec3 right=normalize(cross(-light,vec3(0,1,0)));
     vec3 up=cross(right,-light);
     return vec4(dot(right,world)/25.,-dot(up,world)/25.,(60.-dot(light,world))/120.,1);
@@ -39,6 +42,21 @@ float fbm(vec2 p) {
 // the pylon trusses rather than behind them in the gate layer.
 vec3 omegaFlares(vec2 uv) {
     vec3 color=vec3(0);
+    // Blue-white engine discs and soft optical halos, visible from the stern.
+    // Restrict to the cleared gate and a rear view to avoid shining through hull.
+    if(F.scene.x>10.5 && F.scene.z+16.<OMEGA_GATE_MOUTH_Z) {
+        for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2) {
+            vec3 e=vec3(float(sx)*OMEGA_ENGINE_X,float(sy)*OMEGA_ENGINE_Y,15.72+F.scene.z);
+            float facing=smoothstep(.18,.55,normalize(F.eye.xyz-e).z);
+            vec4 clip=F.vp*vec4(e,1);
+            if(clip.w<=0. || facing<=0.) continue;
+            vec2 dp=uv-(clip.xy/clip.w*.5+.5); dp.x*=F.scene.y;
+            float radius=clamp(1.2/clip.w,.001,.055);
+            float q=dot(dp,dp)/(radius*radius);
+            color+=facing*(vec3(.18,.34,1.25)*exp(-q*.55)
+                +vec3(.035,.065,.23)*exp(-q*.075));
+        }
+    }
     // Activation, as in the footage: a red-orange flare appears part way
     // along each spine, travels toward the far cap brightening at every fin
     // station, swells into a pink-white sphere near the far end, and the four
