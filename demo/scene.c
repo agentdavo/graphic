@@ -55,6 +55,10 @@ int main(int argc, char **argv) {
         "  --record FILE                     journal every call after init\n"
         "  --profile lavapipe                small settings for a GPU-less runner\n"
         "  +r_gpu_cull 0                     any cvar; --cvars lists them\n");
+    /* Outdoor is decided before vkr_init because it creates the sky, water,
+     * history and bloom targets there, so it cannot be a per-frame cvar. */
+    bool outdoor = false;
+    for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--outdoor")) outdoor = true;
     cvar_state config = opt.config;
     vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "scene",
         .width = 1280, .height = 720, .vsync = true, .headless = opt.headless, .config = &config,
@@ -64,7 +68,7 @@ int main(int argc, char **argv) {
     vkmin_size(gpu, &width, &height);
     vkr *r = vkr_init(gpu, &(vkr_desc){.width = width, .height = height, .shadow_atlas = 2048,
         .max_vertices = 8192, .max_indices = 16384, .max_meshes = 8, .max_materials = 8,
-        .max_instances = INSTANCES + BILLBOARDS});
+        .max_instances = INSTANCES + BILLBOARDS, .outdoor = outdoor});
 
     const gk_shapes shapes = gk_upload_shapes(r);
     const uint32_t checker = gk_checker_texture(gpu, 256, 16,
@@ -135,6 +139,30 @@ int main(int argc, char **argv) {
                 .texture = disc, .flags = VKMIN_QUAD_BILLBOARD};
         }
 
+        /* The outside path: analytic sky, the water plane and the bloom
+         * composite. Terrain, grass and scatter are left out -- this exists to
+         * put sky.frag, water.frag and taa.frag under the agreement check,
+         * which nothing did before, not to rebuild a landscape. The maps are
+         * the renderer's own default slots, which is what makes that possible
+         * without an asset. The asserts in vkr_frame say which of these fields
+         * must be positive; the rest are chosen to look like weather.
+         *
+         * Water sits just below the courtyard floor and the bounded plane is
+         * wider than the tile, so it shows as a lake ringing the courtyard
+         * rather than flooding it. The plane has to be visibly in frame: a
+         * water pass that drew nothing would regress silently, and one that
+         * drowns the scene hides every other regression behind it. */
+        const Outdoor outside = {
+            .terrain = {0.0f, 0.0f, 64.0f, 1.0f},
+            .height = {-1.0f, 8.0f, -0.15f, 0.015f},
+            .maps = {VKR_TEX_WHITE, VKR_TEX_WHITE, VKR_TEX_BLACK, VKR_TEX_WHITE},
+            .albedo = {VKR_TEX_WHITE, VKR_TEX_WHITE, VKR_TEX_WHITE, VKR_TEX_WHITE},
+            .normals = {VKR_TEX_FLAT_NORMAL, VKR_TEX_FLAT_NORMAL, VKR_TEX_FLAT_NORMAL, VKR_TEX_FLAT_NORMAL},
+            .water_maps = {VKR_TEX_FLAT_NORMAL, VKR_TEX_FLAT_NORMAL, 0, 0},
+            .weather = {0.35f, 0.6f, 0.05f, 60.0f},
+            .water = {0.45f, 0.9f, 0.25f, 1.6f},
+        };
+
         const float orbit = t * 0.12f;
         const vec3 eye = {sinf(orbit) * 34.0f, 12.0f + 4.0f * sinf(t * 0.09f), cosf(orbit) * 34.0f};
         const mat4 view = vkmin_mat4_look_at(eye, (vec3){0, 2.5f, 0}, (vec3){0, 1, 0});
@@ -152,6 +180,7 @@ int main(int argc, char **argv) {
             .quads = billboards, .quad_count = BILLBOARDS,
             .overlay_text = overlay,
             .look = {.outline = 0.35f, .fog = {0.42f, 0.48f, 0.58f}, .fog_density = 0.004f},
+            .outdoor = outdoor ? &outside : NULL,
             .frame = f});
         vkmin_frame_end(gpu);
     }

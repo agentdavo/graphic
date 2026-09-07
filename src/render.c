@@ -834,6 +834,18 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     const int rw = win_w < r->desc.width ? win_w : r->desc.width;
     const int rh = win_h < r->desc.height ? win_h : r->desc.height;
 
+    /* The indoor passes cooperate with a rendered sub-rect -- tonemap.frag
+     * scales its uv by Frame.screen -- but water.frag and taa.frag sample at
+     * raw v_uv and the bloom pass blurs the whole source, so outdoor at
+     * rw < desc.width composites the margin that was never rendered. That is
+     * a silently wrong picture, so refuse it here rather than draw it: one
+     * check at the boundary, where the caller can still act on it. Supporting
+     * it would mean scaling uv in three shaders and scissoring bloom, which is
+     * worth doing when something needs it and not before. */
+    VKR_ASSERT(!outside || (rw == r->desc.width && rh == r->desc.height),
+               "outdoor needs vkr_desc sized to the frame: rendering %dx%d into %dx%d targets "
+               "would composite an unrendered margin", rw, rh, r->desc.width, r->desc.height);
+
     const uint32_t slot = f->frame.slot;
     VKR_ASSERT(slot < VKR_FRAMES, "vkr_frame: frame slot %u", slot);
 

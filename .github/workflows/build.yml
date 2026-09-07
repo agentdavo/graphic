@@ -88,6 +88,18 @@ jobs:
           ./build/scene --headless --size 320 180 --frame 300 --out s-legacy.png --path=legacy
           ./build/scene --headless --size 320 180 --frame 300 --out s-modern.png --path=modern
           cmp s-legacy.png s-modern.png
+      # The outside path -- analytic sky, the water composite, bloom -- had no
+      # runtime coverage at all until scene grew an --outdoor mode, so sky.frag
+      # and water.frag were in the same position render.c was before scene
+      # existed: compiled, embedded, and never run.
+      - name: The outdoor path agrees across paths too
+        run: |
+          ./build/scene --headless --size 320 180 --frame 300 --out out.png --record out.vkj --outdoor
+          ./build/replay --replay out.vkj --frame 300 --path=legacy --out out-replay.png
+          cmp out.png out-replay.png
+          ./build/scene --headless --size 320 180 --frame 300 --out out-legacy.png --outdoor --path=legacy
+          ./build/scene --headless --size 320 180 --frame 300 --out out-modern.png --outdoor --path=modern
+          cmp out-legacy.png out-modern.png
       # The one agreement check the tree can still make: a frame rendered
       # directly, and the same frame replayed from its journal by a different
       # program on the other code path. Byte equality or nothing.
