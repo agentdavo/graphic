@@ -198,10 +198,10 @@ jobs:
       # arithmetic, so this is the one check that runs anywhere. It is also the
       # code where a mistake is invisible -- overlapping ranges corrupt two
       # live resources without asking Vulkan anything illegal.
-      - name: The suballocator, with no GPU
+      - name: The pure units, with no GPU
         run: |
-          cmake --build build --target test_arena
-          ./build/test_arena
+          cmake --build build --target test_units
+          ./build/test_units
       - name: Build shaders
         run: cmake --build build --target shaders
       - name: Build vkmin

@@ -1,17 +1,21 @@
-/* test_arena -- drives vkmin's suballocator directly, with no device.
+/* test_units -- vkmin's pure logic, driven directly with no device.
  *
- * The allocator hands out ranges inside one VkDeviceMemory. A mistake there
- * does not fault and no validation layer reports it: two live resources are
- * simply given overlapping bytes and quietly corrupt each other. That is the
- * "preconditions of our own invention" case, so it is ours to check.
+ * Three units, chosen because each one is wrong quietly rather than loudly:
  *
- * It reads only cap, used, live and the range table, so this needs no
- * instance, no device and no GPU -- which is why it can run in CI on a machine
- * with no driver at all, unlike every other check in this tree.
+ *  - the suballocator, which hands out ranges inside one VkDeviceMemory. A
+ *    mistake does not fault and no validation layer reports it; two live
+ *    resources are simply given overlapping bytes and corrupt each other. The
+ *    invariant that matters is the one the arena cannot state for itself, so
+ *    this keeps a shadow list of live spans and checks every range against it.
+ *  - choose_path, which decides the 1.4-or-1.3 question. Silently upgrading a
+ *    forced --path=legacy would leave every cross-path comparison in CI
+ *    passing while comparing a path against itself.
+ *  - format_lookup and mip_bytes, which size every upload. Block rounding is
+ *    the trap: block_dim is 4 for BC and 1 everywhere else, so a slip shows
+ *    only on compressed textures and only as a wrong picture.
  *
- * The invariant that matters most is the one the arena cannot state for
- * itself: no two live allocations may overlap. So the test keeps its own
- * shadow list and checks every returned range against it.
+ * None of it touches a Vulkan entry point, so this needs no instance, no
+ * device and no driver -- the one check in this tree that runs anywhere.
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,12 +35,14 @@
  * VkDeviceSize, which is a uint64_t. */
 #include <vulkan/vulkan_core.h>
 
-static void arena_fail(const char *file, int line, const char *fmt, ...);
+_Noreturn static void arena_fail(const char *file, int line, const char *fmt, ...);
 #define VKMIN_FAIL(...) arena_fail(__FILE__, __LINE__, __VA_ARGS__)
 #include "vkmin.h"
 #include <stdarg.h>
 
-static void arena_fail(const char *file, int line, const char *fmt, ...) {
+/* _Noreturn like the real vkmin_fail, or format_lookup appears to fall off
+ * the end of a non-void function and -Werror=return-type rejects it. */
+_Noreturn static void arena_fail(const char *file, int line, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "%s:%d: arena invariant broken: ", file, line);
@@ -61,6 +67,14 @@ typedef struct {
 } arena;
 
 #include "vkmin_arena.h"
+
+/* choose_path takes a path_caps; restate the two fields it reads. The other
+ * three exist in vkmin.c and never reach this decision. */
+typedef struct {
+    bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
+} path_caps;
+
+#include "vkmin_pure.h"
 
 /* ------------------------------------------------------------- harness -- */
 
@@ -182,6 +196,62 @@ int main(void) {
     check(sane_faults == 0, "range table stayed sorted, disjoint and in bounds");
     check(s.used <= s.cap, "high-water mark never passed capacity");
 
-    printf("arena: %d checks, %d failures\n", checks, errors);
+    /* ---- choose_path: the 1.4-or-1.3 decision, as a table of outcomes ---- */
+
+    const char *why = NULL;
+    const path_caps both = {.host_image_copy = true, .maintenance5 = true};
+    const path_caps neither = {0};
+    const path_caps no_copy = {.maintenance5 = true};
+    const path_caps no_m5 = {.host_image_copy = true};
+
+    check(choose_path(both, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_MODERN, "auto takes modern when it can");
+    check(choose_path(neither, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_LEGACY, "auto falls to the 1.3 floor");
+    check(choose_path(no_copy, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_LEGACY, "one feature short is still legacy");
+    check(choose_path(no_m5, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_LEGACY, "the other feature short too");
+    /* A forced legacy must be honoured on a device that could do modern. This
+     * is what makes the two paths comparable on one machine, and every
+     * cross-path check in CI rests on it. */
+    check(choose_path(both, VKMIN_PATH_LEGACY, &why) == VKMIN_PATH_LEGACY, "legacy is honoured on a modern device");
+    check(choose_path(both, VKMIN_PATH_MODERN, &why) == VKMIN_PATH_MODERN, "modern is honoured when available");
+    /* The reason string is what the device line prints, so a reader can tell a
+     * fallback from a choice. Wrong text is a lie in the log, not a crash. */
+    check(choose_path(neither, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_LEGACY &&
+          strcmp(why, "no hostImageCopy") == 0, "reason names the missing feature");
+    check(choose_path(no_m5, VKMIN_PATH_AUTO, &why) == VKMIN_PATH_LEGACY &&
+          strcmp(why, "no maintenance5") == 0, "and names the other one");
+
+    /* ---- format sizes: the block-dimension rounding is the trap ---- */
+
+    const format_info rgba8 = format_lookup(VKMIN_FMT_RGBA8_UNORM);
+    check(rgba8.block_bytes == 4 && rgba8.block_dim == 1, "rgba8 is one byte-quad per texel");
+    check(mip_bytes(rgba8, 16, 16) == 1024, "16x16 rgba8 is 1024 bytes");
+    check(mip_bytes(rgba8, 1, 1) == 4, "a 1x1 rgba8 mip is 4 bytes");
+
+    const format_info bc1 = format_lookup(VKMIN_FMT_BC1_UNORM);
+    check(bc1.block_dim == 4 && bc1.block_bytes == 8, "bc1 is 8 bytes per 4x4 block");
+    check(mip_bytes(bc1, 16, 16) == 128, "16x16 bc1 is 16 blocks of 8");
+    /* Rounding up is the point: a 1x1 BC image still costs a whole block, and
+     * rounding down would under-size the upload and read past the source. */
+    check(mip_bytes(bc1, 1, 1) == 8, "a 1x1 bc1 mip still costs one whole block");
+    check(mip_bytes(bc1, 5, 5) == 32, "5x5 bc1 rounds up to 2x2 blocks");
+
+    const format_info bc5 = format_lookup(VKMIN_FMT_BC5_UNORM);
+    check(bc5.block_bytes == 16 && bc5.block_dim == 4, "bc5 is 16 bytes per block");
+    check(mip_bytes(bc5, 4, 4) == 16, "4x4 bc5 is exactly one block");
+
+    check(format_lookup(VKMIN_FMT_D32_FLOAT).aspect == VK_IMAGE_ASPECT_DEPTH_BIT, "depth carries the depth aspect");
+    check(format_lookup(VKMIN_FMT_RGBA8_UNORM).aspect == VK_IMAGE_ASPECT_COLOR_BIT, "colour carries colour");
+
+    /* The switch has no default, so a new enumerator without a case is already
+     * a compile error. What that cannot catch is an entry that compiles but
+     * maps to nothing usable, so walk every declared format. */
+    bool every_format_sized = true;
+    for (int f = 0; f < VKMIN_FMT_NONE; ++f) {
+        const format_info fi = format_lookup((vkmin_format)f);
+        if (fi.vk == VK_FORMAT_UNDEFINED || !fi.block_bytes || !fi.block_dim) every_format_sized = false;
+    }
+    check(every_format_sized, "every format maps to a real VkFormat with a size");
+
+    printf("pure units: %d checks, %d failures\n", checks, errors);
     return errors ? 1 : 0;
 }
