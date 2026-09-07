@@ -2,7 +2,13 @@
 #ifndef VKMIN_GPU_H
 #define VKMIN_GPU_H
 #include "min_types.h"
+/* The absent-index sentinel for every U32 field that names something by index
+ * -- a bindless texture, a bone range, a shadow view. Zero is a real index, so
+ * it cannot serve; callers test against this, never against 0. */
 #define VKMIN_NONE 0xffffffffu
+/* Descriptor array size, so also one past the largest index vkmin_index can
+ * return. Shaders declare the array at this size, which is why changing it
+ * means recompiling shaders, not just rebuilding vkmin. */
 #define VKMIN_MAX_TEXTURES 4096u
 /* Sampler presets. Users never create samplers; they pick one of these. */
 #define VKMIN_SAMPLER_LINEAR_REPEAT 0u

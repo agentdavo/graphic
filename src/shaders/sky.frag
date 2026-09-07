@@ -1,4 +1,9 @@
 #version 450
+// sky.frag -- the analytic sky, drawn full-screen behind everything. It writes
+// the id and normal targets as well as colour, to a constant 0 and 0.5: an
+// undeclared or unwritten output leaves whatever the attachment held, and the
+// outline pass in tonemap.frag differentiates the normal target, so stale
+// contents draw edges across the sky. Same reasoning as quad.glsl's.
 #include "common.glsl"
 #include "lib/outdoor.glsl"
 layout(location=0) in vec2 v_uv;

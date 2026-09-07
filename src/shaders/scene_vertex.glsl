@@ -1,7 +1,14 @@
-#include "lib/outdoor.glsl"
 // scene_vertex.glsl -- the one vertex fetch, shared by the depth-only and
 // forward vertex shaders. Pulls the packed vertex by device address, applies
 // skinning when the instance says so, and returns world-space attributes.
+//
+// It is one function on purpose, not two similar ones. depth.vert and
+// scene.vert must produce bit-identical world positions or the prepass depth
+// disagrees with the forward pass and the surface z-fights against its own
+// shadow; the same goes for the wind displacement below, which is why it lives
+// here rather than in the forward shader that visibly needs it. Two copies
+// would drift the first time one of them was edited.
+#include "lib/outdoor.glsl"
 struct FetchedVertex {
     vec3 world_pos;
     vec3 normal;

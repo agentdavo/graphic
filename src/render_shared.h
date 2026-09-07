@@ -20,7 +20,9 @@
 
 #define VKMIN_MAX_LIGHTS 256u
 #define VKMIN_MAX_VIEWS 40u        /* camera + shadow views culled per frame */
-#define VKMIN_MAX_DRAWS 16384u      /* indirect commands per view */
+#define VKMIN_MAX_DRAWS 16384u      /* ceiling on vkr_desc.max_instances, which is
+                                     * the real per-list stride; also the size of
+                                     * the compare buffer in the d_check_cull diff */
 #define VKMIN_CASCADES 4u
 
 #define VKMIN_CLUSTER_X 16u
@@ -44,6 +46,9 @@
 #define VKMIN_INST_GRASS 4u
 #define VKMIN_INST_LEAF 8u
 #define VKMIN_INST_TREE 16u
+/* A Material flag, not an Instance one, despite sitting here: 16 is the next
+ * free bit in each set independently, and the two are never tested against the
+ * same word. lit_pbr.frag is its only reader. */
 #define VKMIN_MAT_TERRAIN 16u
 
 #define VKMIN_LIGHT_DIRECTIONAL 0u
@@ -180,8 +185,13 @@ VKMIN_STRUCT(Frame) {
     ADDR lights;
     ADDR views;
     ADDR bones;
-    ADDR draw_cmds;     /* DrawCmd[VKMIN_MAX_VIEWS][VKMIN_MAX_DRAWS] */
-    ADDR draw_counts;   /* U32[VKMIN_MAX_VIEWS] */
+    /* Two lists per view -- [0] back-face culled, [1] double-sided -- so both
+     * are indexed [view * 2 + list]. The command array's inner stride is
+     * draw_capacity below, which is the renderer's max_instances, not
+     * VKMIN_MAX_DRAWS; that constant is only the ceiling max_instances may
+     * take. cull.comp and draw_lists() must agree with this exactly. */
+    ADDR draw_cmds;     /* DrawCmd[VKMIN_MAX_VIEWS][2][draw_capacity] */
+    ADDR draw_counts;   /* U32[VKMIN_MAX_VIEWS][2] */
     ADDR cluster_lights; /* U32[VKMIN_CLUSTER_COUNT * VKMIN_CLUSTER_STRIDE] */
     ADDR quads;          /* Quad[] for this frame */
     /* The look, for the shader library: all zero is plain PBR with no post. */

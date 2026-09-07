@@ -1,13 +1,30 @@
+// omega.glsl -- the preamble for the omega demo's own six shaders. Omega is a
+// second, self-contained user of the transport contract, kept apart from the
+// renderer on purpose: it uses none of shaders/lib, and nothing in lib/ may
+// grow a dependency on it.
+//
+// It replaces the engine's push block rather than extending it. VKMIN_OWN_PUSH
+// suppresses common.glsl's `Push push` and OmegaBlock takes its place, so
+// every omega pipeline is created with push_size = sizeof(OmegaPush) and the
+// SPIR-V size check in vkmin_make_pipeline is what holds the two ends
+// together. omega_shared.h is the C/GLSL pair for that block and for the scene
+// constants below; like render_shared.h it is compiled by both toolchains from
+// one text, and its geometry constants (mouth Z, pylon radius, muzzle offsets)
+// are read by omega.c to build the meshes and by these shaders to draw the
+// light that has to land in the same places.
 #define VKMIN_OWN_PUSH
 #include "common.glsl"
 #include "omega_shared.h"
 layout(push_constant, scalar) uniform OmegaBlock { OmegaPush o; };
 layout(buffer_reference, scalar) readonly buffer OmegaFrame { OmegaScene s; };
+// The per-frame scene block, reached by device address out of the push block.
 #define F OmegaFrame(o.frame).s
 const float O_PI=3.14159265359;
-/* The inverse of omega_pack_normal in 21_omega.c: two snorm16 on an octahedron,
- * folded for the lower hemisphere. Both halves of this pair have to change
- * together, so keep the comment on the C side pointing here. */
+/* The inverse of omega_pack_normal in omega/omega.c: two snorm16 on an
+ * octahedron, folded for the lower hemisphere. Both halves of this pair have
+ * to change together, so keep the comment on the C side pointing here. This
+ * is the part of the contract no _Static_assert can cover -- the sizes agree
+ * whatever the encoding is, so only the pair of comments guards it. */
 vec3 omegaOctDecode(uint packed) {
     vec2 e=unpackSnorm2x16(packed);
     vec3 n=vec3(e.x,e.y,1.-abs(e.x)-abs(e.y));

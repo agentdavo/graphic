@@ -214,8 +214,16 @@ add_custom_target(shaders DEPENDS "${VKMIN_SHADERS_H}")
 get_filename_component(VKMIN_GLSLANG_DIR "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" DIRECTORY)
 find_program(VKMIN_SPIRV_VAL NAMES spirv-val HINTS "${VKMIN_GLSLANG_DIR}")
 if(VKMIN_SPIRV_VAL)
+    # One invocation per module: spirv-val takes a single input and answers
+    # "More than one input file specified" to anything else, so passing the
+    # whole list made this target fail every time it was asked to run.
+    set(VKMIN_VALIDATE_COMMANDS "")
+    foreach(spv IN LISTS VKMIN_SPV_FILES)
+        list(APPEND VKMIN_VALIDATE_COMMANDS
+             COMMAND ${VKMIN_SPIRV_VAL} --target-env vulkan1.3 --scalar-block-layout "${spv}")
+    endforeach()
     add_custom_target(validate-shaders
-        COMMAND ${VKMIN_SPIRV_VAL} --target-env vulkan1.3 --scalar-block-layout ${VKMIN_SPV_FILES}
+        ${VKMIN_VALIDATE_COMMANDS}
         DEPENDS ${VKMIN_SPV_FILES}
         COMMENT "spirv-val over every module"
         VERBATIM)

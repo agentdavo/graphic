@@ -1,6 +1,7 @@
 #version 450
-// 05: a compute shader writes the triangle's vertices as a function of the
-// frame index. The draw that follows pulls them by address.
+// ex_spin.comp -- a compute shader writes the triangle's vertices as a
+// function of the frame index; the draw that follows pulls them by address.
+// Was example 05; see ex_tri.vert on what became of the series.
 #define VKMIN_OWN_PUSH
 #include "common.glsl"
 layout(buffer_reference, scalar) buffer ExVertexRef { ExVertex v[]; };

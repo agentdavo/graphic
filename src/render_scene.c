@@ -1,11 +1,15 @@
-/* render_scene.c -- see scene.h. One read, then pointer arithmetic. */
+/* render_scene.c -- see render_scene.h. One read, then pointer arithmetic. */
 #include "render_scene.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void fail(const char *path, const char *why) {
+/* _Noreturn is load-bearing, not decoration: every caller below is followed by
+ * code that dereferences what the check just rejected, so without it an
+ * analyser has to assume fail() returns and reports a null or overrun that
+ * cannot happen. render_ktx2.c's fail() is marked the same way. */
+static _Noreturn void fail(const char *path, const char *why) {
     fprintf(stderr, "scene: %s: %s\n", path, why);
     abort();
 }

@@ -10,8 +10,12 @@ struct Surface {
     uint flags;      // VKMIN_MAT_*
 };
 
-// Always samples every map (the 1x1 defaults stand in for missing ones); the
-// flags decide what is used, so the cost is constant and the branch is on data.
+// Always samples every map; the flags decide what is used, so the cost is
+// constant and the branch is on data, not on whether to do the work.
+// The 1x1 stand-ins are a fixed convention of the texture array's first three
+// slots -- VKR_TEX_WHITE 0, VKR_TEX_FLAT_NORMAL 1, VKR_TEX_BLACK 2 in
+// render.h, asserted at registration in render.c -- so a VKMIN_NONE index
+// becomes a sample that changes nothing rather than a branch around a sample.
 Surface surface_fetch(Frame frame, Material m, vec3 v_normal, vec4 v_tangent, vec2 uv, bool front_facing) {
     Surface s;
     uint albedo_tex = m.albedo_tex == VKMIN_NONE ? 0u : m.albedo_tex;

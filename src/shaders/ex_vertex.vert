@@ -1,5 +1,6 @@
 #version 450
-// 03..06: pull an ExVertex by device address, transform by the push mvp.
+// ex_vertex.vert -- pull an ExVertex by device address, transform by the push
+// mvp. Was examples 03..06; see ex_tri.vert on what became of the series.
 #define VKMIN_OWN_PUSH
 #include "common.glsl"
 layout(buffer_reference, scalar) readonly buffer ExVertexRef { ExVertex v[]; };

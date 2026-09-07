@@ -1,4 +1,5 @@
 #version 450
+// smoke.vert -- second stage of the smoke test; see smoke.comp.
 #include "common.glsl"
 layout(location = 0) out vec2 v_uv;
 

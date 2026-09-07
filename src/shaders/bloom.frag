@@ -1,4 +1,11 @@
 #version 450
+// bloom.frag -- one separable Gaussian tap, run three times at half
+// resolution. push.param is the source texture slot and push.param2 is the
+// pass index render.c dispatches: 0 subtracts 1.0 first (the bright pass, so
+// only genuinely over-range radiance blooms) and blurs horizontally, 1 blurs
+// horizontally again, 2 blurs vertically and applies the strength. The
+// strength arrives as float bits in the uint push.param3 -- Push has no float
+// field and adding one would move every offset the C side asserts.
 #include "common.glsl"
 layout(location=0) in vec2 v_uv;
 layout(location=0) out vec4 o_color;

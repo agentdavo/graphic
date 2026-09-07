@@ -1,6 +1,9 @@
 #version 450
 // smoke.comp -- writes a textured triangle's vertices to a buffer by device
-// address. Exists to prove compute -> draw hand-off through the layer.
+// address. Exists to prove compute -> draw hand-off through the layer: this,
+// smoke.vert and smoke.frag are one three-stage smoke test, and only make
+// sense together. No C in the repository names their _spv symbols at present,
+// so nothing currently runs the test; they are still compiled and embedded.
 #include "common.glsl"
 layout(local_size_x = 64) in;
 

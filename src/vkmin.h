@@ -254,6 +254,12 @@ typedef struct {                  /* plain data, for humans and models to read *
     size_t device_used, device_cap, ring_used, ring_cap;
     /* Arena indices: 0 buffer, 1 image. device_used remains the monotonic high-water cursor sum. */
     size_t arena_live[2], arena_pending[2], arena_free[2], arena_high_water[2], arena_largest_free[2];
+    /* What freeing without stalling costs. retirements is how many frees are
+     * still waiting on the submission timeline; a retirement_wait is the case
+     * that failed to be free -- an allocation that had to block until one
+     * completed. The device_idle_* counters are the whole-device stalls that
+     * remain (swapchain recreate, shutdown, sync_naive), and
+     * device_idle_calls is their sum. */
     uint32_t retirements, texture_pending, texture_free;
     uint64_t retirement_waits, device_idle_calls, allocation_failures;
     double retirement_wait_ms;

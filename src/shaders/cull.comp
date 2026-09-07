@@ -3,11 +3,15 @@
 // (x: instance, y: view) and writes VkDrawIndexedIndirectCommand records.
 //
 // Two lists per view: [0] back-face culled, [1] double-sided. Two modes,
-// selected by push.param: compact (atomic append, the fast path) and stable
-// (slot = instance index, count = instance_count, culled instances written
-// with instance_count 0). Stable is the reference path: its draw order is
-// fixed, so golden images are bit-exact; compact's order is whatever the
-// atomics decide.
+// selected by push.param: non-zero is compact (atomic append, the fast path)
+// and zero is stable (slot = instance index, count pre-filled to the instance
+// count, culled instances written with instance_count 0). Stable is the
+// reference path in the sense CLAUDE.md means: it is the parallel
+// implementation kept permanently so the fast path can be checked against it
+// at a flag's cost. Its draw order is the instance order and therefore fixed,
+// so golden images and journal replays are bit-exact; compact's order is
+// whatever the atomics decide that run, which is why it cannot be the one the
+// recorded frames are compared against.
 #include "common.glsl"
 layout(local_size_x = VKMIN_CULL_GROUP) in;
 

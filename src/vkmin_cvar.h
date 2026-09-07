@@ -71,9 +71,16 @@ typedef struct cvar_state {
     bool locked; /* init-only settings cannot change after context creation */
 } cvar_state;
 
-/* Initialize before use. Edit through these functions; fields support copying
- * the whole state, not bypassing validation. cvar_set supplies a program/profile
- * default; parsing marks an explicit assignment, including an explicit zero. */
+/* Initialize before use. Edit through these functions; the fields are public so
+ * a whole state can be copied, not so validation can be bypassed. Out-of-range
+ * values and edits to an init-only setting after `locked` abort rather than
+ * being clamped: a tunable that quietly took a different value than was asked
+ * for would make a measurement lie.
+ *
+ * cvar_set supplies a program or profile default and does NOT mark the setting
+ * as assigned; only parsing does, which is why cvar_was_set means "the user
+ * said so on the command line" -- including an explicit zero, which
+ * cvar_is_overridden (a comparison against the table default) cannot see. */
 void cvar_init(cvar_state *state);
 float cvar_get(const cvar_state *state, cvar_id id);
 bool cvar_get_bool(const cvar_state *state, cvar_id id);
@@ -83,11 +90,16 @@ bool cvar_is_overridden(const cvar_state *state, cvar_id id);
 bool cvar_was_set(const cvar_state *state, cvar_id id);
 const char *cvar_name(cvar_id id);
 
-/* Parses "name=value" or "+name value" forms. Returns false on an unknown
- * name or unparsable value, having printed why. */
+/* Parses one "name=value" string. The "+name value" spelling accepted on a
+ * command line is joined into that form by the caller (parse_command_line in
+ * vkmin.c), so there is one parser and not two. Returns false, having printed
+ * why, on an unknown name, an unparsable or out-of-range value, or an edit to
+ * an init-only setting once the state is locked. */
 bool cvar_parse_assignment(cvar_state *state, const char *text);
 void cvar_print_all(const cvar_state *state);
-/* Writes "name=value name=value" for changed or explicitly assigned values. */
+/* Writes "name=value name=value" for changed or explicitly assigned values.
+ * Returns the length the text would have had, snprintf-style, so a result >= cap
+ * means buf holds a truncated line. */
 int cvar_format_overrides(const cvar_state *state, char *buf, int cap);
 
 #endif

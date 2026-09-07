@@ -1,4 +1,4 @@
-/* render_ktx2.c -- see ktx2.h. */
+/* render_ktx2.c -- see render_ktx2.h. */
 #include "render_ktx2.h"
 
 #include <stdio.h>

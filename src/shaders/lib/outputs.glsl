@@ -1,8 +1,11 @@
-// lib/outputs.glsl -- the forward pass writes three targets: HDR colour, the
-// instance id for picking, and the octahedral normal for the outline pass.
+// lib/outputs.glsl -- the other fixed half of the forward interface: three
+// targets, HDR colour, the instance id for picking (what vkmin_pick reads) and
+// the octahedral normal the outline pass in tonemap.frag differentiates.
 // Every opaque draw writes all three, unconditionally; a blended pipeline is
 // created with the id and normal attachments masked off, so the same shader
-// serves both.
+// serves both. A game fragment shader that declares fewer, or declares them in
+// a different order, is writing to the wrong attachments -- call
+// write_outputs() rather than declaring outputs of its own.
 layout(location = 0) out vec4 o_color;
 layout(location = 1) out uint o_id;
 layout(location = 2) out vec2 o_normal;

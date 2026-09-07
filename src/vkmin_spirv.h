@@ -1,5 +1,20 @@
-/* Internal SPIR-V push-layout reader. Bounded input, explicit failure, no Vulkan.
- * Decorations, not a guessed C layout, determine matrix and array strides. */
+/* Internal SPIR-V push-layout reader. It answers exactly one question -- how
+ * many bytes is this module's push-constant block -- so vkmin_make_pipeline can
+ * refuse a pipeline whose C-side push struct has drifted from the GLSL block
+ * instead of letting the shader read whatever follows it. Bounded input,
+ * explicit failure, no Vulkan. Decorations, not a guessed C layout, determine
+ * matrix and array strides.
+ *
+ * A SPIR-V module is a flat word stream: an instruction's first word packs the
+ * opcode in the low 16 bits and its total word count in the high 16, so `i +=
+ * w[i] >> 16` walks it. Only these numbers appear below, written as the
+ * literals the binary actually holds:
+ *   opcodes      21 OpTypeInt    22 OpTypeFloat   23 OpTypeVector  24 OpTypeMatrix
+ *                28 OpTypeArray  30 OpTypeStruct  32 OpTypePointer 43 OpConstant
+ *                59 OpVariable   71 OpDecorate    72 OpMemberDecorate
+ *   decorations   4 RowMajor      6 ArrayStride    7 MatrixStride  35 Offset
+ *   storage classes  9 PushConstant   5349 PhysicalStorageBuffer
+ * Header words: w[0] magic, w[3] the id bound (every result id is below it). */
 #ifndef VKMIN_SPIRV_H
 #define VKMIN_SPIRV_H
 #include <stdbool.h>
@@ -7,8 +22,14 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+/* w/n: the module and its length in words. def[id]: the word index where result
+ * id `id` was defined, so a type can be followed without rescanning. bound: the
+ * module's id bound, the one limit every id is checked against. */
 typedef struct { const uint32_t *w, *def; size_t n; uint32_t bound; } vkm_spv;
 
+/* Byte size of type `id`. `stride` and `row_major` come from the decorations on
+ * the *member* that holds this type, because that is where SPIR-V puts a matrix
+ * stride; `depth` only bounds recursion on a malformed module. */
 static inline bool vkm_spv_size(const vkm_spv *v, uint32_t id, uint32_t stride,
                                 bool row_major, unsigned depth, uint32_t *out) {
     if (id >= v->bound || !v->def[id] || depth > 32) return false;
@@ -45,7 +66,10 @@ static inline bool vkm_spv_size(const vkm_spv *v, uint32_t id, uint32_t stride,
         if (array_stride < element) return false;
         size = (uint64_t)array_stride * count[3]; break;
     }
-    case 30: /* struct */
+    /* Struct size is the largest member end, not a running sum: members are
+     * placed by their Offset decoration and need not be declared in order. An
+     * undecorated member is a module we refuse rather than guess about. */
+    case 30:
         for (uint32_t member = 0; member + 2 < wc; ++member) {
             uint32_t offset = UINT32_MAX, matrix_stride = 0;
             bool row = false;

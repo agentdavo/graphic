@@ -220,7 +220,9 @@ automated and the rest handled with explicit, shared convention.
 
 vkmin is a thin wrapper over Vulkan. The Khronos validation layer already exists, it is far
 more thorough than anything we would write, and vkmin already turns it on — together with
-synchronization validation — whenever a context is created with `debug` set. Reimplementing
+synchronization validation — in any build without `NDEBUG`. There is no desc field and no
+flag for it: a release build never pays for it, a debug build always does, and if the layer
+is missing vkmin says so on stderr and continues without it. Reimplementing
 part of its job inside vkmin costs shipping-path code, adds a second opinion that can disagree
 with the first, and catches less.
 

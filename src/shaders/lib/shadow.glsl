@@ -1,7 +1,12 @@
 // lib/shadow.glsl -- one atlas, many views. shadow_sample() is the primitive:
 // 3x3 PCF against one View's tile, returning the lit fraction. The two
-// helpers above it pick the view for a sun (by cascade) or a local light
+// helpers at the bottom pick the view for a sun (by cascade) or a local light
 // (by cube face).
+//
+// Everything outside a view's frustum returns 1.0, fully lit. That is the only
+// choice that degrades gracefully -- returning 0 would black out anything the
+// map does not reach -- but it means shadows simply stop at the far cascade's
+// edge, which is why lit_pbr.frag fades the sun's shadow to 1.0 before it.
 float shadow_sample(Frame frame, uint view_index, vec3 world_pos, vec3 N, float NdotL) {
     View sv = ViewRef(frame.views).v[view_index];
     vec3 offset_pos = world_pos + N * sv.texel.z * (1.0 - NdotL);
@@ -25,6 +30,13 @@ float shadow_sample(Frame frame, uint view_index, vec3 world_pos, vec3 N, float 
     return lit / 9.0;
 }
 
+// KNOWN DISCONTINUITY: this is a hard step. Two adjacent pixels either side of
+// a split get different views, different texel sizes and different depth bias,
+// so the lit fraction jumps and the split shows as a visible seam across the
+// image. Blending the two cascades over a band is planned separately as
+// r_cascade_blend; do not "fix" it here in passing, because the same index is
+// also what VKMIN_DEBUG_CASCADES colours and what sun_shadow() clamps against
+// sun.shadow_views, and all three have to move together.
 uint cascade_for(Frame frame, float view_depth) {
     uint c = 0u;
     if (view_depth > frame.cascade_splits.x) c = 1u;

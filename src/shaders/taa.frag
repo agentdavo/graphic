@@ -1,4 +1,16 @@
 #version 450
+// taa.frag -- reprojected temporal accumulation. There is no motion vector
+// target: the world position is reconstructed from the depth the input carries
+// in its alpha and re-projected through Outdoor.previous_vp, which costs one
+// matrix instead of an attachment, at the price of being wrong for anything
+// that moved under its own power. Every early return leaves o_color at the
+// current frame, so failing to find history degrades to no TAA rather than to
+// a smear.
+//
+// That alpha channel is (1 - ndc.z) * 1000, a depth key written by the passes
+// upstream (see water.frag), and it is also what the history rejection below
+// compares against. Colour and depth share one attachment because the outdoor
+// path has no spare target for the key.
 #include "common.glsl"
 layout(location=0) in vec2 v_uv;
 layout(location=0) out vec4 o_color;

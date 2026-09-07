@@ -1,4 +1,14 @@
 #version 450
+// water.frag -- a full-screen pass, not a water mesh. There is no water
+// geometry anywhere: this ray-marches nothing either, it intersects the view
+// ray with one horizontal plane at Outdoor.height.z analytically, so the
+// surface is exact at any distance and costs the same everywhere. The scene
+// already rendered into Outdoor.targets.x, and this pass reads that plus the
+// depth target to get thickness, refraction and the shoreline.
+//
+// Every early return writes the untouched background, so a pixel where the
+// plane is behind the camera, outside the terrain map or behind existing
+// geometry simply shows the scene.
 #include "common.glsl"
 #include "lib/outdoor.glsl"
 layout(location=0) in vec2 v_uv;

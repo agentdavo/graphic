@@ -5,7 +5,10 @@
 // is inhibited by its strength; the cvars set the strengths, so switching a
 // stage off changes no code path. push.param is the HDR texture slot,
 // push.param2 the tonemap curve, push.param3 the shadow atlas slot for the
-// atlas debug view.
+// atlas debug view. push.aux is the exception to Push's own rules: it is an
+// ADDR everywhere else, but here it carries the bloom texture index plus one,
+// so that zero still means "no bloom" -- an unusual overload, kept because the
+// alternative was another U32 and Push's offsets are asserted on the C side.
 #include "common.glsl"
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;

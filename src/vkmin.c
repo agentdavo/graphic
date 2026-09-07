@@ -118,7 +118,9 @@ typedef struct {
 typedef struct {
     uint16_t gen;
     bool used;
-    bool external;       /* swapchain image: not ours to destroy */
+    bool external;       /* the backbuffer slot: its VkImage and view are the offscreen target,
+                          * created and destroyed by create_offscreen and shutdown, not by this
+                          * slot. No swapchain image ever occupies a slot. */
     VkImage img;
     VkDeviceSize allocation_offset, allocation_size;
     VkImageView view;
@@ -164,7 +166,12 @@ typedef struct {
 } arena;
 
 /* The features that decide the path, plus the two that only affect debug
- * builds. Filled once; read at init and at the three seams. */
+ * builds. Filled once; read at init and at the three seams where legacy and
+ * modern actually differ, each marked "Seam N of 3" below: (1) image upload --
+ * a staging copy through the ring, or a host copy straight into the image;
+ * (2) backbuffer readback -- the same choice in reverse; (3) a shader stage --
+ * a transient VkShaderModule, or SPIR-V chained inline via maintenance5.
+ * Everything else in this file is common to both. */
 typedef struct {
     bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
     /* Probed and reported only, never enabled: the measurements behind two
@@ -176,10 +183,19 @@ struct vkmin_ctx {
     vkmin_desc desc;
     plat_window *window;
     cvar_state config, frame_config;
+    /* Replaying a journal older than version 6: reproduce the pure bump
+     * allocator it was recorded under, because it stored raw offsets and ids
+     * that assume exactly that. Arena storage and descriptor slots are never
+     * handed back, and a handle generation wraps at 4095 instead of retiring
+     * the slot -- the opposite of the current policy in both cases. */
     bool legacy_allocation;
     uint32_t journal_version;
     retired_resource retired[VKMIN_MAX_RETIRED];
-    uint32_t retired_count, requested_texture;
+    uint32_t retired_count;
+    /* Replay only: the descriptor slot the journal says the next registration
+     * must land in, biased by one so 0 means "no request". Physical slot reuse
+     * would otherwise depend on allocation order rather than on the recording. */
+    uint32_t requested_texture;
     uint32_t texture_owner[VKMIN_MAX_TEXTURES];
     uint64_t retirement_waits, device_idle_calls, allocation_failures;
     double retirement_wait_ms;
@@ -209,8 +225,13 @@ struct vkmin_ctx {
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd[VKMIN_MAX_FRAMES];
     VkSemaphore acquired[VKMIN_MAX_FRAMES];
-    /* One timeline for every submit, frames and immediate uploads alike:
-     * a submit signals the next value and a wait names the value it needs.
+    /* One timeline semaphore for every submit, frames and immediate uploads
+     * alike. A timeline semaphore is a monotonically increasing 64-bit counter
+     * rather than a binary flag: each submit signals ++timeline_value, and a
+     * wait names the value it needs, so "has this particular work finished" is
+     * an integer comparison against however far the GPU has got. That is what
+     * lets one object serve every frame in flight, every upload and every
+     * retired allocation, with no per-object fence to allocate or reset.
      * slot_value is what the frame last submitted from that slot signals. */
     VkSemaphore timeline;
     uint64_t timeline_value;
@@ -223,7 +244,7 @@ struct vkmin_ctx {
     bool layouts_pending; /* some image slot has layout_pending set */
     bool in_pass;
     bool in_default_pass;
-    uint32_t frame_index;      /* logical frame: what vkmin_frame_index reports */
+    uint32_t frame_index;      /* logical frame: what vkmin_frame.index carries */
     uint32_t frames_rendered;
     uint32_t draws, dispatches; /* this frame's, copied into stats at frame end */
     vkmin_stats stats;
@@ -340,7 +361,12 @@ static uint32_t handle_index(uint32_t id) {
     return (id & ((1u << VKMIN_HANDLE_INDEX_BITS) - 1u)) - 1u;
 }
 static uint16_t handle_gen(uint32_t id) { return (uint16_t)(id >> VKMIN_HANDLE_INDEX_BITS); }
-/* 12 bits of generation; never back to 0, which is what makes 0 invalid. */
+/* Zero is invalid because the index is stored biased by one, not because of the
+ * generation. The generation gets the remaining 12 bits: VKMIN_SLOT_ALLOC
+ * retires a slot for good once its generation passes 4095, rather than wrap it
+ * back onto handles already handed out. Replaying a pre-v6 journal is the one
+ * exception -- see legacy_allocation, where vkmin_free_* wraps to 1 because
+ * those journals recorded handles produced under that policy. */
 static uint16_t gen_next(uint16_t gen) { return (uint16_t)(gen + 1); }
 
 #define VKMIN_SLOT_ALLOC(pool, count, out_index)                                  \
@@ -474,8 +500,15 @@ typedef struct { uint32_t pipe, push_bytes, a, b, cnt; } rec_draw;
 typedef struct { uint32_t pipe, push_bytes, indices, cmds, counts, max_draws, host_count; uint64_t cmd_offset, count_offset, host_cmds; } rec_indirect;
 typedef struct { uint32_t flags, image_count; } rec_barrier;
 
-/* Which 8-byte words of `data` hold an address vkmin issued: an arena buffer
- * address or a ring allocation from this frame. Exact match, not a range. */
+/* Pushed data is opaque bytes to vkmin, but some of those bytes are device
+ * addresses the program got from vkmin_address or vkmin_ring_alloc, and a
+ * replay in another process will not get the same addresses back. So every
+ * 8-byte word is checked against the addresses this run actually issued -- an
+ * exact match against a buffer's base or a ring allocation of this frame, never
+ * a range test, so a coordinate that happens to fall inside the arena is left
+ * alone -- and each hit is journalled as a relocation for vkmin_replay to
+ * rewrite. False negatives are harmless (an unrecognised word was not an
+ * address); a false positive would corrupt the payload, hence the exact match. */
 static int scan_relocs(const vkmin_ctx *c, const void *data, size_t bytes, reloc *out, int cap) {
     int n = 0;
     const uint8_t *p = data;
@@ -512,6 +545,13 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
         encoded = malloc(data_bytes);
         VKMIN_ASSERT(encoded, "journal relocation allocation");
         memcpy(encoded, data, data_bytes);
+        /* v6 and later store a buffer address as identity, not as a number:
+         * the handle in the high 32 bits, a byte offset into that buffer in the
+         * low 32. Only exact base matches are recognised today, so the low half
+         * is always zero on write; relocate() adds it back anyway so an interior
+         * pointer could be recorded later without a format change. Recording the
+         * handle is what lets a journal replay after the allocator has reused
+         * the range for something else. */
         for (int k = 0; k < n; ++k) if (relocs[k].kind == RELOC_BUFFER) {
             uint64_t address; memcpy(&address, encoded + relocs[k].offset, sizeof address);
             for (uint32_t i = 0; i < VKMIN_MAX_BUFFERS; ++i) {
@@ -931,6 +971,12 @@ static void create_device(vkmin_ctx *c) {
         extensions[ext_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
         f12.pNext = &m5;
     }
+    /* Two independent options, one singly linked pNext chain, so the tail has
+     * to be spliced rather than appended: modern gives f12 -> m5 -> hic, and
+     * robustness adds r2 -> pr after whatever the last link is. hic.pNext is
+     * only reachable on the modern path, which is why the else-branch sets
+     * f12.pNext instead. A feature struct left off the chain is silently not
+     * requested, so both branches must be written out. */
     const bool robust = c->debug && c->caps.pipeline_robustness && c->caps.robust_buffer_access2;
     if (robust) {
         f2.features.robustBufferAccess = VK_TRUE; /* robustBufferAccess2 requires the base feature too */
@@ -1026,6 +1072,26 @@ static bool arena_try_alloc(arena *a, VkDeviceSize size, VkDeviceSize alignment,
 }
 
 static void timeline_wait(vkmin_ctx *, uint64_t);
+
+/* ----- retirement: when freed storage becomes reusable ------------------- */
+/* vkmin_free_* invalidates the handle at once, but the GPU may still be reading
+ * the arena range, the VkImage or the VkPipeline from work already submitted.
+ * So a free does not return anything to the arena: it appends a retired_resource
+ * stamped with the timeline value at that moment (retire_resource), and the
+ * storage comes back only once the timeline has passed that value
+ * (collect_retired). Waiting for the whole device is never needed for this.
+ *
+ * Two properties make the bookkeeping cheap. The timeline only counts up and
+ * resources are appended in submit order, so retired[] is sorted by value and
+ * collecting is a prefix scan; and the value stamped is the *last* submit, so a
+ * resource is never released early. When the array or the arena fills,
+ * retirement_wait blocks on retired[0] -- the soonest value that can free
+ * anything. Under sync_naive the wait happens immediately at the free, which is
+ * the reference behaviour to compare the overlapped path against.
+ *
+ * legacy_allocation (replaying a pre-v6 journal) keeps the old policy: storage
+ * is never handed back and the bump cursor only moves forward, because those
+ * journals recorded offsets that assumed exactly that. */
 static void collect_retired(vkmin_ctx *c) {
     uint64_t completed = 0;
     VK_CHECK_CTX(c, vkGetSemaphoreCounterValue(c->dev, c->timeline, &completed));
@@ -1256,6 +1322,17 @@ static void timeline_wait(vkmin_ctx *c, uint64_t value) {
     VK_CHECK_CTX(c, vkWaitSemaphores(c->dev, &wait, UINT64_MAX));
     c->wait_ms_total += wall_ms() - start;
 }
+
+/* The only three places vkmin stops the whole device instead of waiting on a
+ * timeline value: recreating a swapchain, shutting down, and the sync_naive
+ * reference path. Each keeps its own counter so --metrics can show what a
+ * change to the synchronisation strategy actually removed, and no fourth site
+ * can appear without adding one here. */
+static void device_wait_idle(vkmin_ctx *c, uint64_t *reason) {
+    ++c->device_idle_calls;
+    ++*reason;
+    VK_CHECK_CTX(c, vkDeviceWaitIdle(c->dev));
+}
 /* Called only after this slot has completed. Three dense queries avoid the
  * sparse pass-query indices and include frames that are never reused. */
 static void collect_gpu_totals(vkmin_ctx *c, uint32_t slot) {
@@ -1340,7 +1417,7 @@ typedef struct {
 
 /* The one table that says what each use means. Every image barrier in the
  * codebase is derived from two rows of it. */
-static use_info use_lookup(vkmin_use use, VkImageAspectFlags aspect) {
+static use_info use_lookup(vkmin_use use) { // pure
     switch (use) {
     case VKMIN_USE_UNDEFINED:
         return (use_info){VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0};
@@ -1371,7 +1448,6 @@ static use_info use_lookup(vkmin_use use, VkImageAspectFlags aspect) {
     case VKMIN_USE_PRESENT:
         return (use_info){VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
     }
-    (void)aspect;
     VKMIN_FAIL("bad vkmin_use %d", (int)use);
 }
 
@@ -1379,8 +1455,8 @@ static use_info use_lookup(vkmin_use use, VkImageAspectFlags aspect) {
  * move. `discard` keeps the source scope but throws the contents away, which
  * is what every cleared attachment wants. */
 static VkImageMemoryBarrier2 slot_transition(image_slot *s, vkmin_use use, bool discard) {
-    const use_info from = use_lookup(s->use, s->aspect);
-    const use_info to = use_lookup(use, s->aspect);
+    const use_info from = use_lookup(s->use);
+    const use_info to = use_lookup(use);
     const VkImageMemoryBarrier2 b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = from.stage,
@@ -1728,7 +1804,7 @@ static void recreate_swapchain(vkmin_ctx *c) {
         plat_poll();
         plat_framebuffer_size(c->window, &w, &h);
     }
-    do { ++c->device_idle_calls; ++c->device_idle_present; VK_CHECK_CTX(c, vkDeviceWaitIdle(c->dev)); } while (0);
+    device_wait_idle(c, &c->device_idle_present);
     destroy_swapchain(c);
     create_swapchain(c);
     /* The owned backbuffer keeps its size; the blit scales into the new
@@ -2013,8 +2089,10 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     if (!desc->headless) create_swapchain(c);
     create_readback_buffers(c);
 
-    /* Slot 0 is the backbuffer: an external image whose VkImage changes every
-     * frame in windowed mode. Its handle is stable for the life of the context. */
+    /* Slot 0 is the backbuffer, so vkmin_backbuffer() is a handle the program
+     * can hold for the life of the context. It points at the offscreen image in
+     * both modes and on both paths; windowed frames blit that image into the
+     * acquired swapchain image at frame end rather than rendering into it. */
     c->images[VKMIN_BACKBUFFER_SLOT] = (image_slot){
         .gen = 1, .used = true, .external = true, .format = c->backbuffer_format,
         .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .w = c->extent.width, .h = c->extent.height, .mips = 1,
@@ -2032,15 +2110,18 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         .height = default_depth_extent ? default_depth_extent : desc->height,
         .format = VKMIN_FMT_D32_FLOAT, .usage = VKMIN_IMAGE_DEPTH,
         .label = "vkmin.default_depth"});
+    /* The same header for --record and for the stream shared with audio. The
+     * two address bases are what a pre-v6 journal is rebased from on replay;
+     * v6 and later record buffer identity instead but still carry them. */
+    const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height,
+                               c->arena_addr, c->ring_addr};
     if (c->record_path) { /* everything the program does from here is recorded */
         c->rec = fopen(c->record_path, "wb");
         VKMIN_ASSERT(c->rec != NULL, "cannot write journal '%s'", c->record_path);
-        const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
         VKMIN_ASSERT(fwrite(&jh, sizeof jh, 1, c->rec) == 1, "journal write failed");
         fprintf(stderr, "vkmin: recording to %s\n", c->record_path);
     }
     if (c->desc.journal) {
-        const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height, c->arena_addr, c->ring_addr};
         VKMIN_ASSERT(jrnl_write(c->desc.journal,(jrnl_packet){JRNL_VIDEO,0,sizeof jh},&jh),"shared journal header failed");
         c->rec_shared = true;
     }
@@ -2071,7 +2152,7 @@ void vkmin_shutdown(vkmin_ctx *c) {
     for (uint32_t slot = 0; slot < c->frames_in_flight; ++slot) collect_gpu_totals(c, slot);
     fprintf(stderr, "vkmin: GPU totals ms over %u frames: rendering %.3f readback-copy %.3f\n",
         c->gpu_frames_timed, c->gpu_work_ms_total, c->gpu_readback_ms_total);
-    do { ++c->device_idle_calls; ++c->device_idle_shutdown; VK_CHECK_CTX(c, vkDeviceWaitIdle(c->dev)); } while (0);
+    device_wait_idle(c, &c->device_idle_shutdown);
     if (c->metrics_path) {
         FILE *metrics = fopen(c->metrics_path, "w");
         VKMIN_ASSERT(metrics, "cannot write metrics '%s'", c->metrics_path);
@@ -2376,7 +2457,7 @@ static void modern_image_upload(vkmin_ctx *c, image_slot *s, uint32_t mip, uint3
         const VkHostImageLayoutTransitionInfoEXT to_general = {
             .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
             .image = s->img,
-            .oldLayout = use_lookup(s->use, s->aspect).layout,
+            .oldLayout = use_lookup(s->use).layout,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .subresourceRange = {.aspectMask = s->aspect, .levelCount = VK_REMAINING_MIP_LEVELS, .layerCount = 1},
         };
@@ -2810,6 +2891,12 @@ static void hot_reload_check(vkmin_ctx *c) {
 
 /* ---------------------------------------------------------------- frame -- */
 
+/* Restate what slot 0 points at, at the top of every frame. It is the same
+ * owned image every time -- deliberately, because that is what lets the slot's
+ * tracked `use` (TRANSFER_SRC, left there by last frame's readback or present
+ * blit) survive into this frame and order this frame's first write after that
+ * read. The one place to change if a swapchain image were ever bound directly.
+ * `use` is not touched here: resetting it would drop that ordering. */
 static void backbuffer_bind(vkmin_ctx *c, VkImage img, VkImageView view) {
     image_slot *bb = &c->images[VKMIN_BACKBUFFER_SLOT];
     bb->img = img;
@@ -2817,9 +2904,6 @@ static void backbuffer_bind(vkmin_ctx *c, VkImage img, VkImageView view) {
     bb->w = c->extent.width;
     bb->h = c->extent.height;
     bb->format = c->backbuffer_format;
-    /* The same owned image every frame, so its tracked use (TRANSFER_SRC from
-     * last frame's readback or blit) stays valid and orders this frame's first
-     * write after that read. */
 }
 
 /* The one point a frame reads the outside world: the window, the demo file,
@@ -3162,6 +3246,9 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
 
     const image_slot *any = color ? color : depth;
     VKMIN_ASSERT(any != NULL, "pass with no attachments");
+    /* One field gates both, as vkmin_pass_desc says: w == 0 means the whole
+     * attachment, and h is then not consulted at all. Testing desc->h here
+     * instead would silently accept a half-specified area. */
     const int w = desc->w > 0 ? desc->w : (int)any->w;
     const int h = desc->w > 0 ? desc->h : (int)any->h;
     VkRenderingAttachmentInfo color_att[3];
@@ -3226,15 +3313,17 @@ void vkmin_set_depth_bias(vkmin_ctx *c, float constant, float slope) {
     vkCmdSetDepthBias(c->cmd[c->slot], constant, 0.0f, slope);
 }
 
-/* Every draw and dispatch goes through here: the pipeline and the push block
- * are parameters of the call, never state left behind for the next one. */
-/* The pipeline knows its push size; the draw only supplies the bytes. */
+/* The pipeline knows its push size; the draw only supplies the bytes. Journal
+ * records need it before bind_and_push runs, hence the separate lookup. */
 static uint32_t pipe_push_size(vkmin_ctx *c, vkmin_pipeline p) {
     const pipe_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->pipes, VKMIN_MAX_PIPES, p.id, s);
     return s->push_size;
 }
 
+/* Every draw and dispatch goes through here: the pipeline and the push block
+ * are parameters of the call, never state left behind for the next one, so no
+ * draw can inherit half of another draw's setup. */
 static void bind_and_push(vkmin_ctx *c, vkmin_pipeline p, VkPipelineBindPoint want, const void *push) {
     VKMIN_ASSERT(c && c->in_frame, "draw or dispatch outside a frame");
     const pipe_slot *s = NULL;
@@ -3498,7 +3587,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
     VkCommandBuffer cmd = c->cmd[c->slot];
     image_slot *bb = &c->images[VKMIN_BACKBUFFER_SLOT];
 
-    /* Seam 1 of 3: the legacy path records its per-frame readback copy here;
+    /* Seam 2 of 3: the legacy path records its per-frame readback copy here;
      * the modern path records nothing and reads the image from the host. */
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->diagnostic_pool, c->slot * 3 + 1);
     if (c->path == VKMIN_PATH_LEGACY && !c->desc.no_readback) legacy_record_readback(c, cmd, bb);
@@ -3554,7 +3643,7 @@ void vkmin_frame_end(vkmin_ctx *c) {
     }
     if (c->desc.sync_naive) {
         const double wait_start = wall_ms();
-        do { ++c->device_idle_calls; ++c->device_idle_reference; VK_CHECK_CTX(c, vkDeviceWaitIdle(c->dev)); } while (0);
+        device_wait_idle(c, &c->device_idle_reference);
         c->wait_ms_total += wall_ms() - wait_start;
     }
     c->slot = (c->slot + 1u) % c->frames_in_flight;
@@ -3619,6 +3708,13 @@ void vkmin_wait(vkmin_ctx *c) {
     collect_retired(c);
 }
 
+/* The read side of scan_relocs: turn the recorded form of each address back
+ * into an address of this run. v6 records buffer identity (handle + offset) and
+ * so must resolve the handle, which is also a check that the replay is holding
+ * the buffer the recording had. v3-v5 recorded raw addresses and are rebased
+ * off the header's arena_base/ring_base, which is why the two kinds are
+ * mutually exclusive by version. Returning false rejects the file; a journal is
+ * untrusted input, so nothing here may abort. */
 static bool relocate(const vkmin_ctx *c, uint8_t *data, size_t bytes, const reloc *relocs, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) {
         const size_t offset = relocs[i].offset;
@@ -3952,7 +4048,7 @@ bool vkmin_save_png(vkmin_ctx *c, const char *path) {
     unsigned char *rgba = malloc(bytes);
     VKMIN_ASSERT(rgba != NULL, "out of memory writing '%s'", path);
     const double read_start = wall_ms(), wait_start = c->wait_ms_total;
-    /* Seam 1 of 3, read side. */
+    /* Seam 2 of 3, read side. */
     if (c->path == VKMIN_PATH_LEGACY) legacy_read_backbuffer(c, rgba, bytes);
     else modern_read_backbuffer(c, rgba, bytes);
     for (size_t i = 3; i < bytes; i += 4) rgba[i] = 255; /* the PNG is opaque by definition */

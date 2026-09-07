@@ -1,6 +1,20 @@
-// outdoor.glsl -- shared weather. No wall clock, mutable random stream or
-// texture sky. Single-scattering approximation using optical air mass,
-// Rayleigh phase and Henyey-Greenstein Mie phase; metres, Y up.
+// lib/outdoor.glsl -- shared weather: sky, aerial perspective, wind, terrain
+// sampling, cloud and grass fade. Single-scattering approximation using
+// optical air mass, Rayleigh phase and Henyey-Greenstein Mie phase; metres,
+// Y up.
+//
+// Everything here is a pure function of position and frame.frame_index. There
+// is no wall clock, no mutable random stream and no sky texture, because the
+// depth prepass, the shadow views, the colour pass and the replay path all
+// evaluate these independently and must agree to the bit -- a grass blade that
+// bends differently in the prepass than in the colour pass self-occludes.
+// That is also why the noise here is hashed from world position rather than
+// carried in a buffer.
+//
+// This is the one lib/ file included from outside the forward path
+// (scene_vertex.glsl, depth.frag, quad.glsl, sky.frag, water.frag,
+// scatter.comp all take it directly), which is why it alone carries an
+// include guard -- vkmin_lib.glsl would otherwise pull it in twice.
 #ifndef VKMIN_OUTDOOR_GLSL
 #define VKMIN_OUTDOOR_GLSL
 uint outdoor_hash(uvec2 cell, uint seed) {

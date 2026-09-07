@@ -2,6 +2,16 @@
  * to bottom in the order the GPU executes it. Everything above it exists to
  * make that function readable: target creation, the shadow view builder, the
  * transparent sort, and the text layout for the overlay.
+ *
+ * vkr_frame is long on purpose. The eight stages are numbered banners inside
+ * it, matching render.h's list; splitting them into helpers would hide the
+ * one thing a reader has to be able to see, which is the order the barriers
+ * fall in relative to the passes they separate. Read it top to bottom.
+ *
+ * Two things are recorded but not executed here, and both are read a frame or
+ * two later: the indirect draw counts (copied to the ring, consumed when this
+ * slot comes round again) and, under d_check_cull, the GPU draw list. That is
+ * why so much of the top of vkr_frame is about the *previous* use of `slot`.
  */
 #include "render.h"
 _Static_assert(sizeof(Push) <= VKMIN_PUSH_BYTES, "renderer Push must fit");
@@ -28,7 +38,16 @@ enum {
     VKR_MAX_QUADS = 16384,      /* per frame, the game's plus the overlay's */
     VKR_MAX_TRANSPARENT = 512,
     VKR_MAX_SHADOW_LIGHTS = 16,
-    VKR_LOCAL_TILES = 48,   /* three quadrants of 16 tiles each */
+    /* The atlas is an 8x8 grid of tiles. Quadrant 0 (its top-left 4x4) is the
+     * sun's four cascades, at atlas/4 each; the other three quadrants are 16
+     * atlas/8 tiles apiece for local lights, hence 48. Change one of these and
+     * the tile arithmetic in build_views has to change with it. */
+    VKR_LOCAL_TILES = 48,
+    /* Timestamp 0..8 bracket the eight stages, so pass_ms[i] is
+     * gpu_ms[i+1]-gpu_ms[i] and frame_ms is gpu_ms[8]-gpu_ms[0]. The outdoor
+     * path adds five independent pairs at 9..18 -- (9,10) scatter, (11,12)
+     * grass, (13,14) sky, (15,16) water, (17,18) TAA -- which is why they are
+     * not emitted in numeric order: sky runs before grass. */
     VKR_TIMESTAMPS = 9,
     VKR_FRAMES = 2
 };
@@ -206,10 +225,13 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->draw_counts = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), .label = "vkr.draw_counts"});
     r->cluster_lights = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = (size_t)VKMIN_CLUSTER_COUNT * VKMIN_CLUSTER_STRIDE * sizeof(uint32_t), .label = "vkr.cluster_lights"});
 
-    /* Ten pipelines for the whole engine, all created here, all against the
-     * one layout. The forward shader is the game's choice: a canonical one
-     * or its own composed from shaders/lib. */
+    /* Ten pipelines for the indoor path, six more below when desc->outdoor is
+     * set; all created here, all against the one layout, so nothing is built
+     * mid-frame. The forward shader is the game's choice: a canonical one or
+     * its own composed from shaders/lib. */
     const vkmin_bytes fs = desc->fs.data ? desc->fs : VKMIN_BYTES(lit_pbr_frag_spv);
+    /* Hot reload watches a path, so a caller that supplied its own SPIR-V blob
+     * and no path gets none: there is no file to re-read. */
     const char *fs_path = desc->fs_path ? desc->fs_path : desc->fs.data ? NULL : "build/lit_pbr.frag.spv";
     const uint32_t push = sizeof(Push); /* every renderer pipeline pushes the one Push block */
     r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cull_comp_spv), .push_size = push, .label = "vkr.cull"});
@@ -287,6 +309,10 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
             .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
             .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_NONE, .label = "outside.impostors.batcher"});
     }
+    /* d_check_cull runs cpu_cull twice into this, once per list, and each pass
+     * can emit up to max_instances commands. The +2 is not slack for the cull:
+     * it keeps the request non-zero when max_instances is 0, because calloc(0)
+     * may legally return NULL and trip the assert below. */
     for (int i = 0; i < VKR_FRAMES; ++i) {
         r->check_cpu[i] = calloc(2u * desc->max_instances + 2u, sizeof(DrawCmd));
         VKR_ASSERT(r->check_cpu[i] != NULL, "out of memory");
@@ -558,7 +584,19 @@ static view_set build_views(const vkr *r, const vkr_frame_desc *f, const setting
 /* -------------------------------------------------------- CPU reference --- */
 
 /* The reference cull: same test as cull.comp, on the CPU, in instance order.
- * Slow and obviously right; flip r_gpu_cull to compare. */
+ * Slow and obviously right; flip r_gpu_cull to compare, or leave r_gpu_cull on
+ * and set d_check_cull to have both run and be diffed.
+ *
+ * One rule in cull.comp is deliberately absent here: the shader also drops a
+ * VKMIN_INST_TREE instance from view 0 once its impostor has taken over. Only
+ * scatter sets that flag, and vkr_frame asserts scatter_count == 0 whenever
+ * d_check_cull is on, so the two cannot both be live. A caller that sets
+ * VKMIN_INST_TREE by hand would see the difference reported as a mismatch --
+ * which is the check working, not the check being wrong.
+ *
+ * `list` selects one of the two per-view lists, matching cull.comp: 0 is
+ * back-face culled, 1 is double-sided. Blended materials belong to neither;
+ * they are sorted separately by sort_transparents. */
 static uint32_t cpu_cull(const View *v, const Instance *inst, uint32_t n, const Material *mats,
                          DrawCmd *out, const Mesh *meshes, uint32_t list) {
     uint32_t count = 0;
@@ -680,6 +718,15 @@ vkr_stats vkr_finish(vkr *r) {
 
 /* ---------------------------------------------------------------- frame --- */
 
+/* Issues one view's two draw lists, back-face-culled then double-sided, with
+ * the pipeline each needs. The two cull paths differ only in where the command
+ * records live -- device memory the GPU wrote, or ring memory cpu_cull wrote
+ * this frame -- so the choice is a field on the indirect desc, not a branch
+ * around the draw. Both lists are issued unconditionally, including when the
+ * cull leaves one empty, so the recorded command stream is a function of the
+ * frame's inputs alone and not of what the cull happened to decide -- which is
+ * what lets a journal replay produce the same submission. A zero-count
+ * indirect draw is the cheap half of that bargain. */
 static void draw_lists(vkr *r, uint32_t view, vkmin_pipeline culled, vkmin_pipeline double_sided, const Push *base,
                        bool gpu_cull, const uint64_t *host_cmds, const uint32_t *host_counts) {
     Push push = *base;
@@ -751,14 +798,46 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     }
     if (!s.freeze) r->frozen = false;
 
+    /* The render size, and the one invariant the whole post chain rests on.
+     *
+     * f->frame.width/height is vkmin's own render size, which is pinned to
+     * vkmin_desc.width/height for the life of the context: resizing the window
+     * rebuilds the swapchain and blits into it, leaving c->extent alone. So
+     * this clamp only bites when vkr_desc is *smaller* than vkmin_desc -- the
+     * renderer's targets, made once at vkr_desc's size, are then the limit.
+     *
+     * When it does bite, the colour, depth, id and normal targets are only
+     * written over their top-left rw x rh, and every pass that draws into them
+     * is given .w/.h so it stops there. Nothing rescales the leftover margin;
+     * instead rw/rh go into Frame.screen, and a shader sampling those targets
+     * has to build uv as `v_uv * frame.screen.xy / textureSize(...)` so that it
+     * reads exactly the written sub-rect. tonemap.frag does this, which is what
+     * makes the indoor path correct at any rw <= desc.width.
+     *
+     * The outdoor shaders do not: water.frag and taa.frag sample depth and hdr
+     * at raw v_uv, and the bloom pass blurs the whole source target rather than
+     * the rendered part of it. So a caller using vkr_desc.outdoor must size
+     * vkr_desc to vkmin_desc and keep this clamp inert; below that it would
+     * pull in a margin that was never rendered this frame. Fixing that means
+     * scaling uv in three shaders and scissoring the bloom pass, which is why
+     * it is written down here rather than half-done. */
     const int win_w = f->frame.width, win_h = f->frame.height;
-    /* Targets are made once at the maximum size; a larger window renders at
-     * the maximum and is upscaled by the tonemap pass. */
     const int rw = win_w < r->desc.width ? win_w : r->desc.width;
     const int rh = win_h < r->desc.height ? win_h : r->desc.height;
 
     const uint32_t slot = f->frame.slot;
     VKR_ASSERT(slot < VKR_FRAMES, "vkr_frame: frame slot %u", slot);
+
+    /* Everything until the "per-frame data" banner harvests the *previous*
+     * frame that used this slot. Its fence has been waited by frame_begin, so
+     * its timestamps have landed and its ring block is safe to read. Nothing
+     * below is about the frame being recorded now, and every count reported by
+     * vkr_get_stats is therefore one frame late by construction.
+     *
+     * The bounds are the timestamp map from the enum at the top: 9 for the
+     * eight stages, and 19 (9 + five outdoor pairs) before outside_ms means
+     * anything. A short query pool leaves the older values in place rather
+     * than reporting a difference of garbage. */
     for (int i = 0; i + 1 < gs.timestamps && i < 8; ++i) r->stats.pass_ms[i] = gs.gpu_ms[i + 1] - gs.gpu_ms[i];
     if (outside && gs.timestamps >= 19) for (int k = 0; k < 5; ++k) r->stats.outside_ms[k] = gs.gpu_ms[10+k*2]-gs.gpu_ms[9+k*2];
     if (gs.timestamps >= VKR_TIMESTAMPS) r->stats.frame_ms = gs.gpu_ms[VKR_TIMESTAMPS - 1] - gs.gpu_ms[0];
@@ -821,6 +900,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     Quad *quads = vkmin_ring_alloc(gpu, VKR_MAX_QUADS * sizeof(Quad), &quads_addr);
     uint32_t world_quads = 0, screen_quads = 0;
     {
+        /* Over the cap the tail is dropped rather than the frame refused: the
+         * quad list is presentation, and a game emitting particles should not
+         * abort on a busy frame. The overlay then gets whatever room is left,
+         * which may be none -- vkr_text with cap 0 writes nothing. */
         const uint32_t user = s.quads && f->quad_count < VKR_MAX_QUADS ? f->quad_count : (s.quads ? VKR_MAX_QUADS : 0u);
         for (uint32_t i = 0; i < user; ++i) {
             if (!(f->quads[i].flags & VKMIN_QUAD_SCREEN)) quads[world_quads++] = f->quads[i];
@@ -906,7 +989,17 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         transparent_count = sort_transparents(f, r->host_materials, r->host_meshes, cmds);
     }
     /* The cull check: the CPU list for the camera view now, the GPU list read
-     * back when this slot comes round again. */
+     * back when this slot comes round again.
+     *
+     * Camera view only, and that is a real gap in the coverage: the shadow
+     * views run the identical cull.comp against different planes, and nothing
+     * here verifies any of them. Widening it is not a
+     * one-line change -- check_cpu is sized for one view's two lists, the
+     * copy_to_ring above moves exactly view 0's slice, and covering all of
+     * vs.count views would multiply both by up to VKMIN_MAX_VIEWS of ring
+     * traffic every frame. Note that cpu_cull is already correct for v > 0:
+     * the one rule it does not model, the tree-impostor drop, is guarded by
+     * `v == 0u` in the shader. */
     uint64_t check_addr = 0;
     if (s.check_cull && s.gpu_cull) {
         DrawCmd *cpu = r->check_cpu[slot];
@@ -924,6 +1017,15 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
 
     /* --- 1. cull ---------------------------------------------------------- */
     vkmin_timestamp(gpu, 0);
+    /* Write-after-read against the frame before this one. draw_counts and
+     * draw_cmds are single buffers reused every frame, not per-slot, so the
+     * fill and the cull dispatch below are about to overwrite bytes the
+     * previous frame's indirect draws and its count copy-to-ring may still be
+     * reading -- the two commands are in different submissions but nothing
+     * orders them. Synchronization validation found both of those races here;
+     * they are invisible to any single-frame test, because the first frame has
+     * no predecessor to race. Execution dependency only: no data is being
+     * handed over, so there is no source access mask (see vkmin_barrier). */
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.frame_start = true});
     if (outside) {
         vkmin_timestamp(gpu,9);
@@ -938,10 +1040,18 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
             if (cells) vkmin_dispatch(gpu,r->scatter,&push,(cells+63u)/64u,1,1);
             if (scatter[k].foliage.w) quad_base += cells;
         }
+        /* scatter.comp wrote outside_instances and outside_quads; cull.comp
+         * below reads them as its instance array. Same queue, same stage, but
+         * two dispatches are not ordered against each other by default. */
         vkmin_barrier(gpu,&(vkmin_barrier_desc){.compute_to_compute = true});
         vkmin_timestamp(gpu,10);
     }
+    /* Seed the per-view counts for the mode the cull is about to run in:
+     * compact appends with atomicAdd from 0, stable writes instance i into
+     * slot i and needs the count to already be the full instance count. */
     vkmin_fill_buffer(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), s.compact ? 0u : total_instances);
+    /* The fill is a transfer write; cull.comp reads and atomically updates the
+     * same bytes. Without this the atomics can run against the pre-fill value. */
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.transfer_to_compute = true});
     if (s.gpu_cull && total_instances) {
         Push push = base_push;
@@ -949,7 +1059,20 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         vkmin_dispatch(gpu, r->cull, &push, (total_instances + VKMIN_CULL_GROUP - 1) / VKMIN_CULL_GROUP, vs.count, 1);
     }
     vkmin_timestamp(gpu, 1);
+    /* The cull's output leaves the compute stage two ways at once, so one
+     * barrier covers both: as indirect arguments for every draw_lists() call
+     * from here to the end of the forward pass (compute_to_indirect_draw), and
+     * as the source of the two copies immediately below (compute_to_transfer).
+     * Dropping either half leaves a hazard that only shows up on a driver that
+     * actually overlaps the stages. */
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.compute_to_indirect_draw = true, .compute_to_transfer = true});
+    /* Readback for stats and, under d_check_cull, for the draw-list diff. The
+     * destination is this frame's own ring block and is not read until the
+     * slot comes round again, by which time its fence has been waited -- the
+     * ring is where a readback can quietly collide with itself a couple of
+     * frames apart, which is one of the hazards synchronization validation
+     * caught. The cmds copy is view 0 only: offset 0, length 2 * max_instances
+     * is exactly the camera view's two lists. See the d_check_cull note below. */
     vkmin_copy_to_ring(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), counts_addr);
     if (check_addr) vkmin_copy_to_ring(gpu, r->draw_cmds, 0, 2u * r->desc.max_instances * sizeof(DrawCmd), check_addr);
 
@@ -978,12 +1101,21 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     /* --- 4. light clusters ------------------------------------------------ */
     vkmin_dispatch(gpu, r->cluster, &base_push, (VKMIN_CLUSTER_COUNT + VKMIN_CLUSTER_GROUP - 1) / VKMIN_CLUSTER_GROUP, 1, 1);
     vkmin_timestamp(gpu, 4);
+    /* One barrier, two jobs, both consumed by the forward pass that follows:
+     * the atlas moves from depth attachment (stage 2 wrote it) to sampled, and
+     * compute_to_fragment publishes the cluster_lights the dispatch just wrote
+     * to the fragment shader that reads them. Batching them is not tidiness --
+     * they are the same dependency, at the same point, into the same pass. */
     const vkmin_transition to_sampled_atlas[] = {{r->atlas, VKMIN_USE_SAMPLED}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_sampled_atlas, .image_count = 1, .compute_to_fragment = true});
 
     /* --- 5. forward opaque, 6. forward transparent and world quads --------- */
-    /* The clear is the sky: there is no skybox, and Sponza's courtyard is open.
-     * The id and normal targets clear to zero with it. */
+    /* Indoors the clear colour *is* the sky: there is no skybox pass, so
+     * anything the geometry does not cover stays this blue. Outdoors the sky
+     * pass below paints over all of it, and the clear only still matters for
+     * the id and normal attachments, which clear to zero alongside it -- id 0
+     * meaning "nothing pickable here", normal 0 meaning "no surface", which is
+     * what the outline test in tonemap.frag checks for with step(0.01, len). */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = r->hdr, .extra = {r->id, r->normal}, .depth = r->depth, .clear_color = true,
                                              .clear = {0.30f * 2.5f, 0.50f * 2.5f, 0.95f * 2.5f, 1.0f}, .w = rw, .h = rh, .label = "forward"});
     if (outside) {
@@ -1020,7 +1152,13 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     vkmin_timestamp(gpu, 6);
 
     /* --- 7. post: outline, tonemap, LUT; 8. screen quads ------------------ */
-    /* The id target is left in TRANSFER_SRC for vkmin_pick between frames. */
+    /* Everything the forward pass wrote as an attachment becomes readable.
+     * hdr, normal and depth are sampled by tonemap.frag (colour, and the two
+     * inputs the outline edge test needs); id goes to TRANSFER_SRC instead,
+     * because nothing samples it -- it is left in that layout deliberately so
+     * vkmin_pick can copy from it *between* frames, outside any pass, without
+     * a layout change of its own. The layouts carry the ordering here, so no
+     * stage flags are needed on top. */
     const vkmin_transition to_post[] = {{r->hdr, VKMIN_USE_SAMPLED}, {r->normal, VKMIN_USE_SAMPLED},
                                         {r->depth, VKMIN_USE_SAMPLED}, {r->id, VKMIN_USE_TRANSFER_SRC}};
     vkmin_barrier(gpu, &(vkmin_barrier_desc){.images = to_post, .image_count = 4});

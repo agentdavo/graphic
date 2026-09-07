@@ -1,4 +1,24 @@
 #version 450
+// scatter.comp -- builds the outdoor instance buffer on the GPU. Grass, trees
+// and their impostor quads are never uploaded: a thread per grid cell hashes a
+// stable key from the cell's world coordinates, decides existence, size and
+// rotation from that hash alone, and writes an Instance the cull pass then
+// sees like any other. Nothing persists between frames, so the scatter cannot
+// pop as the camera moves and nothing has to be evicted.
+//
+// One pipeline, two modes on push.view, because the caller-supplied instances
+// and the generated ones have to land in one buffer for cull.comp to walk:
+//
+//   push.view == VKMIN_NONE  copy mode. Copies push.param3 Instances from
+//                            push.aux into the frame's instance buffer.
+//                            Dispatched once, before the layers.
+//   push.view == k           layer k of push.aux's Scatter array. Writes into
+//                            the instance buffer at s.grid.w, and any impostor
+//                            Quads at push.param.
+//
+// The hash key is the world cell, not the invocation index, so a cell keeps
+// the same blade or tree as the grid slides under the camera; keying it off k
+// would reshuffle the whole field every time the origin moved.
 #include "common.glsl"
 #include "lib/outdoor.glsl"
 layout(local_size_x=64) in;

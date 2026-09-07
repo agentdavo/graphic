@@ -1,6 +1,8 @@
-/* render_format.h -- the cooked scene file. Written by tools/cook.c from glTF,
- * read by src/scene.c at runtime. Everything is fixed-size records laid out
- * in the order below, so loading is one read and a handful of pointer
+/* render_format.h -- the cooked scene file. Written from glTF by the cooker
+ * (tools/cook.c, not currently in the tree; VKM_VERSION is the handshake with
+ * whatever writes it), read by src/render_scene.c at runtime, which is the one
+ * reader that has to agree with this. Everything is fixed-size records laid
+ * out in the order below, so loading is one read and a handful of pointer
  * arithmetic; there is no JSON and no string parsing at runtime.
  *
  *   vkm_header

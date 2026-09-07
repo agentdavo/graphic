@@ -1,7 +1,13 @@
-// quad.frag -- textured, tinted, premultiplied. With VKMIN_QUAD_SDF the red
-// channel is a distance field: 128 is the edge, so text stays crisp at any
-// size; the softness is in texels of the atlas, converted through the
-// screen-space derivative so it is one pixel wide however the quad is scaled.
+// quad.glsl -- the quad fragment body, textured, tinted, premultiplied. Two
+// modules include it: quad.frag for world quads and quad_screen.frag, which
+// defines VKMIN_SCREEN_OUTPUT first because the post-tonemap pass it belongs
+// to has only a colour attachment. One body, two entry points, so a change to
+// SDF text cannot apply to one and not the other.
+//
+// With VKMIN_QUAD_SDF the red channel is a distance field with the edge at
+// 0.5, so text stays crisp at any size; the softness is in texels of the
+// atlas, converted through the screen-space derivative so the transition is
+// one pixel wide however the quad is scaled.
 #include "common.glsl"
 #include "lib/outdoor.glsl"
 layout(location = 0) in vec2 v_uv;

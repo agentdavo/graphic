@@ -1,5 +1,8 @@
-/* render_pack.h -- vertex attribute packing, the mirror of the decode helpers in
- * shaders/common.glsl. Used by the cooker and by the demo's generated meshes. */
+/* render_pack.h -- vertex attribute packing, the mirror of the decode helpers
+ * in shaders/common.glsl. Every encoder here must stay the exact inverse of
+ * its GLSL counterpart: a mismatch does not fail to build, it tilts normals.
+ * Used by render_geometry.c, by the cooker, and by callers generating meshes
+ * at runtime. */
 #ifndef VKMIN_PACK_H
 #define VKMIN_PACK_H
 
