@@ -30,12 +30,37 @@ jobs:
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
+      # The one agreement check the tree can still make: a frame rendered
+      # directly, and the same frame replayed from its journal by a different
+      # program on the other code path. Byte equality or nothing.
+      - name: Record on the modern path, replay on the legacy one
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          ./build/omega --headless --size 320 180 --frame 300 --out direct.png --record f300.vkj
+          ./build/replay --replay f300.vkj --frame 300 --path=legacy --out replayed.png
+          cmp direct.png replayed.png
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: frame300
           path: frame300.png
           if-no-files-found: warn
+
+  # Packager and viewer decoder: no GPU, no browser, but Node for the shared
+  # JavaScript the viewer and the tests both use.
+  inspector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m unittest discover -s tools -p test_inspector.py -v
 
   # The other three backends are parallel implementations; they earn their keep
   # only if they keep compiling.

@@ -303,6 +303,15 @@ else()
     set(OMEGA_AUDIO sndmin_miniaudio)
 endif()
 
+# ----------------------------------------------------------------- replay ---
+# A journal replays into a different code path than the one that recorded it,
+# but a replaying context is driven by vkmin_replay rather than the host's own
+# loop -- so this is a separate program, not a flag on the demo. It needs only
+# vkmin.h: the journal carries the resources, the shaders and the assets.
+add_executable(replay tools/replay.c)
+target_link_libraries(replay PRIVATE vkmin_flags vkmin)
+
+# ------------------------------------------------------------------ omega ---
 add_executable(omega omega/omega.c)
 target_include_directories(omega PRIVATE omega "${VKMIN_GENERATED_DIR}")
 target_compile_options(omega PRIVATE ${VKMIN_FP_EXACT})

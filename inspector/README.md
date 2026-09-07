@@ -1,15 +1,17 @@
 # vkmin Inspector
 
-Offline capture workbench. Open `inspector/index.html` in a browser.
+Offline capture workbench. Open `inspector/index.html` in a browser, or build
+the same viewer as a single file with no external references:
+
+```sh
+python tools/build_inspector.py --viewer-only --out vkmin-inspector.html
+```
+
 **Open capture A** selects a directory containing `capture.json`, `events.tsv`,
 and checkpoint folders.
 
-> The tooling that produced those capture directories — `inspect_frame.py`,
-> `build_inspector.py` and the replay driver they invoked — lived in `tools/`
-> and `examples/` and is not currently in the tree. vkmin still writes the raw
-> halves itself (`--events FILE` and `--inspect-dir DIR`, both from the replay
-> path); what is missing is the step that packages them into a capture this
-> viewer can open. The rest of this file describes the viewer as built.
+Build a capture with `tools/inspect_frame.py`, which drives `build/replay`
+once per checkpoint; see [Determinism](../README.md#determinism).
 The directory picker requires a browser supporting `webkitdirectory`.
 No server, network requests, dependencies or native application connection are
 needed to use the viewer. The capture directory is read only.
@@ -82,15 +84,14 @@ pipeline IDs. Each value is an array of fields:
 
 Supported types are `u32`, `i32`, `f32`, `u64`, `f64`, with optional `count`.
 Offsets and lengths are checked against the actual push block. The supplied
-consumer schema matches `tests/package_gpu/consumer.c`; it is not an Omega
-schema. Raw push bytes do not describe their own types. GPU addresses are
+consumer schema matched a package-consumer test no longer in the tree; it is
+not an Omega schema. Raw push bytes do not describe their own types. GPU addresses are
 process-specific and referenced ring/buffer contents are not decoded here.
 
 ## Verification
 
 ```powershell
-python tools/test_inspector.py
-python -m unittest discover -s tools -p test_inspection.py
+python -m unittest discover -s tools -p test_inspector.py
 ```
 
 The new tests require Node for the shared decoder and application-state tests;
