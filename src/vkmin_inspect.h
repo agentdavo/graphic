@@ -12,11 +12,19 @@ static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
 #undef VKMIN_OP_NAME
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT, "one name per opcode");
+    /* rh comes from a journal, which is untrusted input. The replay loop
+     * rejects an out-of-range opcode before it reaches us, but that check is
+     * three hundred lines away behind a macro and -fanalyzer cannot see it, so
+     * at -O0 it reports an attacker-controlled array index here and the build
+     * fails. Bound it locally: the lookup is then correct on its own terms
+     * whoever calls it, which is cheaper than teaching every reader that the
+     * safety lives somewhere else. */
+    const uint32_t op = rh->op < (uint32_t)OP_COUNT ? rh->op : (uint32_t)OP_INVALID;
     uint32_t frame = c->frame_index;
     if (rh->op == OP_FRAME_BEGIN && rh->hdr_bytes == sizeof(rec_frame)) {
         rec_frame r; memcpy(&r, hdr, sizeof r); frame = r.frame_index;
     }
-    fprintf(out, "%u\t%u\t%s\t", event, frame, names[rh->op]);
+    fprintf(out, "%u\t%u\t%s\t", event, frame, names[op]);
     if (rh->op == OP_PASS_BEGIN && rh->hdr_bytes >= sizeof(rec_pass)) {
         rec_pass r; memcpy(&r, hdr, sizeof r);
         fprintf(out, "color=%u depth=%u extra=%u,%u area=%d,%d,%d,%d", r.color, r.depth,

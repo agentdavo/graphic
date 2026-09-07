@@ -326,6 +326,17 @@ loader and `glslangValidator`.
   `-fanalyzer`, and no `cppcheck` or lavapipe in the tree. Section 4 describes
   the regime this project is meant to run under, not what a checkout currently
   enforces.
+- Validation follows `NDEBUG`, and every CMake build type except `Debug`
+  defines it. So `-DCMAKE_BUILD_TYPE=Debug` is the only way to get the
+  validation section 7 relies on, and it is worth building periodically for a
+  second reason: `-fanalyzer` at `-O0` sees paths it cannot see at `-O2`. It
+  found a real one -- a journal-supplied opcode indexing an array with the
+  bounds check three hundred lines away behind a macro. Treat the two build
+  types as two analysers, in the spirit of section 4.
+- Only `--exit-after N` ends a windowed run on its own, which is what makes
+  the swapchain create/destroy path testable under validation without a human
+  at the keyboard. Resize is still manual: nothing in the tree can drag a
+  window.
 
 ---
 

@@ -53,10 +53,36 @@ uint cube_face(vec3 d) {
 }
 
 // Lit fraction from the sun at P, or 1.0 when shadows are off or unassigned.
-float sun_shadow(Frame frame, Light sun, vec3 P, vec3 N, vec3 L, uint cascade) {
+//
+// Takes view_depth rather than a precomputed cascade so the selection and the
+// blend cannot disagree: carrying both would be two spellings of one fact.
+// frame.sun.w is the blend fraction (cvar r_cascade_blend). At 0 the second
+// sample is a uniform branch nothing takes, so the hard-split path is not an
+// approximation of the old behaviour -- it is the same instructions.
+//
+// The band for cascade c is [split_c*(1-k), split_c]. Just below split_c the
+// mix is entirely cascade c+1; just above, cascade_for returns c+1 with t = 0,
+// which is also entirely c+1. So the function is continuous at every split for
+// any k, and smoothstep flattens the derivative at both ends of the band.
+float sun_shadow(Frame frame, Light sun, vec3 P, vec3 N, vec3 L, float view_depth) {
     if (sun.shadow_view == VKMIN_NONE || (frame.flags & VKMIN_FRAME_SHADOWS) == 0u) return 1.0;
-    uint c = min(cascade, sun.shadow_views - 1u);
-    return shadow_sample(frame, sun.shadow_view + c, P, N, max(dot(N, L), 0.0));
+    float ndl = max(dot(N, L), 0.0);
+    uint c = min(cascade_for(frame, view_depth), sun.shadow_views - 1u);
+    float lit = shadow_sample(frame, sun.shadow_view + c, P, N, ndl);
+
+    float k = frame.sun.w;
+    // c + 1u < shadow_views, not c < shadow_views - 1u: shadow_views is
+    // unsigned and the subtraction would wrap if it were ever zero.
+    if (k > 0.0 && c + 1u < sun.shadow_views) {
+        float split = frame.cascade_splits[c];
+        float band = split * k;
+        float t = band > 0.0 ? clamp((view_depth - (split - band)) / band, 0.0, 1.0) : 0.0;
+        if (t > 0.0) {
+            float next = shadow_sample(frame, sun.shadow_view + c + 1u, P, N, ndl);
+            lit = mix(lit, next, smoothstep(0.0, 1.0, t));
+        }
+    }
+    return lit;
 }
 
 // Lit fraction from a local light; L points from P towards the light.

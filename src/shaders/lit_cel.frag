@@ -20,7 +20,7 @@ void main() {
     if (frame.sun_light != VKMIN_NONE && !unlit) {
         Light sun = LightRef(frame.lights).l[frame.sun_light];
         vec3 L = normalize(frame.sun.xyz);
-        color += cel(frame, s.N, V, L, s.albedo, sun.color.rgb, sun_shadow(frame, sun, P, s.N, L, cascade));
+        color += cel(frame, s.N, V, L, s.albedo, sun.color.rgb, sun_shadow(frame, sun, P, s.N, L, view_depth));
     }
     LightList list = lights_for_pixel(frame, gl_FragCoord.xy, view_depth);
     if (!unlit) {

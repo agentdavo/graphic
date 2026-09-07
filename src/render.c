@@ -59,7 +59,7 @@ const char *const vkr_pass_names[8] = {"cull", "shadows", "prepass", "clusters",
 typedef struct {
     bool shadows, normal_maps, clustered, prepass, gpu_cull, transparent, overlay, freeze, compact, quads, check_cull;
     int cascades, shadow_lights, debug, tonemap;
-    float shadow_bias, normal_bias, cascade_lambda, exposure, shadow_distance, outline, lut;
+    float shadow_bias, normal_bias, cascade_lambda, exposure, shadow_distance, outline, lut, cascade_blend;
     uint32_t max_lights;
 } settings;
 
@@ -77,6 +77,7 @@ static settings read_settings(const cvar_state *config) {
         .quads = cvar_get_bool(config, CV_r_quads),
         .check_cull = cvar_get_bool(config, CV_d_check_cull),
         .outline = cvar_get(config, CV_r_outline),
+        .cascade_blend = cvar_get(config, CV_r_cascade_blend),
         .lut = cvar_get(config, CV_r_lut),
         .cascades = cvar_get_int(config, CV_r_cascades),
         .shadow_lights = cvar_get_int(config, CV_r_shadow_lights),
@@ -935,7 +936,13 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         .cluster_dims = {VKMIN_CLUSTER_X, VKMIN_CLUSTER_Y, VKMIN_CLUSTER_Z, 0},
         .screen = {(float)rw, (float)rh, 1.0f / (float)rw, 1.0f / (float)rh},
         .ambient = {cvar_get(config, CV_r_ambient), cvar_get(config, CV_r_ambient), cvar_get(config, CV_r_ambient), s.debug != 0 ? 1.0f : s.exposure},
-        .sun = {to_sun.x, to_sun.y, to_sun.z, 0.0f},
+        /* w is the cascade blend fraction. It rides in the sun vector
+         * because that slot was already there and unread, so no struct
+         * grows and no _Static_assert in render_shared.h moves. Clamped
+         * to half a split: past that a band would reach back through the
+         * previous split and cost a second sample over most of the view. */
+        .sun = {to_sun.x, to_sun.y, to_sun.z,
+                s.cascade_blend < 0.0f ? 0.0f : (s.cascade_blend > 0.5f ? 0.5f : s.cascade_blend)},
         .light_count = light_count,
         .view_count = vs.count,
         .debug_mode = (uint32_t)s.debug,

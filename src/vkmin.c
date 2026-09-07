@@ -1704,13 +1704,21 @@ static void destroy_readback_buffers(vkmin_ctx *c) {
 
 /* ------------------------------------------------------------ swapchain -- */
 
+/* Order matters here, and it is the opposite of the obvious one. The caller's
+ * vkDeviceWaitIdle covers everything the queue is doing, but a semaphore
+ * handed to vkQueuePresentKHR is also waited on by the presentation engine,
+ * which is not queue work and which wait-idle says nothing about. Destroying
+ * rendered[i] first therefore frees a semaphore a pending present may still
+ * reference -- VUID-vkDestroySemaphore-semaphore-01137, which core validation
+ * reports and which is fatal here. Retiring the swapchain first completes its
+ * outstanding presents, and only then is each semaphore unreferenced. */
 static void destroy_swapchain(vkmin_ctx *c) {
-    for (uint32_t i = 0; i < c->swap_count; ++i) vkDestroySemaphore(c->dev, c->rendered[i], NULL);
-    c->swap_count = 0;
     if (c->swapchain) {
         vkDestroySwapchainKHR(c->dev, c->swapchain, NULL);
         c->swapchain = VK_NULL_HANDLE;
     }
+    for (uint32_t i = 0; i < c->swap_count; ++i) vkDestroySemaphore(c->dev, c->rendered[i], NULL);
+    c->swap_count = 0;
 }
 
 static void create_swapchain(vkmin_ctx *c) {

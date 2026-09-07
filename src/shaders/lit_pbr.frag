@@ -47,7 +47,7 @@ void main() {
     if (frame.sun_light != VKMIN_NONE && !unlit) {
         Light sun = LightRef(frame.lights).l[frame.sun_light];
         vec3 L = normalize(frame.sun.xyz);
-        float shadow = sun_shadow(frame, sun, P, s.N, L, cascade);
+        float shadow = sun_shadow(frame, sun, P, s.N, L, view_depth);
         if (frame.outdoor != uint64_t(0)) {
             // The last cascade covers a finite region; fade before its edge.
             shadow = mix(shadow,1.0,smoothstep(frame.cascade_splits.w*.8,frame.cascade_splits.w,view_depth));

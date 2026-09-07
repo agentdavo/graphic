@@ -25,6 +25,7 @@
     X(r_shadow_atlas, 4096.0f, "shadow atlas size in texels")                        \
     X(r_cascades, 4.0f, "sun cascade count, 1..4")                                   \
     X(r_cascade_lambda, 0.6f, "log/uniform split blend, 0 uniform .. 1 logarithmic") \
+    X(r_cascade_blend, 0.0f, "cross-fade this fraction of each cascade into the next; 0 hard splits") \
     X(r_shadow_lights, 8.0f, "max local lights given shadow tiles per frame")        \
     X(r_shadow_bias, 1.5f, "depth bias in atlas texels")                             \
     X(r_normal_bias, 1.0f, "normal offset bias in atlas texels")                     \
