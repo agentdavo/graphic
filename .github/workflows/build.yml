@@ -14,12 +14,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - name: Install Vulkan, lavapipe, glslang and a platform backend
+      # Ubuntu 24.04's mesa-vulkan-drivers is Mesa 24.0, and lavapipe of that
+      # vintage is a 2024 driver being asked to run a Vulkan 1.4-era renderer.
+      # The kisak PPA carries a current Mesa. This project's own history did
+      # the same thing by hand: CLAUDE.md still describes a Mesa downloaded
+      # into build/deps rather than the distro one.
+      - name: Install Vulkan, a current lavapipe, glslang and a backend
         run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build libvulkan-dev glslang-tools spirv-tools \
             mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev vulkan-tools
+          dpkg -l mesa-vulkan-drivers | tail -1
       # Ubuntu 24.04's libvulkan-dev is Vulkan 1.3.275 era, and this is a 1.4
       # codebase: unifiedImageLayouts, hostImageCopy and maintenance5 are not
       # declared by those headers, so vkmin.c cannot compile against them.
