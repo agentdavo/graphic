@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Vulkan, lavapipe, glslang and a platform backend
         run: |
           sudo apt-get update -qq
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -92,7 +92,7 @@ jobs:
           - backend: glfw
             packages: libglfw3-dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -100,36 +100,75 @@ jobs:
       - run: cmake -S . -B build -G Ninja -DVKMIN_PLATFORM=${{ matrix.backend }}
       - run: cmake --build build
 
+  # Built one target at a time. A step name is visible in the API without a
+  # token while the log is not, so when this fails the step that failed says
+  # which target broke -- which is the whole diagnosis from outside.
   headless:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build libvulkan-dev glslang-tools
-      - name: No window system and no sound card
-        run: |
-          cmake -S . -B build -G Ninja -DVKMIN_HEADLESS=ON
-          cmake --build build
+      - name: Report the compiler
+        run: cc --version && cmake --version | head -1
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DVKMIN_HEADLESS=ON
+      - name: Build shaders
+        run: cmake --build build --target shaders
+      - name: Build vkmin
+        run: cmake --build build --target vkmin
+      - name: Build sndmin
+        run: cmake --build build --target sndmin
+      - name: Build render
+        run: cmake --build build --target render
+      - name: Build replay
+        run: cmake --build build --target replay
+      - name: Build scene
+        run: cmake --build build --target scene
+      - name: Build omega
+        run: cmake --build build --target omega
+
+  # Same tree with GCC's analyser off. If this passes while the jobs above
+  # fail, the difference is -fanalyzer on a compiler three major versions
+  # older than the one this is developed against, not the code.
+  headless-no-analyser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libvulkan-dev glslang-tools
+      - name: Configure without the analyser
+        run: cmake -S . -B build -G Ninja -DVKMIN_HEADLESS=ON -DVKMIN_ANALYZER=OFF
+      - name: Build everything
+        run: cmake --build build
 
   windows:
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: true
+          # Every name here is checked against `pacman -Si`. Two earlier ones
+          # were invented and do not exist -- there is no vulkan-devel (it is
+          # headers plus loader) and sdl3 is lowercase -- and setup-msys2 fails
+          # the whole job on an unknown package before any build runs.
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-glslang
-            mingw-w64-ucrt-x86_64-SDL3
+            mingw-w64-ucrt-x86_64-sdl3
       - shell: msys2 {0}
         run: |
           cmake -S . -B build -G Ninja
