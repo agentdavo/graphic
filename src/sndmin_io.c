@@ -1,4 +1,14 @@
-/* Third party only; quarantined under the repository's third-party flags. */
+/* Third party only; quarantined under the repository's third-party flags.
+ *
+ * The whole of dr_wav, stb_vorbis and stb_image_write is compiled into this
+ * one object with -w, so their diagnostics never mix with sndmin's own -Werror
+ * build. Nothing else in sndmin may include these headers, and this file
+ * exports nothing but sndmin_io.h -- so the vendored code is swappable and its
+ * types never reach the engine. Keep it thin for the same reason: every line
+ * here is a line the analysers do not see.
+ *
+ * Game thread, and blocking IO throughout. Never reachable from the mixer.
+ * Not exercised by omega, which synthesises its audio and loads no files. */
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "stb_vorbis.c"
@@ -25,6 +35,11 @@ uint32_t sndmin_reader_read(sndmin_reader *r, float *out, uint32_t frames) {
 }
 bool sndmin_reader_rewind(sndmin_reader *r) { return stb_vorbis_seek_start(r->vorbis) != 0; }
 void sndmin_reader_close(sndmin_reader *r) { if (r) { stb_vorbis_close(r->vorbis); free(r); } }
+/* Whole-file decode to interleaved float, caller frees. Format is sniffed by
+ * trying WAV and falling back to Ogg, rather than by extension -- the callers
+ * are loading assets, not honouring a user's file naming. Returns NULL on any
+ * failure, and *frames may come back short of the container's claim if the
+ * stream ends early, so callers must use the returned count, not their own. */
 float *sndmin_decode(const char *path, uint64_t *frames, uint32_t *channels, uint32_t *rate) {
     unsigned int ch = 0, hz = 0; drwav_uint64 count = 0;
     float *data = drwav_open_file_and_read_pcm_frames_f32(path, &ch, &hz, &count, NULL);

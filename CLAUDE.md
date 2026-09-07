@@ -127,7 +127,12 @@ Therefore, in this repository:
   The governing principle: anything that is not crystal clear to an analyser is probably not
   clear to the next human either.
 - Do not silence a warning to make it go away. Either the code is wrong, or the code is unclear
-  enough to fool a tool, and both are worth fixing.
+  enough to fool a tool, and both are worth fixing. The one exception is a third-party
+  quarantine: a translation unit existing only to compile a vendored header may use `-w`,
+  provided it exports nothing but our own interface and contains no logic of ours. That is
+  what `vkmin_stb.c`, `sndmin_io.c` and `sndmin_miniaudio.c` are. Silencing a warning in code
+  we wrote is still forbidden; the quarantine works because the boundary is a whole file
+  rather than a pragma buried in one.
 - Formatting and language conventions were written down in `docs/style.md` and the mechanical
   subset enforced by a checker in `make style`; neither is currently in the tree. The lesson
   they left is worth keeping: a checker proves itself against a fixture of known-bad and
@@ -175,6 +180,13 @@ break on a specific frame, accurate profiling free of the distortion instrumenta
 and the ability to run heavyweight checkers at a fraction of normal speed while covering exactly
 the same code paths. Where this codebase has non-determinism, treat removing it as high-value
 work rather than an indulgence.
+
+Determinism is not only about journalling inputs. In sndmin it is also arithmetic: the audio
+sources compile with `-ffp-contract=off -fno-fast-math`, and the DSP helpers reimplement
+`sqrt`, `exp2` and `sin` rather than calling libm, because libm's accuracy is unspecified and
+one ulp inside a feedback loop is a different WAV. Reassociating a float expression in
+shipping DSP is a defect, not a rounding detail, and the rendered WAVs are the check that
+catches it.
 
 **Step through the code you never look at.** Periodically take a major entry point and step
 into every function, walking the complete coverage of one cycle. It is a grim exercise and it
@@ -225,6 +237,12 @@ flag for it: a release build never pays for it, a debug build always does, and i
 is missing vkmin says so on stderr and continues without it. Reimplementing
 part of its job inside vkmin costs shipping-path code, adds a second opinion that can disagree
 with the first, and catches less.
+
+This section is about vkmin and does not transfer to sndmin. There is no Khronos layer for
+audio, so sndmin validates every float crossing into the mixer itself: a NaN entering a
+feedback delay line never leaves it, and a journal is a file on disk that a replay must not
+trust. Those checks are the "preconditions of our own invention" case below, not the
+duplicate-of-a-layer case.
 
 So do not add runtime checks for what the layer already reports: handle validity, usage flags,
 image layouts, synchronization hazards, descriptor bindings, object lifetimes, or any other

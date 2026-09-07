@@ -1,4 +1,16 @@
-/* Device layer only; no miniaudio engine, resource manager or decoding. */
+/* Device layer only; no miniaudio engine, resource manager or decoding.
+ *
+ * The live counterpart to sndmin_null.c, and the second third-party
+ * quarantine: miniaudio is compiled into this one object with -w, and the
+ * MA_NO_* switches below cut it down to opening a playback device and calling
+ * back. sndmin does its own mixing, synthesis, resampling and decoding, so
+ * every one of those subsystems would be a second implementation of something
+ * that already exists here -- and a non-deterministic one.
+ *
+ * The callback below is the audio thread. It runs at whatever period the OS
+ * chose, it may not block, and everything it is allowed to touch is described
+ * in sndmin_internal.h. Not exercised by any of omega's runs, which are all
+ * offline; only the null backend and the offline path are covered there. */
 #define MA_NO_ENGINE
 #define MA_NO_RESOURCE_MANAGER
 #define MA_NO_NODE_GRAPH
@@ -10,6 +22,10 @@
 #include "sndmin_plat.h"
 #include <stdlib.h>
 struct sndmin_device { ma_device device; };
+/* The audio thread's entry point, and the only place the mixer is entered on a
+ * live context. Playback only, so the capture buffer is ignored. Nothing is
+ * done here but forward: any work added to this function is work done under
+ * the callback's deadline, in a file the analysers do not check. */
 static void output(ma_device *d, void *out, const void *in, ma_uint32 frames) {
     (void)in; sndmin_mix(d->pUserData, out, frames);
 }

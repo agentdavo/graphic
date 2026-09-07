@@ -5,7 +5,24 @@
  * Handles belong to one context and expire at shutdown; voices may be stolen.
  * Check resource/play handles and render results. sndmin_ok distinguishes a
  * recoverable rejection from a terminal command/journal failure. On terminal
- * failure, shut down and recreate the context. No operation calls user code. */
+ * failure, shut down and recreate the context. No operation calls user code.
+ *
+ * Threads. Every function declared here is game-thread-only, and none of them
+ * waits on the device. A live context owns a second thread inside the audio
+ * backend that the caller never names: these calls append to a game-side list,
+ * sndmin_frame hands the due part of that list to the mixer through a
+ * lock-free ring, and the mixer publishes its counters back the same way. So a
+ * command issued while building frame N is not heard at frame N -- it is
+ * restamped latency_frames later, which is the price of never making the
+ * callback block on the game. An offline context has no second thread at all:
+ * sndmin_render pulls the mixer forward inline, on the calling thread.
+ *
+ * Determinism. The mixer always runs at SNDMIN_RATE whatever the device rate
+ * is, in scalar float, and sndmin's sources are compiled with FP contraction
+ * and fast-math off. The same commands therefore yield bit-identical PCM from
+ * one build, which is what makes a journal replay checkable against a golden
+ * WAV. Time is samples at SNDMIN_RATE everywhere; a frame's commands are
+ * stamped at index * SNDMIN_FRAME_SAMPLES. */
 #ifndef SNDMIN_H
 #define SNDMIN_H
 #include <stdbool.h>
@@ -36,17 +53,23 @@ typedef struct {
     uint32_t rate;                /* device rate; mixer always 48000; 0 = 48000 */
     bool offline;
     int argc; char **argv;        /* --offline, --record FILE */
-    uint32_t latency_frames;      /* live scheduling offset; 0 = 3 */
+    uint32_t latency_frames;      /* live scheduling offset, in SNDMIN_FRAME_SAMPLES
+                                   * frames; 0 = 3. Unused offline. */
     FILE *journal;               /* borrowed shared jrnl stream, already opened */
 } sndmin_desc;
+/* Classic ADSR. attack/decay/release are seconds; sustain is the level held
+ * after decay, 0..1. An all-zero adsr means "unset" and picks a default. */
 typedef struct { float attack, decay, sustain, release; } sndmin_adsr;
 typedef struct {
     sndmin_wave wave[2]; sndmin_instrument instrument;
     float detune, sub, pulse_width; /* detune cents; width 0 = .5 */
     float cutoff, resonance, filter_env; /* Hz, [0,1), octaves */
-    sndmin_adsr amp, filter;
+    sndmin_adsr amp, filter;      /* amp shapes level; filter scales filter_env */
+    /* One LFO per voice, a sine of lfo_hz scaled by lfo_depth. The unit of the
+     * depth follows the route: for PITCH one is one semitone, for WIDTH one is
+     * 0.4 of the pulse duty cycle, for CUTOFF one is three octaves. */
     float lfo_hz, lfo_depth; sndmin_lfo_route lfo_route;
-    uint32_t unison; float unison_cents, chorus;
+    uint32_t unison; float unison_cents, chorus; /* 1..4 detuned copies; cents apart */
     /* Orchestral articulation. Appended, and every one zero by default, because
      * zero is exactly the behaviour that existed before they did: an untouched
      * patch sounds as it always has, and the frozen journals -- whose 0x202
@@ -62,9 +85,14 @@ enum { SNDMIN_PATCH_BYTES_V1 = 92 }; /* the record older journals wrote */
 typedef struct {
     vec3 position, velocity;
     float gain, pitch;            /* set(): zero gain mutes; pitch 1/1024..8, 0 = 1 */
-    float min_radius, max_radius; /* defaults 1, 100 metres */
-    float reverb_send, lfe_send;
-    float fade_seconds;
+    /* Metres. Full gain inside min_radius, silence past max_radius. play()
+     * substitutes 1 for a non-positive min_radius and min_radius + 100 for a
+     * max_radius that does not exceed it; sndmin_acoustics, which anyone may
+     * call on a raw descriptor, substitutes a flat 100 for the latter. Fill
+     * both in if you care which. */
+    float min_radius, max_radius;
+    float reverb_send, lfe_send;  /* share of the voice sent on, 0..1 */
+    float fade_seconds;           /* ramp to the new gain, and stop()'s fade out */
 } sndmin_voice_desc;
 typedef struct {
     sndmin_sound sound; sndmin_stream stream; sndmin_patch patch; sndmin_song song;
@@ -85,10 +113,18 @@ typedef struct {
                                   * Prefer sndmin_bus_set: literal, persistent gains. */
     float delay_seconds, delay_feedback; /* music bus; default off */
 } sndmin_frame_desc;
+/* One early reflection: delay in seconds behind the direct sound, gain linear,
+ * lowpass the coefficient of a one-pole smoother (1 = open, 0 = fully damped). */
 typedef struct { float delay, gain, lowpass; } sndmin_tap;
+/* What a listener/source pair sounds like, evaluated on the game thread and
+ * sent to the mixer, which then ramps to it over ~0.1 s rather than jumping.
+ * The last three describe the room around the listener rather than this
+ * source, and drive the shared reverb; see sndmin_acoustics for the model. */
 typedef struct {
-    float gain, lowpass, doppler, pan[8];
-    sndmin_tap taps[4];
+    float gain, lowpass, doppler, pan[8]; /* linear; one-pole coeff; pitch ratio; per-channel gains */
+    sndmin_tap taps[4];           /* the four loudest early reflections */
+    /* Metres; fraction of probe rays that escaped, 0..1; reverberation time in
+     * seconds -- the tail loses about 18 dB per `decay`, not the usual 60. */
     float mean_free_path, openness, decay;
 } sndmin_acoustic;
 typedef struct {
@@ -117,7 +153,9 @@ void sndmin_frame(sndmin_ctx *, const sndmin_frame_desc *);          /* game thr
 sndmin_stats sndmin_stats_get(sndmin_ctx *);                        /* consumes snapshots */
 void sndmin_dump(sndmin_ctx *, FILE *);                            /* io */
 /* Single offline render per context, starting at sample zero. Frames include tails.
- * Recreate/replay to render again. Failure returns false, never partial success. */
+ * Recreate/replay to render again. Failure returns false, never partial success.
+ * Offline contexts only: this drives the mixer on the calling thread, so the
+ * whole engine collapses to one thread and the result is reproducible. */
 bool sndmin_render(sndmin_ctx *, uint32_t frames, const char *wav, const char *spectrogram_png); /* io */
 bool sndmin_replay(sndmin_ctx *, const char *journal);              /* before frame: io */
 /* Pure game-thread acoustic reference, also useful in tests/tools. */

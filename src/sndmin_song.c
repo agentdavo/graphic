@@ -1,8 +1,36 @@
 #include "sndmin_internal.h"
 #include <stdlib.h>
 #include <string.h>
-/* Tracker parser is deliberately line-oriented and bounded. Unknown input is
- * rejected, including trailing fields, missing patterns and out-of-range notes. */
+/* Songs: a small tracker format, and the scheduler that turns one into voices.
+ *
+ * The model is the one every tracker uses. A song is an ordered list of
+ * patterns; a pattern is `rows` rows; a row is up to eight channels, each
+ * either empty or a note. A row is a sixteenth note, so time per row is
+ * 60/bpm/4 seconds -- 720000/bpm samples at 48 kHz, which is the one constant
+ * in sndmin_song_schedule. `swing` steals a fraction of each odd row and gives
+ * it to the even row before it, the usual shuffle feel. `arp` turns a channel's
+ * notes into three fast repeats at fixed intervals, the chiptune substitute for
+ * a chord on a monophonic voice.
+ *
+ * A song is scheduled once, in full, at play time -- every note of every
+ * pattern becomes a CMD_PLAY stamped at its sample. It is not stepped frame by
+ * frame. That is why a song cannot react to anything, and why it replays and
+ * renders offline identically for free: after sndmin_play there is no
+ * sequencer left running, only a pile of commands with timestamps.
+ *
+ * Both halves are game-thread only, and both are unexercised by omega, which
+ * builds its score in C rather than loading one; the format is for a game that
+ * wants its music editable without a rebuild.
+ *
+ * The parser is deliberately line-oriented and bounded. Unknown input is
+ * rejected, including trailing fields, missing patterns and out-of-range notes.
+ * There is no partial success: a rejected song commits nothing. */
+/* "C4", "F#2" -> MIDI number; -1 for the rest token "---"; -2 for anything
+ * else, including a flat, a missing octave or an octave outside 0..8. C4 is
+ * 60, so the trailing digit is the octave in scientific pitch notation. The
+ * lookup string is the chromatic scale with a space where a black key would
+ * be, which is what makes the letter's index its semitone directly. Note that
+ * only "C4" and "C#4" parse -- there is no separator form. Pure. */
 static int note_number(const char *s) {
     if(strcmp(s,"---")==0) return -1;
     static const char letters[]="C D EF G A B";
@@ -14,6 +42,9 @@ static int note_number(const char *s) {
     if(s[at]<'0'||s[at]>'8'||s[at+1]) return -2;
     return (s[at]-'0'+1)*12+semitone;
 }
+/* The song format names patches instead of spelling out forty parameters, so
+ * this is the whole vocabulary a .song file has. Clears *ok for an unknown
+ * name -- it never clears it otherwise, so the caller may chain calls. Pure. */
 static sndmin_patch_desc preset(const char *name,bool *ok) {
     sndmin_patch_desc p={.cutoff=3500,.detune=7,.sub=0.2f,.filter_env=2,
         .amp={0.003f,0.16f,0.25f,0.12f},.filter={0.002f,0.2f,0.1f,0.1f}};
@@ -124,14 +155,25 @@ sndmin_song sndmin_load_song(sndmin_ctx *c,const char *path) {
     for(uint32_t i=0;i<song->count;++i) song->notes[i].patch+=first_patch;
     c->songs[c->song_count++]=song; return (sndmin_song){c->song_count};
 }
+/* Expand a whole song into timestamped CMD_PLAYs, once, at play time. `voice`
+ * is the handle the game holds, carried in each command's `count` as the group
+ * id -- that is what later lets one sndmin_set or sndmin_stop reach every note
+ * the song will ever produce, including the ones not yet started. Game thread;
+ * allocates nothing, but can fail terminally if the journal write does. */
 void sndmin_song_schedule(sndmin_ctx *c,const sndmin_play_desc *play,uint32_t voice) {
     const snd_song *song=c->songs[play->song.id-1];
-    const double step=720000.0/(double)song->bpm; /* 16th-note samples */
+    /* Samples per row: a row is a sixteenth, so 48000 * 60 / bpm / 4. Double
+     * because it is rarely whole and the error would otherwise accumulate
+     * across the hundreds of rows in a song. */
+    const double step=720000.0/(double)song->bpm;
     for(uint32_t order=0;order<song->orders;++order) {
         const uint32_t pattern=song->order[order];
         for(uint32_t n=0;n<song->pattern_count[pattern];++n) {
             const snd_note note=song->notes[song->pattern_first[pattern]+n];
             const uint32_t row=order*song->rows+note.row;
+            /* Swing: hold every odd row back by a fraction of a step and let
+             * the even row before it run long. The pair still adds up to two
+             * steps, so the grid never drifts however long the song runs. */
             const double start=(double)row*step+(row%2?step*(double)song->swing:0);
             const double length=step*(row%2?1-(double)song->swing:1+(double)song->swing);
             const bool arpeggio=song->arp[note.channel][0]!=0||song->arp[note.channel][1]!=0;
@@ -141,6 +183,10 @@ void sndmin_song_schedule(sndmin_ctx *c,const sndmin_play_desc *play,uint32_t vo
                 const int pitch=(int)note.note+note.effect+(a?song->arp[note.channel][a-1]:0);
                 p.note=(uint32_t)snd_clamp((float)pitch,1,127);
                 p.voice.gain*= (float)note.volume*0.01f;
+                /* Gate for 85% of the slot, so consecutive notes separate
+                 * instead of running together. A patch with a slow attack
+                 * would never reach full level in that time, so those are
+                 * held a whole beat instead -- a pad has to sustain. */
                 p.duration=(float)(length/(double)repeats/48000)*0.85f;
                 if(c->patches[p.patch.id-1].amp.attack>0.05f) p.duration=(float)(step*4/48000);
                 if(c->next_voice==UINT32_MAX) { c->failed=true; return; }

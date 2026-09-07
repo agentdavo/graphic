@@ -1,12 +1,34 @@
+/* Offline output and journal replay: the two paths that drive the mixer
+ * without a sound card, and the reason sndmin can be tested at all.
+ *
+ * sndmin_write_output runs the whole engine on the calling thread, in blocks,
+ * writing 16-bit PCM as it goes -- so a render costs one WAV's worth of memory
+ * whatever its length. sndmin_replay reads a journal back into a fresh context
+ * so the same commands produce the same samples. Both are game-thread, both do
+ * IO, and neither may be entered on a live context.
+ *
+ * These WAVs are the project's golden test: 16-bit output is a total order on
+ * the float mix, so a hash comparison catches any arithmetic drift at all.
+ * That is what -ffp-contract=off -fno-fast-math is protecting. */
 #include "sndmin_internal.h"
 #include <stdlib.h>
 #include <string.h>
+/* Little-endian 16-bit, since WAV is little-endian and the host might not be. */
 static bool u16(FILE *f,uint16_t x) {
     const unsigned char b[2]={(unsigned char)x,(unsigned char)(x>>8)};
     return jrnl_bytes_write(f,b,2);
 }
-/* 512-point Hann STFT, 256 frequency bins, time advances left-to-right.
- * FFT is diagnostic only; golden audio never depends on visualization maths. */
+/* One column of a spectrogram: a 512-point Hann-windowed short-time Fourier
+ * transform, giving 256 usable bins from DC to Nyquist, painted bottom-up so
+ * low frequencies sit at the bottom. Radix-2 decimation-in-time, which is why
+ * the input is written in bit-reversed order first -- after that the butterfly
+ * passes run in place. Brightness is log magnitude over a 24-octave floor,
+ * read straight out of the float's exponent rather than through a log call.
+ *
+ * FFT is diagnostic only; golden audio never depends on visualization maths.
+ * Nothing here feeds back into the mix, so this is the one place in sndmin
+ * where an arithmetic change would be harmless. Unexercised by omega, which
+ * always passes a null spectrogram path. */
 static void spectrum(const float *window,unsigned char *rgb,uint32_t width,uint32_t column) {
     float real[512],imag[512]={0};
     for(unsigned i=0;i<512;++i) {
@@ -34,6 +56,9 @@ bool sndmin_write_output(sndmin_ctx *c,uint32_t frames,const char *wav,const cha
     const uint64_t total=(uint64_t)frames*800,bytes=total*c->channels*2;
     if(bytes>UINT32_MAX-68) return false;
     FILE *f=fopen(wav,"wb"); if(!f) return false;
+    /* Plain 16-bit PCM for stereo; WAVE_FORMAT_EXTENSIBLE beyond it, because
+     * only the extensible header carries a channel mask, and without one a
+     * player has to guess which speaker each channel belongs to. */
     const bool surround=c->channels>2;
     bool ok=jrnl_bytes_write(f,"RIFF",4)&&jrnl_u32_write(f,(uint32_t)bytes+(surround?60:36))&&
         jrnl_bytes_write(f,"WAVEfmt ",8)&&jrnl_u32_write(f,surround?40:16)&&u16(f,surround?0xfffe:1)&&
@@ -49,6 +74,12 @@ bool sndmin_write_output(sndmin_ctx *c,uint32_t frames,const char *wav,const cha
     if(png&&!rgb) ok=false;
     float samples[800*8],history[512]={0}; uint32_t head=0,column=0;
     unsigned char encoded[800*8*2]; size_t index=0;
+    /* The offline main loop, and the offline substitute for the game/mixer
+     * handshake: feed the commands due now, top the stream buffers up, then
+     * mix as far as the next event. Blocks are therefore ragged rather than a
+     * fixed 800, and that is the point -- a command lands on its exact sample,
+     * so a render is not merely deterministic but agrees with what the live
+     * path would have produced from the same journal. */
     for(uint64_t at=0;ok&&at<total;) {
         /* Keep future commands out of the queue: stream chunks stamped at at
          * must never be trapped behind a future event. Split at event positions. */
@@ -65,8 +96,17 @@ bool sndmin_write_output(sndmin_ctx *c,uint32_t frames,const char *wav,const cha
             for(unsigned ch=0;ch<c->channels;++ch) {
                 const size_t offset=(size_t)i*c->channels+ch;
                 const float x=samples[offset]; mono+=x/(float)c->channels;
+                /* Dither. Rounding float to 16-bit without it correlates the
+                 * quantisation error with the signal, which is audible on a
+                 * fade as a buzz rather than as hiss. Just under half an LSB
+                 * of noise decorrelates it. Derived from the sample index and
+                 * channel, not from a generator with state, so the dither is
+                 * part of the deterministic result and two renders of the same
+                 * score hash the same. */
                 const float dither=snd_noise(at+i,0x6d2b79f5u+ch)*0.49f;
                 const float scaled=snd_clamp(x*32767+dither,-32768,32767);
+                /* Round half away from zero. C's cast truncates, which would
+                 * bias every sample towards silence. */
                 const int32_t signed_sample=(int32_t)(scaled+(scaled>=0?0.5f:-0.5f));
                 const uint16_t value=(uint16_t)signed_sample;
                 encoded[offset*2]=(unsigned char)value; encoded[offset*2+1]=(unsigned char)(value>>8);
@@ -83,9 +123,22 @@ bool sndmin_write_output(sndmin_ctx *c,uint32_t frames,const char *wav,const cha
     if(ok&&png) ok=sndmin_png(png,width,256,rgb);
     free(rgb); (void)sndmin_stats_get(c); return ok;
 }
+/* Rebuild a context from a recorded journal: resources first, then every
+ * command, staged exactly as the original run staged them. Only legal on a
+ * fresh offline context -- the guard below is what enforces that, since
+ * replaying into a context that already has sounds or patches would renumber
+ * the very handles the recorded commands refer to.
+ *
+ * Recorded commands are treated as untrusted input, not as data this build
+ * wrote: every one goes through sndmin_command_valid, and the frame stamp must
+ * agree with the sample. A journal is a file on disk, and a malformed or
+ * truncated one must fail the replay rather than reach the mixer. */
 bool sndmin_replay(sndmin_ctx *c,const char *path) {
     if(!c||c->failed||!path||!c->desc.offline||c->started||c->sound_count||c->patch_count||c->pending_count||c->stream_count||c->song_count) return false;
     FILE *f=jrnl_open(path,false); if(!f) return false;
+    /* Journalling off for the duration, restored below: commands read out of
+     * one journal must not be echoed into another the context happens to be
+     * recording to. sndmin_submit tests both the pointer and the flag. */
     FILE *saved=c->journal; c->journal=NULL; c->replaying=true;
     bool ok=true; jrnl_packet packet; int result=0;
     uint32_t meta[3]={0}; bool info_seen=false;

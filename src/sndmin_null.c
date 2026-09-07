@@ -1,3 +1,13 @@
+/* The no-device backend: the full eight-function surface, remembering what it
+ * was asked for and never producing a sample. Linked when there is no sound
+ * card, no audio headers, or no wish to make a noise -- a headless build, a
+ * test, a server. It starts no thread and never calls sndmin_mix, so a context
+ * using it only advances when something drives the mixer directly, which
+ * offline rendering does and nothing else does.
+ *
+ * That absence is the contract, not an omission: this file is also the
+ * reference for what a backend is allowed to assume, so it stays this short.
+ * Its counterpart is sndmin_miniaudio.c. */
 #include "sndmin_plat.h"
 #include <stdlib.h>
 struct sndmin_device { uint32_t rate, channels; bool running; };
