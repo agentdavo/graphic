@@ -1,5 +1,8 @@
 /* vkmin_stb.c -- third-party image I/O, quarantined. Compiled with relaxed
  * warnings; nothing else in the build includes stb. */
+/* sndmin_io.c compiles stb_image_write a second time, deliberately: sndmin
+ * must not depend on vkmin. That copy is STB_IMAGE_WRITE_STATIC so the two
+ * do not collide here. */
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STB_IMAGE_WRITE_IMPLEMENTATION

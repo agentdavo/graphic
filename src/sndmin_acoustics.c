@@ -64,9 +64,12 @@ sndmin_acoustic sndmin_acoustics(const sndmin_frame_desc *f,const sndmin_voice_d
     sndmin_acoustic a={0};
     const vec3 delta=min_vec3_sub(v->position,f->listener),d=unit(delta);
     const float distance=snd_sqrt(min_vec3_dot(delta,delta));
-    /* Note this fallback for max_radius differs from the one sndmin_play
-     * applies through defaults(); see the comment there. */
-    const float min=v->min_radius>0?v->min_radius:1,max=v->max_radius>min?v->max_radius:100;
+    /* Same fallback sndmin_play applies through defaults(): min + 100, not a
+     * flat 100. They used to differ, so an unset max_radius rolled off over
+     * 1..101 m when the voice was played and 1..100 m after any sndmin_set,
+     * which does not run defaults(). One descriptor, two curves, depending on
+     * which call last touched it. */
+    const float min=v->min_radius>0?v->min_radius:1,max=v->max_radius>min?v->max_radius:min+100;
     /* Inverse-distance falloff, times a linear taper to zero at max_radius.
      * Pure 1/r never reaches silence, so a distant source would keep costing a
      * voice and keep adding a whisper to the mix; the taper gives a definite

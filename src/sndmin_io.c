@@ -12,6 +12,12 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "stb_vorbis.c"
+/* stb_image_write is compiled here and again in vkmin_stb.c, which looks
+ * like duplication worth removing and is not: sndmin links neither vkmin
+ * nor Vulkan, and sharing one PNG writer would create exactly that edge and
+ * cost the property that sndmin builds on a machine with no GPU at all.
+ * STB_IMAGE_WRITE_STATIC is what keeps the two copies from colliding at
+ * link time in a binary like omega that pulls in both. */
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"

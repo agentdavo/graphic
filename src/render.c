@@ -137,6 +137,7 @@ struct vkr {
      * until the GPU list written that frame has been read back. */
     DrawCmd *check_cpu[VKR_FRAMES];
     uint32_t check_cpu_count[VKR_FRAMES];
+    uint32_t check_view[VKR_FRAMES];   /* which view this slot's check covers */
     const DrawCmd *check_gpu[VKR_FRAMES];
     bool check_valid[VKR_FRAMES];
 
@@ -710,7 +711,7 @@ vkr_stats vkr_finish(vkr *r) {
     vkmin_wait(r->gpu);
     for (uint32_t slot = 0; slot < VKR_FRAMES; ++slot) {
         if (r->check_valid[slot] && r->counts_valid[slot]) {
-            r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
+            r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot] + r->check_view[slot] * 2u, r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
             r->check_valid[slot] = false;
         }
     }
@@ -821,7 +822,14 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
      * vkr_desc to vkmin_desc and keep this clamp inert; below that it would
      * pull in a margin that was never rendered this frame. Fixing that means
      * scaling uv in three shaders and scissoring the bloom pass, which is why
-     * it is written down here rather than half-done. */
+     * it is written down here rather than half-done.
+     *
+     * The indoor half of that claim is measured, not reasoned: building the
+     * scene demo with vkr_desc at twice the frame size drives rw to half
+     * desc.width and still renders a correctly framed image with no margin.
+     * The outdoor half is not, and cannot be until something exercises
+     * vkr_desc.outdoor -- scene does not, so water.frag and taa.frag run
+     * nowhere in this tree and a fix to them would be unverifiable. */
     const int win_w = f->frame.width, win_h = f->frame.height;
     const int rw = win_w < r->desc.width ? win_w : r->desc.width;
     const int rh = win_h < r->desc.height ? win_h : r->desc.height;
@@ -850,7 +858,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         }
     }
     if (r->check_valid[slot] && r->counts_valid[slot]) {
-        r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot], r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
+        r->stats.cull_mismatches += compare_draw_lists(r->check_gpu[slot], r->counts_host[slot] + r->check_view[slot] * 2u, r->check_cpu[slot], r->check_cpu_count[slot], r->desc.max_instances);
         r->check_valid[slot] = false;
     }
     r->stats.device_used = gs.device_used;
@@ -995,24 +1003,25 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
         DrawCmd *cmds = vkmin_ring_alloc(gpu, VKR_MAX_TRANSPARENT * sizeof(DrawCmd), &transparent_addr);
         transparent_count = sort_transparents(f, r->host_materials, r->host_meshes, cmds);
     }
-    /* The cull check: the CPU list for the camera view now, the GPU list read
-     * back when this slot comes round again.
-     *
-     * Camera view only, and that is a real gap in the coverage: the shadow
-     * views run the identical cull.comp against different planes, and nothing
-     * here verifies any of them. Widening it is not a
-     * one-line change -- check_cpu is sized for one view's two lists, the
-     * copy_to_ring above moves exactly view 0's slice, and covering all of
-     * vs.count views would multiply both by up to VKMIN_MAX_VIEWS of ring
-     * traffic every frame. Note that cpu_cull is already correct for v > 0:
-     * the one rule it does not model, the tree-impostor drop, is guarded by
-     * `v == 0u` in the shader. */
+    /* The cull check: one view's CPU list now, the GPU list read back when
+     * this slot comes round again. cpu_cull is correct for every view -- the
+     * one rule it does not model, the tree-impostor drop, is guarded by
+     * `v == 0u` in the shader -- so the choice of view is free, and rotating
+     * it by frame index covers the shadow views too. A single frame therefore
+     * proves nothing about view 3; a run of vs.count frames proves all of
+     * them, which is what the multi-frame checks actually do. */
     uint64_t check_addr = 0;
     if (s.check_cull && s.gpu_cull) {
+        /* One view per frame, chosen by frame index, so every shadow view is
+         * covered over vs.count frames at the cost of exactly one. Checking
+         * them all at once would multiply both the host buffer and the ring
+         * copy by up to VKMIN_MAX_VIEWS, every frame, for a debug path. */
+        const uint32_t v = vs.count ? f->frame.index % vs.count : 0u;
         DrawCmd *cpu = r->check_cpu[slot];
-        uint32_t n = cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu, r->host_meshes, 0);
-        n += cpu_cull(&vs.views[0], f->instances, f->instance_count, r->host_materials, cpu + n, r->host_meshes, 1);
+        uint32_t n = cpu_cull(&vs.views[v], f->instances, f->instance_count, r->host_materials, cpu, r->host_meshes, 0);
+        n += cpu_cull(&vs.views[v], f->instances, f->instance_count, r->host_materials, cpu + n, r->host_meshes, 1);
         r->check_cpu_count[slot] = n;
+        r->check_view[slot] = v;
         r->check_gpu[slot] = vkmin_ring_alloc(gpu, 2u * r->desc.max_instances * sizeof(DrawCmd), &check_addr);
     }
     r->check_valid[slot] = s.check_cull && s.gpu_cull;
@@ -1081,7 +1090,10 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
      * caught. The cmds copy is view 0 only: offset 0, length 2 * max_instances
      * is exactly the camera view's two lists. See the d_check_cull note below. */
     vkmin_copy_to_ring(gpu, r->draw_counts, 0, VKMIN_MAX_VIEWS * 2 * sizeof(uint32_t), counts_addr);
-    if (check_addr) vkmin_copy_to_ring(gpu, r->draw_cmds, 0, 2u * r->desc.max_instances * sizeof(DrawCmd), check_addr);
+    if (check_addr) {
+        const size_t stride = 2u * (size_t)r->desc.max_instances * sizeof(DrawCmd);
+        vkmin_copy_to_ring(gpu, r->draw_cmds, (size_t)r->check_view[slot] * stride, stride, check_addr);
+    }
 
     /* --- 2. shadow atlas -------------------------------------------------- */
     vkmin_pass_begin(gpu, &(vkmin_pass_desc){.depth = r->atlas, .clear_depth = true, .label = "shadows"});
