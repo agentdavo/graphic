@@ -42,16 +42,17 @@ jobs:
         run: cmake --build build
       - name: Validate every SPIR-V module
         run: cmake --build build --target validate-shaders
-      # Split fine so the failing step name localises a runtime problem the
-      # way it did a compile one: the log needs a token, the step name does
-      # not. VK_DRIVER_FILES is the current spelling; VK_ICD_FILENAMES is kept
-      # beside it because the runner's loader is older than the headers above.
+      # No VK_DRIVER_FILES here, deliberately. Setting it *replaces* the
+      # loader's search path rather than adding to it, so naming one ICD file
+      # that turns out not to exist leaves the loader with no drivers at all
+      # and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER -- which is
+      # exactly what happened, and what the annotation below finally showed.
+      # On a GPU-less runner lavapipe is the only ICD installed, so letting
+      # the loader find it is both simpler and correct. The pinned path in
+      # CLAUDE.md is a Windows workaround and does not belong here.
       - name: What the loader can see
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
-          ls -l /usr/share/vulkan/icd.d/ || true
+          echo "::notice::ICDs: $(ls /usr/share/vulkan/icd.d/ 2>&1 | tr '\n' ' ')"
           vulkaninfo --summary 2>&1 | head -40 || true
       # A workflow log needs a token to read; a ::error:: annotation does not.
       # So on failure this re-emits what the program actually said as
@@ -60,9 +61,6 @@ jobs:
       # -- the analyser, the headers, the Mesa version -- and two of those
       # were only ruled out by evidence the job itself produced.
       - name: Smallest possible frame
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           set +e
           ./build/omega --headless --size 64 64 --frame 0 --out probe.png --verbose > probe.log 2>&1
@@ -75,17 +73,11 @@ jobs:
             exit "$code"
           fi
       - name: Render a frame under lavapipe
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
       # The one agreement check the tree can still make: a frame rendered
       # directly, and the same frame replayed from its journal by a different
       # program on the other code path. Byte equality or nothing.
       - name: Record on the modern path, replay on the legacy one
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           ./build/omega --headless --size 320 180 --frame 300 --out direct.png --record f300.vkj
           ./build/replay --replay f300.vkj --frame 300 --path=legacy --out replayed.png
@@ -96,9 +88,6 @@ jobs:
       # what they do. d_check_cull compares the GPU draw list against the CPU
       # reference; the run must end with zero mismatches.
       - name: The render layer agrees across paths, and its GPU cull matches the CPU
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           ./build/scene --headless --size 320 180 --frame 300 --out scene.png --record scene.vkj
           ./build/replay --replay scene.vkj --frame 300 --path=legacy --out scene-replay.png
