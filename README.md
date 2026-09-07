@@ -290,20 +290,36 @@ On Windows the toolchain lives in MSYS2; see the notes in [CLAUDE.md](CLAUDE.md)
 
 ## Size, deliberately
 
-Measured with `wc -l`:
-
-| | lines |
-| --- | --- |
-| `vkmin.c` | 3966 |
-| public header `vkmin.h` | 352 |
-| render layer | 1433 |
-| sndmin core | 1142 |
-| shaders, including shared GLSL | 1864 |
-| platform boundary and all four backends | 996 |
-| `omega.c` | 674 |
-
 Code size predicts defects about as well as anything more sophisticated, so
 shrinking it is treated as a reliability strategy rather than an aesthetic one.
+
+`python tools/sizes.py` reports it and `--check` fails when a group is over
+budget; CI runs the latter, so these are gates rather than intentions. It
+counts **code** — comments and blanks stripped — because a budget measured in
+raw lines charges you for explaining the code, and a documentation pass then
+reads as growth. The stripper agrees with `gcc -fpreprocessed -dD -E -P` to
+within a line on every file in the tree.
+
+| | code | budget |
+| --- | --- | --- |
+| vkmin core (`vkmin.c`, cvar, stb) | 3593 | 4200 |
+| public header `vkmin.h` | 233 | 300 |
+| gpu headers | 397 | 900 |
+| common (`min_*`) | 345 | 700 |
+| platform boundary and all four backends | 828 | 1100 |
+| render layer | 1247 | 2600 |
+| render headers | 433 | 1000 |
+| sndmin | 1110 | 2200 |
+| sndmin headers | 267 | 900 |
+| shaders, including shared GLSL | 1592 | 2000 |
+| demos (`omega.c`, `scene.c`, the kit) | 1054 | 1400 |
+
+Generated and vendored code — the baked font, the model arrays,
+`src/third_party` — is measured but never budgeted; it is not ours to shrink.
+
+Raising a budget deliberately is fine. Passing one without noticing is what
+the check exists to prevent, which is why the number and the code that needs
+it should move in the same commit.
 
 ## License
 
