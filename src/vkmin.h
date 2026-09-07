@@ -80,6 +80,20 @@ typedef struct { uint32_t id; } vkmin_pipeline;
 typedef struct { const void *data; size_t size; } vkmin_bytes; /* a pointer and its size, never apart */
 #define VKMIN_BYTES(x) ((vkmin_bytes){(x), sizeof(x)})         /* of an array or object, not a pointer */
 
+/* The version policy, and the reason there are two paths at all. vkmin targets
+ * Vulkan 1.4 but keeps a 1.3 floor: the instance asks for 1.3, and the 1.4-era
+ * capabilities it wants -- host image copy, maintenance5 -- are taken as
+ * extensions probed per device rather than assumed from the API version. So a
+ * 1.3 driver is not a degraded configuration, it is a supported one, and it is
+ * what a software rasteriser or an older vendor driver will select.
+ *
+ * LEGACY is that floor: staging uploads and shader modules. MODERN is the 1.4
+ * path: host image copy and inline SPIR-V. AUTO takes MODERN when the device
+ * offers both features and LEGACY otherwise, and --path forces either.
+ *
+ * The two must produce identical pixels, and that is checkable rather than
+ * asserted: render the same frame directly on each and compare the PNGs. They
+ * agree byte for byte today, for both omega and the scene demo. */
 typedef enum { VKMIN_PATH_AUTO = 0, VKMIN_PATH_LEGACY, VKMIN_PATH_MODERN } vkmin_path;
 typedef enum { VKMIN_FMT_RGBA8_UNORM = 0, VKMIN_FMT_RGBA8_SRGB, VKMIN_FMT_BGRA8_UNORM, VKMIN_FMT_BC1_SRGB,
                VKMIN_FMT_BC1_UNORM, VKMIN_FMT_BC3_SRGB, VKMIN_FMT_BC4_UNORM, VKMIN_FMT_BC5_UNORM,

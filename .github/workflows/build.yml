@@ -74,6 +74,20 @@ jobs:
           fi
       - name: Render a frame under lavapipe
         run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
+      # vkmin targets 1.4 with a 1.3 floor, and the two paths must produce the
+      # same pixels. lavapipe is the natural place to check it: a software
+      # rasteriser is exactly the "1.3 driver is supported, not degraded" case,
+      # and it will normally select LEGACY on its own. Forcing both and
+      # comparing is stronger than the record/replay check, which only proves a
+      # journal replays -- this proves the floor renders.
+      - name: The 1.3 floor and the 1.4 path render the same pixels
+        run: |
+          ./build/omega --headless --size 320 180 --frame 300 --out legacy.png --path=legacy
+          ./build/omega --headless --size 320 180 --frame 300 --out modern.png --path=modern
+          cmp legacy.png modern.png
+          ./build/scene --headless --size 320 180 --frame 300 --out s-legacy.png --path=legacy
+          ./build/scene --headless --size 320 180 --frame 300 --out s-modern.png --path=modern
+          cmp s-legacy.png s-modern.png
       # The one agreement check the tree can still make: a frame rendered
       # directly, and the same frame replayed from its journal by a different
       # program on the other code path. Byte equality or nothing.
