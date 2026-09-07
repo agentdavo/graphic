@@ -303,6 +303,17 @@ else()
     set(OMEGA_AUDIO sndmin_miniaudio)
 endif()
 
+# ------------------------------------------------------------------ scene ---
+# The render layer's only executable. Without it nothing links `render`, and
+# the record/replay agreement -- the one automated check in the tree -- is
+# blind to every line of it. gamekit.h beside it is the shared demo kit: it
+# keeps its own gk_ prefix and its own malloc/exit policy, which is why it sits
+# here and not in src/ with the four library owners.
+add_executable(scene demo/scene.c)
+target_include_directories(scene PRIVATE demo)
+target_compile_options(scene PRIVATE ${VKMIN_FP_EXACT})
+target_link_libraries(scene PRIVATE vkmin_flags render vkmin)
+
 # ----------------------------------------------------------------- replay ---
 # A journal replays into a different code path than the one that recorded it,
 # but a replaying context is driven by vkmin_replay rather than the host's own

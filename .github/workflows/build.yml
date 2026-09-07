@@ -40,6 +40,21 @@ jobs:
           ./build/omega --headless --size 320 180 --frame 300 --out direct.png --record f300.vkj
           ./build/replay --replay f300.vkj --frame 300 --path=legacy --out replayed.png
           cmp direct.png replayed.png
+      # The same check over the render layer, which omega does not link. Without
+      # this, render.c, cull.comp, cluster.comp and the lit shaders have no
+      # runtime coverage at all and the check above stays green regardless of
+      # what they do. d_check_cull compares the GPU draw list against the CPU
+      # reference; the run must end with zero mismatches.
+      - name: The render layer agrees across paths, and its GPU cull matches the CPU
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          ./build/scene --headless --size 320 180 --frame 300 --out scene.png --record scene.vkj
+          ./build/replay --replay scene.vkj --frame 300 --path=legacy --out scene-replay.png
+          cmp scene.png scene-replay.png
+          ./build/scene --headless --size 320 180 --frames 298,299,300 \
+            --out-dir cull --profile lavapipe +d_check_cull 1 2>&1 | tee cull.log
+          grep -q '0 cull mismatches' cull.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

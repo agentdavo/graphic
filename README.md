@@ -101,6 +101,19 @@ The frame graph, shadow views, transparent sorting and the overlay, in 1433
 lines on top of vkmin. It is genuinely separable, and the honest evidence is
 that OMEGA does not link it: the demo drives vkmin directly.
 
+`build/scene` is the program that does link it — a courtyard of cubes and
+spheres under one sun with cascades, four orbiting shadowed point lights and a
+few transparent billboards, every position a function of the frame index.
+
+```sh
+./build/scene --headless --size 1280 720 --frame 300 --out courtyard.png
+```
+
+It exists to be recorded and replayed. Until it did, `render.c`, `cull.comp`,
+`cluster.comp` and the lit shaders ran nowhere, so the agreement check below
+was blind to every line of them. `+d_check_cull 1` additionally compares the
+GPU draw list against the CPU reference and reports the mismatch count.
+
 ---
 
 ## Platform backends
@@ -263,7 +276,7 @@ cmake --build build
 | `VKMIN_ANALYZER` | `ON` | GCC's `-fanalyzer` during the normal build |
 | `VKMIN_SANITIZE` | `OFF` | ASan + UBSan |
 
-Targets: `omega`, `replay`, `vkmin`, `render`, `sndmin`, `sndmin_null`,
+Targets: `omega`, `scene`, `replay`, `vkmin`, `render`, `sndmin`, `sndmin_null`,
 `sndmin_miniaudio`, `shaders` and `validate-shaders`.
 
 Shaders in `src/shaders` compile to SPIR-V and are embedded as `uint32_t`
