@@ -3,3 +3,4 @@ build_*/
 w64devkit/
 tests/out/
 __pycache__/
+.claude/worktrees/

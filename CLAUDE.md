@@ -281,10 +281,19 @@ loader and `glslangValidator`.
   cmake --build build
   ```
 
-- `VKMIN_PLATFORM=auto` picks the first backend it finds. On this machine that
-  is SDL3: GLFW is not installed and MSYS2 publishes no `glfw3.pc`, so a build
-  that must use GLFW needs `-DVKMIN_PLATFORM=glfw` and a GLFW to find. `win32`
-  needs nothing at all and is always available here.
+- `VKMIN_PLATFORM=auto` picks the first backend it finds, and all four are
+  available here: GLFW and SDL3 come from MSYS2
+  (`pacman -S mingw-w64-ucrt-x86_64-glfw`, already installed), and `win32`
+  needs nothing at all. `auto` therefore resolves to GLFW; an existing build
+  directory keeps whatever it cached until it is reconfigured.
+- GLFW and SDL from MSYS2 are shared libraries, so a binary linked against
+  them needs `C:/msys64/ucrt64/bin` on PATH at *run* time, not only at link
+  time. Without it the program dies before `main` with no message and writes
+  no output, which reads like a silent failure rather than a missing DLL. The
+  `win32` backend is the only one with no runtime dependency.
+- The backend does not reach the rendered image: the GLFW and SDL3 builds
+  produce byte-identical PNGs for the same headless frame. A backend change
+  is therefore verifiable with the same agreement check as everything else.
 - Under Windows PowerShell 5.1 a native program that writes to stderr while
   `$ErrorActionPreference = 'Stop'` looks like a failure. Check the exit code
   or the output file before concluding a run failed; `omega --headless` prints
