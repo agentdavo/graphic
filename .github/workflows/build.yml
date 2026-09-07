@@ -53,11 +53,27 @@ jobs:
         run: |
           ls -l /usr/share/vulkan/icd.d/ || true
           vulkaninfo --summary 2>&1 | head -40 || true
+      # A workflow log needs a token to read; a ::error:: annotation does not.
+      # So on failure this re-emits what the program actually said as
+      # annotations, which is the only way to see a runtime message from
+      # outside without credentials. Three guesses at this failure were wrong
+      # -- the analyser, the headers, the Mesa version -- and two of those
+      # were only ruled out by evidence the job itself produced.
       - name: Smallest possible frame
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-        run: ./build/omega --headless --size 64 64 --frame 0 --out probe.png --verbose
+        run: |
+          set +e
+          ./build/omega --headless --size 64 64 --frame 0 --out probe.png --verbose > probe.log 2>&1
+          code=$?
+          set -e
+          cat probe.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error::omega exited $code"
+            tail -n 12 probe.log | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$code"
+          fi
       - name: Render a frame under lavapipe
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
