@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build libvulkan-dev glslang-tools spirv-tools \
-            mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev
+            mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev vulkan-tools
       # Ubuntu 24.04's libvulkan-dev is Vulkan 1.3.275 era, and this is a 1.4
       # codebase: unifiedImageLayouts, hostImageCopy and maintenance5 are not
       # declared by those headers, so vkmin.c cannot compile against them.
@@ -35,8 +35,25 @@ jobs:
         run: cmake --build build
       - name: Validate every SPIR-V module
         run: cmake --build build --target validate-shaders
+      # Split fine so the failing step name localises a runtime problem the
+      # way it did a compile one: the log needs a token, the step name does
+      # not. VK_DRIVER_FILES is the current spelling; VK_ICD_FILENAMES is kept
+      # beside it because the runner's loader is older than the headers above.
+      - name: What the loader can see
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          ls -l /usr/share/vulkan/icd.d/ || true
+          vulkaninfo --summary 2>&1 | head -40 || true
+      - name: Smallest possible frame
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: ./build/omega --headless --size 64 64 --frame 0 --out probe.png --verbose
       - name: Render a frame under lavapipe
         env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
       # The one agreement check the tree can still make: a frame rendered
@@ -44,6 +61,7 @@ jobs:
       # program on the other code path. Byte equality or nothing.
       - name: Record on the modern path, replay on the legacy one
         env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           ./build/omega --headless --size 320 180 --frame 300 --out direct.png --record f300.vkj
@@ -56,6 +74,7 @@ jobs:
       # reference; the run must end with zero mismatches.
       - name: The render layer agrees across paths, and its GPU cull matches the CPU
         env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           ./build/scene --headless --size 320 180 --frame 300 --out scene.png --record scene.vkj
