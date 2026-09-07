@@ -1,5 +1,6 @@
 build/
 build_*/
+build-*/
 w64devkit/
 tests/out/
 __pycache__/

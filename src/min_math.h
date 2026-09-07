@@ -1,6 +1,38 @@
-/* min_math.h -- vectors, matrices, quaternions: all by value, all pure,
- * nothing mutating in place. There is only Normalized(), never Normalize().
- * vec2/vec4/mat4 are the min_types.h types the GPU sees; vec3 is host-only. */
+/* min_math.h -- vectors, matrices, quaternions, cameras, rays and fixed-step
+ * time. Common to both libraries; no device, scene or audio dependency.
+ *
+ * Every function here is pure in the CLAUDE.md section 2 sense: it reads only
+ * its parameters, returns a new value, touches no global state, and mutates
+ * none of its inputs. Arguments are taken by value, not by pointer, precisely
+ * so that cannot quietly change -- there is no min_vec3_normalize(vec3 *v) and
+ * there should never be one. The two functions that write through a pointer
+ * (min_ray_aabb, min_ray_triangle) do so only for a second return value, and
+ * both are documented at the definition.
+ *
+ * That purity is the whole testing story for this file: build inputs, check
+ * outputs, no harness. It is also why there is no camera object, no matrix
+ * stack, and no cached inverse anywhere below.
+ *
+ * ---- conventions, all of which callers depend on --------------------------
+ *
+ *  - mat4 is column-major with the translation in m[12..14], matching GLSL, so
+ *    a mat4 can be memcpy'd into a GPU record. min_mat4_mul(a, b) composes as
+ *    GLSL's a * b: b applies first.
+ *  - Coordinates are right-handed, +Y up. Clip depth is Vulkan's 0..1, near to
+ *    far, and both projections fold in the Y flip Vulkan's framebuffer
+ *    orientation needs, so no caller sets a negative viewport height.
+ *  - Quaternions are xyzw in a vec4, and min_mat4_from_quat assumes unit
+ *    length; it does not normalise for you.
+ *  - Angles are radians throughout. min_sin_cycles is the one exception and
+ *    says so.
+ *  - vec2/vec4/uvec4/mat4 are the min_types.h types the GPU also sees; vec3 is
+ *    host-only and must not appear in a GPU record.
+ *
+ * Degenerate inputs return something defined and visibly wrong rather than
+ * NaN or a trap: a zero-length normalize returns the zero vector, a singular
+ * inverse returns identity. Both are noted where they happen. Nothing here
+ * asserts, because all of it is callable per-vertex.
+ */
 #ifndef MIN_MATH_H
 #define MIN_MATH_H
 
@@ -25,6 +57,11 @@ static inline vec3 min_vec3_cross(vec3 a, vec3 b) {
 
 static inline float min_vec3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
+/* A zero-length input returns the zero vector, not NaN. That is a deliberate
+ * choice with a cost: the result is not unit length, so a caller that assumed
+ * it was gets a silently degenerate basis rather than a visible NaN. It is the
+ * right trade here only because the alternative is a branch or an assert on a
+ * per-vertex path; callers that can produce a zero vector should test first. */
 static inline vec3 min_vec3_normalize(vec3 v) {
     const float len = sqrtf(min_vec3_dot(v, v));
     const float inv = len > 0.0f ? 1.0f / len : 0.0f;
@@ -35,9 +72,12 @@ static inline mat4 min_mat4_identity(void) {
     return (mat4){{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}};
 }
 
-/* Written as an explicit loop rather than sixteen copy-pasted index
- * expressions: short index arithmetic pasted around is exactly the shape of
- * bug this codebase is trying not to have. */
+/* out = a * b, composing as GLSL does: b applies first. Written as an explicit
+ * loop rather than sixteen copy-pasted index expressions: short index arithmetic
+ * pasted around is exactly the shape of bug this codebase is trying not to have,
+ * and it is the one Carmack singled out as costing him disproportionately.
+ * min_mat4_inverse below is the counter-example, and is unrolled only because
+ * the cofactor expansion has no loop structure to write. */
 static inline mat4 min_mat4_mul(mat4 a, mat4 b) {
     mat4 out;
     for (int col = 0; col < 4; ++col) {
@@ -71,7 +111,11 @@ static inline mat4 min_mat4_rotate_y(float radians) {
 }
 
 /* Right-handed, depth range 0..1, with the Y flip Vulkan's framebuffer
- * orientation needs folded in here rather than into a negative viewport. */
+ * orientation needs folded in here (m[5] is -f, not f) rather than into a
+ * negative viewport. Doing it in the matrix keeps the flip in one place: a
+ * negative viewport height would also have to be remembered by every pass, and
+ * by min_mat4_ortho, and by anything that reconstructs a ray. zfar must not
+ * equal znear -- the depth terms divide by the difference. */
 static inline mat4 min_mat4_perspective(float fovy_radians, float aspect, float znear, float zfar) {
     const float f = 1.0f / tanf(fovy_radians * 0.5f);
     mat4 out = {{0}};
@@ -113,7 +157,9 @@ static inline mat4 min_mat4_scale(vec3 s) {
     return out;
 }
 
-/* Unit quaternion xyzw to a rotation matrix. */
+/* Unit quaternion xyzw to a rotation matrix. Unit is a precondition, not a
+ * request: a quaternion of length L produces a matrix scaled by L squared, and
+ * nothing here notices. Normalise on the way in if the source is interpolated. */
 static inline mat4 min_mat4_from_quat(vec4 q) {
     const float x = q.x, y = q.y, z = q.z, w = q.w;
     mat4 out = min_mat4_identity();
@@ -123,6 +169,8 @@ static inline mat4 min_mat4_from_quat(vec4 q) {
     return out;
 }
 
+/* Scale, then rotate, then translate -- the order the composition reads in
+ * reverse, and the order every model transform in the tree assumes. */
 static inline mat4 min_mat4_trs(vec3 t, vec4 r, vec3 s) {
     return min_mat4_mul(min_mat4_translate(t), min_mat4_mul(min_mat4_from_quat(r), min_mat4_scale(s)));
 }
@@ -238,8 +286,17 @@ static inline min_ray min_ray_from_pixel(mat4 view, mat4 proj, float px, float p
     return (min_ray){.origin = a, .dir = min_vec3_normalize(min_vec3_sub(b, a))};
 }
 
-/* Slab test. Returns true with the entry distance in *t (0 when the origin
- * is inside). */
+/* Slab test. Returns true with the entry distance in *t (0 when the origin is
+ * inside). *t is written whether or not the test passes, so read it only on
+ * true. t0 starts at 0 rather than -INFINITY, which is what makes a box
+ * entirely behind the ray miss: its exit distance stays negative and fails the
+ * t0 <= t1 test. The 1e-30f substitution keeps an axis-parallel ray on the same
+ * arithmetic path as every other one instead of branching out of the loop: the
+ * division yields a huge finite slab, which straddles the origin (and so
+ * constrains nothing) when the ray is inside that slab, and lands entirely on
+ * one side of it when the ray is outside, where the other two axes' finite
+ * bounds reject it. Finite rather than INFINITY so that 0 * inv is 0 and not
+ * NaN. Relies on dir being normalised, which min_ray documents. */
 static inline bool min_ray_aabb(min_ray r, vec3 bmin, vec3 bmax, float *t) {
     float t0 = 0.0f, t1 = INFINITY;
     const float o[3] = {r.origin.x, r.origin.y, r.origin.z}, d[3] = {r.dir.x, r.dir.y, r.dir.z};
@@ -255,7 +312,13 @@ static inline bool min_ray_aabb(min_ray r, vec3 bmin, vec3 bmax, float *t) {
     return t0 <= t1;
 }
 
-/* Moller-Trumbore, both faces. Returns true with the distance in *t. */
+/* Moller-Trumbore, both faces: winding is not consulted, so a back-facing hit
+ * counts. Returns true with the distance in *t; *t is untouched on the early
+ * rejections and written on the last one, so read it only on true. Hits behind
+ * the origin are rejected, hits exactly at it are not. The 1e-8f window on det
+ * rejects rays parallel to the triangle's plane -- it is an absolute epsilon, so
+ * it is scale-dependent, and a scene in millimetres will reject grazing hits a
+ * scene in metres accepts. */
 static inline bool min_ray_triangle(min_ray r, vec3 a, vec3 b, vec3 c, float *t) {
     const vec3 e1 = min_vec3_sub(b, a), e2 = min_vec3_sub(c, a);
     const vec3 p = min_vec3_cross(r.dir, e2);
@@ -283,9 +346,34 @@ static inline min_tick min_ticks_for_frame(uint32_t frame, uint32_t hz) {
     return (min_tick){.ticks = (uint32_t)(scaled / 60u), .alpha = (float)(scaled % 60u) / 60.0f};
 }
 
-/* Deterministic scalar sine in cycles, for authored animation and DSP.
- * Precondition: finite input with magnitude < 2^30. Compile without fast-math
- * or FP contraction when bit equality matters. Approximation, not libm sin. */
+/* Deterministic scalar sine, argument in CYCLES not radians (1.0 is a full
+ * turn), for authored animation and DSP.
+ *
+ * It exists because libm's sinf is not required to give the same bits on two
+ * machines, and this codebase's whole replay story (CLAUDE.md section 5) needs
+ * a frame to render identically everywhere. So this is deliberately a less
+ * accurate sine with known behaviour rather than a more accurate one with
+ * unknown portability. Measured worst case over two million samples of one
+ * turn: 3.6e-6 absolute, near the peaks at 0.25 and 0.75 cycles -- roughly
+ * thirty float ulp at 1.0, so this is NOT a drop-in for sinf where precision
+ * matters, only where reproducibility does.
+ *
+ * Determinism is only actually delivered if the translation unit is built
+ * without fast-math and without FP contraction; that is a build-flag
+ * obligation, not something this function can enforce.
+ *
+ * Precondition: finite input with magnitude < 2^30. The (int) cast below is
+ * undefined outside int's range, and 2^30 leaves headroom.
+ *
+ * Four steps, each narrowing the argument:
+ *   1. drop the whole turns, then fold a negative remainder up into [0, 1);
+ *   2. scale to radians, giving x in [0, 2pi);
+ *   3. two reflections bring x into [-pi/2, pi/2], where the series is accurate
+ *      -- sin(x) = sin(pi - x) handles the upper half, its negative twin the
+ *      lower;
+ *   4. the odd Taylor series to x^9, in Horner form.
+ * The polynomial is only valid on that final interval; the reductions are not
+ * optional tidying. */
 static inline float min_sin_cycles(float cycles) {
     cycles-=(float)(int)cycles; if (cycles<0) cycles+=1;
     float x=cycles*6.28318530718f;

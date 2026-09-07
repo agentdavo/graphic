@@ -1,15 +1,29 @@
 /* vkmin_plat_sdl3.c -- SDL3 backend for vkmin_plat.h. The only file that knows SDL3 exists.
  *
  * A parallel implementation of vkmin_plat_glfw.c and vkmin_plat_sdl2.c; exactly
- * one plat backend links into a binary, chosen by PLAT= in the Makefile. It is a
- * separate file rather than an #if inside the SDL2 backend on purpose: SDL3
- * renamed or reshaped nearly every call used here, and interleaving the two
- * would compromise both.
+ * one plat backend links into a binary, chosen by -DVKMIN_PLATFORM=sdl3 at CMake
+ * time. It is a separate file rather than an #if inside the SDL2 backend on
+ * purpose: SDL3 renamed or reshaped nearly every call used here, and
+ * interleaving the two would compromise both. The two files therefore look
+ * almost identical and are meant to -- that is the deliberate duplication of
+ * CLAUDE.md section 5, not an extraction waiting to happen. What genuinely is
+ * shared lives in vkmin_plat_sdl.h (the translation tables) and
+ * vkmin_plat_common.h (the window list and thread check).
  *
  * Where SDL is global and GLFW is per-window -- the event queue, the keyboard,
  * the mouse -- the open windows are kept on a list and events are routed by SDL
  * window id, and keyboard/button state is gated on input focus so that an
  * unfocused window reports everything released, as GLFW does.
+ *
+ * SDL3-specific differences from the SDL2 file, all forced by the API:
+ *   - SDL_Init and the other predicates return true on success, where SDL2
+ *     returned 0. Every call site's sense is inverted; none is a typo.
+ *   - gamepads are enumerated by SDL_GetGamepads into a caller-freed array,
+ *     replacing SDL2's index-and-probe loop.
+ *   - SDL_Vulkan_GetInstanceExtensions needs no window and returns SDL's own
+ *     const array rather than filling the caller's.
+ *   - the mouse is in floats, and SDL_GetWindowSizeInPixels replaces
+ *     SDL_Vulkan_GetDrawableSize.
  */
 #define SDL_MAIN_HANDLED /* vkmin owns main(); do not let SDL rename it */
 #include "vkmin_plat.h"
@@ -174,6 +188,9 @@ void plat_input(plat_window *window, vkmin_inputs *out) {
     int key_count = 0;
     const bool *keys = SDL_GetKeyboardState(&key_count);
     if (focused && keys) {
+        /* Two independent bounds, both needed: the clamp keeps the read inside
+         * plat_sdl_key, and the table's own guarantee that no entry reaches
+         * VKMIN_KEY_COUNT keeps the shift inside out->down. See vkmin_plat_sdl.h. */
         if (key_count > PLAT_SDL_SCANCODE_CAP) key_count = PLAT_SDL_SCANCODE_CAP;
         for (int sc = 0; sc < key_count; ++sc) {
             const int key = plat_sdl_key[sc];

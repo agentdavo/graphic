@@ -1,9 +1,14 @@
 /* vkmin_plat_sdl2.c -- SDL2 backend for vkmin_plat.h. The only file that knows SDL2 exists.
  *
  * A parallel implementation of vkmin_plat_glfw.c, not a replacement: exactly one
- * plat backend links into a binary, chosen by PLAT= in the Makefile. Behaviour is
- * matched to the GLFW backend deliberately, including the main-thread abort and
- * the per-window wheel accumulator, so switching backends changes no vkmin code.
+ * plat backend links into a binary, chosen by -DVKMIN_PLATFORM=sdl2 at CMake
+ * time. Behaviour is matched to the GLFW backend deliberately, including the
+ * main-thread abort and the per-window wheel accumulator, so switching backends
+ * changes no vkmin code.
+ *
+ * This file and vkmin_plat_sdl3.c are near-identical on purpose; see the header
+ * of that file for why they are not one file with #ifs, and for the list of
+ * API differences that would have to be interleaved if they were.
  *
  * Where SDL is global and GLFW is per-window -- the event queue, the keyboard,
  * the mouse -- the open windows are kept on a list and events are routed by SDL
@@ -173,6 +178,9 @@ void plat_input(plat_window *window, vkmin_inputs *out) {
     int key_count = 0;
     const Uint8 *keys = SDL_GetKeyboardState(&key_count);
     if (focused && keys) {
+        /* Two independent bounds, both needed: the clamp keeps the read inside
+         * plat_sdl_key, and the table's own guarantee that no entry reaches
+         * VKMIN_KEY_COUNT keeps the shift inside out->down. See vkmin_plat_sdl.h. */
         if (key_count > PLAT_SDL_SCANCODE_CAP) key_count = PLAT_SDL_SCANCODE_CAP;
         for (int sc = 0; sc < key_count; ++sc) {
             const int key = plat_sdl_key[sc];

@@ -1,7 +1,13 @@
 /* vkmin_plat_common.h -- the bookkeeping every backend was repeating verbatim.
  *
+ * This is the accidental duplication among the four backends, extracted. What
+ * is left in each backend -- the same eight functions in the same order -- is
+ * the deliberate kind: they are parallel implementations of vkmin_plat.h, and
+ * folding them together behind #if would compromise all four.
+ *
  * Exactly one backend .c compiles into a binary, so this header can own the
- * shared state outright without any risk of colliding definitions.
+ * shared state outright without any risk of colliding definitions. That is also
+ * why file-static state is safe here and would not be in a normal header.
  *
  * Include it *after* the backend's own `struct plat_window`, which must carry a
  * `next` link; everything else about the struct is the backend's business.
@@ -27,7 +33,13 @@ static pthread_t owner_thread;
 
 /* Every window call has to come from the thread that opened the first window:
  * Win32 message queues and the GLFW and SDL event queues are all thread-owned,
- * and a cross-thread call fails far away from the mistake. Abort at the door. */
+ * and a cross-thread call fails far away from the mistake. Abort at the door.
+ *
+ * The `!window_count` escape is deliberate, not a hole. With no window open
+ * nothing is owned yet, so the check passes for any caller and the next
+ * plat_window_open claims ownership afresh -- a process may legitimately close
+ * everything on thread A and open the next window on thread B. It also lets
+ * plat_close and plat_poll be called after the last window is gone. */
 static inline void check_thread(void) {
 #ifdef _WIN32
     const bool same_thread = !window_count || owner_thread == GetCurrentThreadId();

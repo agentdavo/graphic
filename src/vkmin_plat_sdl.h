@@ -7,6 +7,31 @@
  * SDL3. Keeping them here rather than in each backend means a key that is wrong
  * is wrong in one place.
  *
+ * ---- read this before editing either table ---------------------------------
+ *
+ * These are DATA, and they are the one part of the platform layer with no
+ * failure mode. A wrong entry does not crash, warn, or fail to build. It
+ * silently reports the wrong key, or reports nothing at all, and the symptom
+ * surfaces as "the game does not respond to F5" long after the edit. Neither
+ * the compiler nor the Vulkan validation layer can see any of it.
+ *
+ * The three invariants an edit must preserve:
+ *
+ *   - Every value must be a GLFW key code, not an SDL one. The two agree by
+ *     accident on letters, digits and space (all ASCII) and on nothing else.
+ *   - Every value must be < VKMIN_KEY_COUNT (352). plat_input indexes
+ *     out->down[key / 32] with it and does not range-check, because the table
+ *     is the check. GLFW's highest code is 348 (MENU), so a correct entry is
+ *     always in range and an out-of-range entry is always a typo.
+ *   - 0 must keep meaning "not carried". plat_input tests `if (key && ...)`, so
+ *     an entry of 0 is a drop and cannot be a real key -- which is fine, since
+ *     GLFW has no key 0.
+ *
+ * The way to check an entry is to read GLFW's glfw3.h GLFW_KEY_* list against
+ * SDL's SDL_scancode.h, not to reason from the character on the keycap: SDL
+ * names its punctuation scancodes after US-layout positions, and so does GLFW,
+ * but they disagree about which ones exist.
+ *
  * Include after the SDL headers.
  */
 #ifndef VKMIN_PLAT_SDL_H
@@ -17,7 +42,10 @@
  * past what SDL actually filled. */
 #define PLAT_SDL_SCANCODE_CAP 512
 
-/* SDL scancode -> GLFW key code. 0 means "vkmin does not carry this key". */
+/* SDL scancode -> GLFW key code. 0 means "vkmin does not carry this key", which
+ * is every scancode not named below: media keys, international keys, F13 and up.
+ * Designated initialisers, so the rows are in GLFW-code order for reading and
+ * the SDL scancode order does not matter. */
 static const short plat_sdl_key[PLAT_SDL_SCANCODE_CAP] = {
     [SDL_SCANCODE_SPACE] = 32,       [SDL_SCANCODE_APOSTROPHE] = 39,
     [SDL_SCANCODE_COMMA] = 44,       [SDL_SCANCODE_MINUS] = 45,
@@ -72,10 +100,16 @@ static const short plat_sdl_key[PLAT_SDL_SCANCODE_CAP] = {
     [SDL_SCANCODE_APPLICATION] = 348,
 };
 
-/* SDL gamepad button index -> GLFW gamepad button index. The two disagree on
- * everything from BACK onwards. SDL2 and SDL3 number their own buttons the
- * same way, so this table serves both; each backend static-asserts that the
- * SDL enum it compiles against still matches the order assumed here. */
+/* SDL gamepad button index -> GLFW gamepad button index. Unlike the key table
+ * this one is positional: row N is SDL button N, so a row inserted in the wrong
+ * place shifts every button after it. The two APIs agree on A/B/X/Y and diverge
+ * from BACK onwards -- SDL orders the stick clicks before the shoulders, GLFW
+ * after, and they disagree about the D-pad's last three.
+ *
+ * SDL2 and SDL3 number their own buttons the same way, so this table serves
+ * both. Each backend then static-asserts four positions of the SDL enum it
+ * actually compiled against, which is the only automated check any of this has:
+ * it catches a renumbered SDL, not a mistyped row. */
 #define PLAT_SDL_PAD_BUTTONS 15
 static const unsigned char plat_sdl_pad_button[PLAT_SDL_PAD_BUTTONS] = {
     0,  /* SDL A/SOUTH        -> GLFW A */
@@ -96,7 +130,14 @@ static const unsigned char plat_sdl_pad_button[PLAT_SDL_PAD_BUTTONS] = {
 };
 
 /* SDL reports sticks over the full Sint16 range and triggers over 0..32767;
- * GLFW reports both in -1..1, with a released trigger reading -1. Pure. */
+ * GLFW reports both in -1..1, with a released trigger reading -1. Pure.
+ *
+ * The clamps are not defensive padding. Sint16 is asymmetric, so a stick pushed
+ * fully negative reads -32768 and divides to -1.000031 -- just outside the range
+ * vkmin_inputs documents, and enough to make a caller's `axis * axis` or an
+ * acosf() misbehave. Doing the divide and then clamping (rather than branching
+ * on the raw value first) is the execute-then-inhibit shape from CLAUDE.md
+ * section 3: one path, no skipped work. */
 static inline float plat_sdl_stick(int raw) {
     const float v = (float)raw / 32767.0f;
     return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);

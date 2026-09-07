@@ -2,10 +2,10 @@
  * between vkmin and the OS. The only file that knows Win32 windowing exists.
  *
  * A parallel implementation of vkmin_plat_glfw.c; exactly one plat backend links
- * into a binary, chosen by PLAT= in the Makefile. Behaviour is matched to the
- * GLFW backend deliberately -- the main-thread abort, the per-window wheel
- * accumulator, the GLFW key and gamepad numbering vkmin_inputs carries -- so
- * switching backends changes no vkmin code.
+ * into a binary, chosen by -DVKMIN_PLATFORM=win32 at CMake time. Behaviour is
+ * matched to the GLFW backend deliberately -- the main-thread abort, the
+ * per-window wheel accumulator, the GLFW key and gamepad numbering vkmin_inputs
+ * carries -- so switching backends changes no vkmin code.
  *
  * Nothing here is linked that a plain mingw/MSVC C program does not already
  * link: the window is user32, the surface comes from the Vulkan loader the rest
@@ -22,7 +22,7 @@
  * Neither key is named in vkmin.h's VKMIN_KEY_* set.
  */
 #ifndef _WIN32
-#error "vkmin_plat_win32.c is the Windows backend; use PLAT=glfw, sdl2 or sdl3 elsewhere"
+#error "vkmin_plat_win32.c is the Windows backend; use -DVKMIN_PLATFORM=glfw, sdl2 or sdl3 elsewhere"
 #endif
 
 #define WIN32_LEAN_AND_MEAN
@@ -39,7 +39,18 @@
 
 /* Win32 virtual key -> GLFW key code, which is what vkmin_inputs carries (see
  * the comment on VKMIN_KEY_COUNT in vkmin.h). 0 means "vkmin does not carry it".
- * Letters, digits and space are identity: their VK codes are already ASCII. */
+ * Letters, digits and space are identity: their VK codes are already ASCII.
+ *
+ * DATA, with the same silent failure mode as the SDL tables -- a wrong entry
+ * builds clean and reports the wrong key forever. The invariants are the same:
+ * every value is a GLFW code, every value is < VKMIN_KEY_COUNT (352), and 0 is
+ * reserved for "dropped" because plat_input tests `if (key && ...)`. The long
+ * version of the warning is in vkmin_plat_sdl.h.
+ *
+ * The VK_OEM_* rows are the ones to distrust: Windows names them by position on
+ * a US layout and their meaning changes with the keyboard layout, so VK_OEM_1
+ * is semicolon here and something else on a German keyboard. GLFW has the same
+ * problem and resolves it the same way, which is why the two agree in practice. */
 static const short plat_win32_key[256] = {
     [VK_BACK] = 259,     [VK_TAB] = 258,      [VK_RETURN] = 257,
     [VK_PAUSE] = 284,    [VK_CAPITAL] = 280,  [VK_ESCAPE] = 256,
@@ -74,8 +85,13 @@ static const short plat_win32_key[256] = {
     [VK_OEM_6] = 93,     [VK_OEM_7] = 39,
 };
 
-/* XInput button flag -> GLFW gamepad button index. GLFW's index 8 is GUIDE,
- * which public XInput does not report, so it is never set here. */
+/* XInput button flag -> GLFW gamepad button index. Flag-to-index rather than the
+ * SDL tables' index-to-index, because XInput packs its buttons as a bitfield in
+ * an order that is not GLFW's; pairing each flag with its destination means the
+ * row order here carries no meaning and a reordered row is harmless.
+ *
+ * GLFW's index 8 is GUIDE, which public XInput does not report, so it is never
+ * set here -- a genuine capability gap, not a missing row. */
 static const struct { WORD flag; unsigned char glfw; } plat_win32_pad[] = {
     { XINPUT_GAMEPAD_A, 0 },              { XINPUT_GAMEPAD_B, 1 },
     { XINPUT_GAMEPAD_X, 2 },              { XINPUT_GAMEPAD_Y, 3 },
@@ -317,7 +333,12 @@ void plat_input(plat_window *window, vkmin_inputs *out) {
 
     XINPUT_STATE state;
     if (read_pad(&state)) {
-        /* GLFW's own XInput normalisation, so the two backends agree bit for bit. */
+        /* GLFW's own XInput normalisation, copied so the two backends agree bit
+         * for bit rather than merely closely. Three things are load-bearing:
+         * the +0.5 and 32767.5 make Sint16's asymmetric range map onto exactly
+         * -1..1 with no clamp needed; the Y negation is because XInput calls up
+         * positive and vkmin_inputs calls down positive; and the triggers are
+         * bytes (0..255), so 127.5 rescales them to -1..1 with released at -1. */
         out->axes[0] = ((float)state.Gamepad.sThumbLX + 0.5f) / 32767.5f;
         out->axes[1] = -((float)state.Gamepad.sThumbLY + 0.5f) / 32767.5f;
         out->axes[2] = ((float)state.Gamepad.sThumbRX + 0.5f) / 32767.5f;
