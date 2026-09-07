@@ -322,6 +322,16 @@ target_include_directories(scene PRIVATE demo)
 target_compile_options(scene PRIVATE ${VKMIN_FP_EXACT})
 target_link_libraries(scene PRIVATE vkmin_flags render vkmin)
 
+# ------------------------------------------------------------- arena test ---
+# The suballocator hands out ranges inside one device allocation, so a mistake
+# there does not fault: two live resources overlap and quietly corrupt each
+# other, and no validation layer can see it. It reads only offsets and sizes,
+# never a Vulkan entry point, so this runs with no instance, no device and no
+# driver -- the one check in the tree that needs no GPU at all.
+add_executable(test_arena tools/test_arena.c)
+target_include_directories(test_arena PRIVATE src)
+target_link_libraries(test_arena PRIVATE vkmin_flags Vulkan::Vulkan)
+
 # ----------------------------------------------------------------- replay ---
 # A journal replays into a different code path than the one that recorded it,
 # but a replaying context is driven by vkmin_replay rather than the host's own

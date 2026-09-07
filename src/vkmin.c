@@ -1023,53 +1023,7 @@ static uint32_t find_memory_type(const vkmin_ctx *c, uint32_t type_bits,
     VKMIN_FAIL("no memory type with properties 0x%x", want);
 }
 
-static VkDeviceSize align_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) & ~(a - 1); }
-
-/* Address-ordered reusable holes. The high-water cursor never moves backwards:
- * old journals retain their original monotonic offsets and device_used meaning. */
-static void arena_release(arena *a, VkDeviceSize offset, VkDeviceSize size) {
-    VKMIN_ASSERT(size && offset <= a->used && size <= a->used - offset, "invalid arena release");
-    uint32_t at = 0;
-    while (at < a->free_count && a->free_ranges[at].offset < offset) ++at;
-    VKMIN_ASSERT(at == 0 || a->free_ranges[at-1].offset + a->free_ranges[at-1].size <= offset, "arena overlap");
-    VKMIN_ASSERT(at == a->free_count || offset + size <= a->free_ranges[at].offset, "arena overlap");
-    if (at && a->free_ranges[at-1].offset + a->free_ranges[at-1].size == offset) {
-        --at; a->free_ranges[at].size += size;
-    } else {
-        VKMIN_ASSERT(a->free_count < VKMIN_MAX_RANGES, "arena metadata exhausted");
-        memmove(&a->free_ranges[at+1], &a->free_ranges[at], (a->free_count-at)*sizeof(arena_range));
-        a->free_ranges[at] = (arena_range){offset,size}; ++a->free_count;
-    }
-    if (at+1 < a->free_count && a->free_ranges[at].offset + a->free_ranges[at].size == a->free_ranges[at+1].offset) {
-        a->free_ranges[at].size += a->free_ranges[at+1].size;
-        memmove(&a->free_ranges[at+1], &a->free_ranges[at+2], (a->free_count-at-2)*sizeof(arena_range));
-        --a->free_count;
-    }
-}
-
-static bool arena_try_alloc(arena *a, VkDeviceSize size, VkDeviceSize alignment, bool reuse, VkDeviceSize *result) {
-    VKMIN_ASSERT(size && alignment && !(alignment & (alignment-1)), "invalid arena allocation");
-    if (reuse) for (uint32_t i = 0; i < a->free_count; ++i) {
-        const arena_range r = a->free_ranges[i];
-        if (r.offset > UINT64_MAX-(alignment-1)) continue;
-        const VkDeviceSize off = align_up(r.offset, alignment), padding = off-r.offset;
-        /* A free tail can grow into virgin space without moving any allocation. */
-        const VkDeviceSize available = r.offset+r.size == a->used ? a->cap-r.offset : r.size;
-        if (padding > available || size > available-padding) continue;
-        memmove(&a->free_ranges[i], &a->free_ranges[i+1], (--a->free_count-i)*sizeof(arena_range));
-        if (off+size > a->used) a->used = off+size;
-        if (padding) arena_release(a, r.offset, padding);
-        if (padding < r.size && size < r.size-padding) arena_release(a, off+size, r.size-padding-size);
-        a->live += size; *result = off; return true;
-    }
-    if (a->used > UINT64_MAX-(alignment-1)) return false;
-    const VkDeviceSize off = align_up(a->used, alignment);
-    if (off > a->cap || size > a->cap-off) return false;
-    const VkDeviceSize previous = a->used;
-    a->used = off+size; a->live += size;
-    if (reuse && off > previous) arena_release(a, previous, off-previous);
-    *result = off; return true;
-}
+#include "vkmin_arena.h"   /* align_up, arena_release, arena_try_alloc */
 
 static void timeline_wait(vkmin_ctx *, uint64_t);
 
