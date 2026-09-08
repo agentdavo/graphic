@@ -3,10 +3,10 @@
  * Everything here is a pure function of its arguments: no context, no Vulkan
  * call, no state. That is why it is in a header rather than buried as static
  * code in vkmin.c -- a test can include it and drive it directly, which is
- * section 5's "split out the finicky bit and test it" applied to the two
- * places where a wrong answer is silent rather than loud.
+ * section 5's "split out the finicky bit and test it" applied to decisions
+ * and arithmetic whose errors otherwise surface far from their source.
  *
- * Neither of these is checked by anything else:
+ * The path and format decisions include:
  *
  *  - choose_path decides the 1.4-or-1.3 question described at vkmin_path in
  *    vkmin.h. Getting it wrong does not crash; it silently runs the wrong one
@@ -25,6 +25,28 @@
  */
 #ifndef VKMIN_PURE_H
 #define VKMIN_PURE_H
+
+/* A Vulkan buffer covers the entire arena, so only vkmin can enforce the
+ * smaller logical resource/slot bounds. Subtract after bounding the offset;
+ * offset+bytes can wrap and accidentally pass an addition-based test. */
+static bool vkm_range_fits(uint64_t capacity, uint64_t offset, uint64_t bytes) {
+    return offset <= capacity && bytes <= capacity-offset;
+}
+
+/* Decimal CLI input without atoi's silent zero, truncation or overflow.
+ * end names the first unconsumed character; callers decide which delimiters fit. */
+typedef struct { uint32_t value; const char *end; bool valid; } vkm_decimal;
+static vkm_decimal vkm_parse_decimal(const char *text, uint32_t limit) {
+    vkm_decimal result = {.end = text};
+    if (!text || *text < '0' || *text > '9') return result;
+    uint32_t value = 0;
+    while (*text >= '0' && *text <= '9') {
+        const uint32_t digit = (uint32_t)(*text-'0');
+        if (value > limit/10 || (value == limit/10 && digit > limit%10)) return result;
+        value = value*10+digit; ++text;
+    }
+    return (vkm_decimal){value, text, true};
+}
 
 /* --------------------------------------------------------------- path -- */
 

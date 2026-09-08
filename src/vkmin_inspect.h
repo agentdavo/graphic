@@ -1,6 +1,23 @@
 /* Private diagnostic implementation, included after frame submission helpers.
  * Inspection is opt-in: temporary staging allocations never enter the journal.
  * Raw files retain exact texels; tools/inspect_frame.py supplies previews. */
+/* Address candidates are explicitly labelled: untyped push bytes cannot prove a
+ * shader read. Logical identities survive independent replay address spaces. */
+static void inspect_push_refs(const vkmin_ctx *c, FILE *out, const uint8_t *data, uint32_t bytes) {
+    fprintf(out, " refs=");
+    for (uint32_t off = 0; off + 8 <= bytes; off += 8) {
+        uint64_t address; memcpy(&address, data + off, 8);
+        for (uint32_t i = 0; i < VKMIN_MAX_BUFFERS; ++i) {
+            const buffer_slot *b = &c->buffers[i];
+            const uint64_t base = c->arena_addr + b->offset;
+            if (b->used && address >= base && address - base < b->size)
+                fprintf(out, "%u:buffer:%u:%llu,", off, handle_make(i, b->gen), (unsigned long long)(address-base));
+        }
+        if (address >= c->ring_addr && address - c->ring_addr < c->ring_cap)
+            fprintf(out, "%u:ring:0:%llu,", off, (unsigned long long)(address-c->ring_addr));
+    }
+}
+
 static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
                           const record_header *rh, const uint8_t *hdr, const uint8_t *data) {
     /* Indexed by the opcode itself, from the same list that declares the enum,
@@ -27,14 +44,15 @@ static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
     fprintf(out, "%u\t%u\t%s\t", event, frame, names[op]);
     if (rh->op == OP_PASS_BEGIN && rh->hdr_bytes >= sizeof(rec_pass)) {
         rec_pass r; memcpy(&r, hdr, sizeof r);
-        fprintf(out, "color=%u depth=%u extra=%u,%u area=%d,%d,%d,%d", r.color, r.depth,
-                r.extra[0], r.extra[1], r.x, r.y, r.w, r.h);
-        if (rh->hdr_bytes == sizeof(rec_named_pass)) {
-            rec_named_pass n; memcpy(&n, hdr, sizeof n);
+        fprintf(out, "color=%u depth=%u extra=%u,%u clear_color=%u clear_depth=%u area=%d,%d,%d,%d", r.color, r.depth,
+                r.extra[0], r.extra[1], (unsigned)r.clear_color, (unsigned)r.clear_depth, r.x, r.y, r.w, r.h);
+        if (rh->hdr_bytes == sizeof(rec_named_pass) || rh->hdr_bytes == REC_PASS_OLD) {
+            rec_named_pass n = {0}; memcpy(&n, hdr, rh->hdr_bytes);
             for (size_t i = 0; i < sizeof n.label; ++i) {
                 if ((unsigned char)n.label[i] < 32 && n.label[i]) n.label[i] = ' ';
             }
-            fprintf(out, " label=%.*s", (int)sizeof n.label, n.label);
+            fprintf(out, " label=%.*s resolves=%u,%u,%u,%u depth_mode=%u raster_samples=%u", (int)sizeof n.label, n.label,
+                    n.resolves[0], n.resolves[1], n.resolves[2], n.resolves[3], n.depth_mode, n.raster_samples);
         }
     } else if ((rh->op == OP_DRAW || rh->op == OP_DISPATCH) && rh->hdr_bytes == sizeof(rec_draw)) {
         rec_draw r; memcpy(&r, hdr, sizeof r);
@@ -45,12 +63,18 @@ static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
         if (r.push_bytes == rh->data_bytes && r.push_bytes <= VKMIN_PUSH_BYTES) {
             fprintf(out, " push_hex=");
             for (uint32_t i = 0; i < r.push_bytes; ++i) fprintf(out, "%02x", (unsigned)data[i]);
+            inspect_push_refs(c, out, data, r.push_bytes);
         }
     } else if (rh->op == OP_DRAW_INDIRECT && rh->hdr_bytes == sizeof(rec_indirect)) {
         rec_indirect r; memcpy(&r, hdr, sizeof r);
-        fprintf(out, "pipeline=%u indices=%u commands=%u offset=%llu counts=%u offset=%llu max=%u push_bytes=%u",
+        fprintf(out, "pipeline=%u indices=%u commands=%u command_offset=%llu counts=%u count_offset=%llu max=%u push_bytes=%u",
                 r.pipe, r.indices, r.cmds, (unsigned long long)r.cmd_offset, r.counts,
                 (unsigned long long)r.count_offset, r.max_draws, r.push_bytes);
+        if (r.push_bytes + 8u == rh->data_bytes && r.push_bytes <= VKMIN_PUSH_BYTES) {
+            fprintf(out, " push_hex=");
+            for (uint32_t i = 0; i < r.push_bytes; ++i) fprintf(out, "%02x", (unsigned)data[i]);
+            inspect_push_refs(c, out, data, r.push_bytes);
+        }
     } else if (rh->op == OP_BARRIER && rh->hdr_bytes == sizeof(rec_barrier)) {
         rec_barrier r; memcpy(&r, hdr, sizeof r);
         fprintf(out, "flags=%u images=%u", r.flags, r.image_count);
@@ -60,16 +84,19 @@ static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
                 fprintf(out, " image=%u use=%u", t.image.id, (unsigned)t.use);
             }
         }
-    } else if ((rh->op == OP_MAKE_PIPELINE || rh->op == OP_REPLACE_PIPELINE) && rh->hdr_bytes == sizeof(rec_pipe)) {
-        rec_pipe r; memcpy(&r, hdr, sizeof r);
+    } else if ((rh->op == OP_MAKE_PIPELINE || rh->op == OP_REPLACE_PIPELINE) && (rh->hdr_bytes == sizeof(rec_pipe) || rh->hdr_bytes == REC_PIPE_OLD)) {
+        rec_pipe r = {0}; memcpy(&r, hdr, rh->hdr_bytes);
         fprintf(out, "pipeline=%u push_bytes=%u shaders=%u,%u,%u label=%.*s", r.result, r.push_size,
                 r.vs_bytes, r.fs_bytes, r.cs_bytes, VKMIN_LABEL, r.label);
+        fprintf(out, " samples=%u alpha_to_coverage=%u depth_test=%u depth_attachment=%u", r.samples ? r.samples : 1, r.alpha_to_coverage, r.depth & 1u,
+                (unsigned)((r.depth & 1u) || (c->journal_version < 8 ? r.color_format == VKMIN_FMT_RGBA8_UNORM : (r.depth & 2u) != 0)));
     } else if (rh->op == OP_MAKE_BUFFER && rh->hdr_bytes == sizeof(rec_buffer)) {
         rec_buffer r; memcpy(&r, hdr, sizeof r);
         fprintf(out, "buffer=%u bytes=%llu label=%.*s", r.result, (unsigned long long)r.size, VKMIN_LABEL, r.label);
-    } else if (rh->op == OP_MAKE_IMAGE && rh->hdr_bytes == sizeof(rec_image)) {
-        rec_image r; memcpy(&r, hdr, sizeof r);
+    } else if (rh->op == OP_MAKE_IMAGE && (rh->hdr_bytes == sizeof(rec_image) || rh->hdr_bytes == REC_IMAGE_OLD)) {
+        rec_image r = {0}; memcpy(&r, hdr, rh->hdr_bytes);
         fprintf(out, "image=%u size=%dx%d format=%u label=%.*s", r.result, r.w, r.h, r.format, VKMIN_LABEL, r.label);
+        fprintf(out, " samples=%u render_to_single=%u", r.samples ? r.samples : 1, r.to_single);
     } else if ((rh->op == OP_BUFFER_UPLOAD || rh->op == OP_IMAGE_UPLOAD || rh->op == OP_RING_ALLOC || rh->op == OP_FRAME_END)
                && rh->hdr_bytes == sizeof(rec_upload)) {
         rec_upload r; memcpy(&r, hdr, sizeof r);
@@ -94,13 +121,75 @@ static void inspect_event(const vkmin_ctx *c, FILE *out, uint32_t event,
     fprintf(out, " header_bytes=%u data_bytes=%u relocations=%u\n", rh->hdr_bytes, rh->data_bytes, rh->reloc_count);
 }
 
+static bool inspect_buffers(vkmin_ctx *c, const char *directory) {
+    char path[1024];
+    int n = snprintf(path, sizeof path, "%s/buffers.tsv", directory);
+    FILE *manifest = n >= 0 && (size_t)n < sizeof path ? fopen(path, "w") : NULL;
+    if (!manifest) return false;
+    fprintf(manifest, "id\tkind\tlabel\toffset\tsize\tfile\n");
+    bool ok = true;
+    for (uint32_t i = 0; i <= VKMIN_MAX_BUFFERS && ok; ++i) {
+        const bool ring = i == VKMIN_MAX_BUFFERS;
+        const buffer_slot *b = ring ? NULL : &c->buffers[i];
+        if (!ring && !b->used) continue;
+        const VkDeviceSize offset = ring ? c->last_slot*c->ring_region : b->offset;
+        const VkDeviceSize size = ring ? c->ring_head[c->last_slot] : b->size;
+        if (!size) continue;
+        const uint32_t id = ring ? 0 : handle_make(i, b->gen);
+        char label[VKMIN_LABEL]; snprintf(label, sizeof label, "%s", ring ? "frame ring" : b->label);
+        for (size_t j = 0; j < sizeof label; ++j) if (label[j] && (unsigned char)label[j] < 32) label[j] = ' ';
+        /* A large resource is explicit in the manifest, never silently truncated. */
+        fprintf(manifest, "%u\t%s\t%s\t%llu\t%llu\t", id, ring ? "ring" : "buffer", label,
+                (unsigned long long)(ring ? offset : 0), (unsigned long long)size);
+        if (size > (64u << 20)) { fprintf(manifest, "\n"); continue; }
+        VkBuffer staging = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+        create_backing_buffer(c, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &memory, NULL, "inspection.buffer");
+        const VkCommandBuffer cmd = imm_begin(c);
+        VkMemoryBarrier2 barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+        const VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &barrier};
+        vkCmdPipelineBarrier2(cmd, &dep);
+        const VkBufferCopy region = {.srcOffset = offset, .size = size};
+        vkCmdCopyBuffer(cmd, ring ? c->ring_buf : c->arena_buf, staging, 1, &region);
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        vkCmdPipelineBarrier2(cmd, &dep); imm_end(c);
+        void *mapped = NULL; VK_CHECK_CTX(c, vkMapMemory(c->dev, memory, 0, size, 0, &mapped));
+        n = snprintf(path, sizeof path, "%s/buffer_%u.raw", directory, i);
+        FILE *file = n >= 0 && (size_t)n < sizeof path ? fopen(path, "wb") : NULL;
+        if (file) { ok = fwrite(mapped, 1, (size_t)size, file) == (size_t)size; if (fclose(file)) ok = false; }
+        else ok = false;
+        vkUnmapMemory(c->dev, memory); vkDestroyBuffer(c->dev, staging, NULL); vkFreeMemory(c->dev, memory, NULL);
+        fprintf(manifest, "buffer_%u.raw\n", i);
+    }
+    if (ferror(manifest)) ok = false;
+    if (fclose(manifest)) ok = false;
+    n = snprintf(path, sizeof path, "%s/device.tsv", directory);
+    FILE *device = n >= 0 && (size_t)n < sizeof path ? fopen(path, "w") : NULL;
+    if (!device) return false;
+    VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver};
+    vkGetPhysicalDeviceProperties2(c->phys, &props);
+    fprintf(device, "device\tvendor_id\tdevice_id\tapi_version\tdriver_version\tdriver_name\tdriver_info\tbuild\n");
+    fprintf(device, "%s\t%u\t%u\t%u\t%u\t%s\t%s\t%s\n", props.properties.deviceName,
+        props.properties.vendorID, props.properties.deviceID, props.properties.apiVersion,
+        props.properties.driverVersion, driver.driverName, driver.driverInfo, c->debug ? "Debug" : "Release");
+    if (ferror(device)) ok = false;
+    if (fclose(device)) ok = false;
+    return ok;
+}
+
 static bool inspect_images(vkmin_ctx *c, const char *directory) {
     char path[1024];
     int n = snprintf(path, sizeof path, "%s/images.tsv", directory);
     if (n < 0 || (size_t)n >= sizeof path) return false;
     FILE *manifest = fopen(path, "w");
     if (!manifest) return false; /* Caller creates the directory. */
-    fprintf(manifest, "slot\tlabel\twidth\theight\tformat\tfile\n");
+    fprintf(manifest, "slot\tlabel\twidth\theight\tformat\tfile\tid\tsamples\n");
     timeline_wait(c, c->timeline_value);
     bool ok = true;
     for (uint32_t i = 0; i < VKMIN_MAX_IMAGES && ok; ++i) {
@@ -113,6 +202,15 @@ static bool inspect_images(vkmin_ctx *c, const char *directory) {
             if (candidate.vk == s->format) { fi = candidate; format = k; break; }
         }
         if (format < 0 || fi.block_dim != 1) { ok = false; break; }
+        char label[VKMIN_LABEL]; memcpy(label, s->label, sizeof label);
+        for (size_t j = 0; j < sizeof label; ++j) if ((unsigned char)label[j] < 32 && label[j]) label[j] = ' ';
+        if (s->samples > 1) {
+            /* Vulkan forbids image-to-buffer copies of multisample images.
+             * Expose their identity without pretending resolved bytes are samples. */
+            fprintf(manifest, "%u\t%.*s\t%u\t%u\t%d\t\t%u\t%u\n", i, VKMIN_LABEL, label,
+                    s->w, s->h, format, handle_make(i, s->gen), s->samples);
+            continue;
+        }
         const size_t bytes = mip_bytes(fi, s->w, s->h);
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -141,9 +239,8 @@ static bool inspect_images(vkmin_ctx *c, const char *directory) {
         vkUnmapMemory(c->dev, memory);
         vkDestroyBuffer(c->dev, buffer, NULL);
         vkFreeMemory(c->dev, memory, NULL);
-        char label[VKMIN_LABEL]; memcpy(label, s->label, sizeof label);
-        for (size_t j = 0; j < sizeof label; ++j) if ((unsigned char)label[j] < 32 && label[j]) label[j] = ' ';
-        fprintf(manifest, "%u\t%.*s\t%u\t%u\t%d\timage_%u.raw\n", i, VKMIN_LABEL, label, s->w, s->h, format, i);
+
+        fprintf(manifest, "%u\t%.*s\t%u\t%u\t%d\timage_%u.raw\t%u\t1\n", i, VKMIN_LABEL, label, s->w, s->h, format, i, handle_make(i, s->gen));
     }
     if (ferror(manifest)) ok = false;
     if (fclose(manifest)) ok = false;
@@ -151,5 +248,5 @@ static bool inspect_images(vkmin_ctx *c, const char *directory) {
     FILE *resources = n >= 0 && (size_t)n < sizeof path ? fopen(path, "w") : NULL;
     if (resources) { vkmin_dump(c, resources); if (fclose(resources)) ok = false; }
     else ok = false;
-    return ok;
+    return ok && inspect_buffers(c, directory);
 }

@@ -20,6 +20,9 @@ vm.runInNewContext(fs.readFileSync(__dirname+'/app.js','utf8'),context);
   ids.get('allowDifferent').checked=true;await ids.get('firstDifference').onclick();
   assert.match(ids.get('differenceResult').textContent,/32, 0/);assert.match(ids.get('differenceResult').textContent,/1024 texels/);
   assert.match(ids.get('pixelReadout').textContent,/A: 255, 0, 0, 255/);assert.match(ids.get('pixelReadout').textContent,/B: 128, 0, 0, 255/);
+  ids.get('bufferType').value='u32';ids.get('bufferCount').value='1';ids.get('bufferOffset').value='0';ids.get('bufferStride').value='0';
+  await ids.get('readBuffer').onclick();assert.match(ids.get('bufferReadout').textContent,/u32=255/);assert.match(ids.get('bufferReadout').textContent,/u32=128/);
+  ids.get('numeric').checked=true;ids.get('absolute').value='128';await ids.get('firstDifference').onclick();assert.match(ids.get('differenceResult').textContent,/Match within numeric tolerance/);ids.get('numeric').checked=false;
   const draw=nodes.find(n=>n.dataset.event===15);assert.ok(draw);await draw.onclick();
   assert.equal(ids.get('image').hidden,true,'uncaptured event must clear viewport');
   assert.equal(ids.get('uncaptured').hidden,false);assert.match(ids.get('push').textContent,/gain \(u32 @ 12\): 255/);assert.match(ids.get('push').textContent,/gain: 128/);
@@ -29,8 +32,8 @@ vm.runInNewContext(fs.readFileSync(__dirname+'/app.js','utf8'),context);
   // Exercise the same File interface used by the directory picker.
   const file=(path,content)=>({webkitRelativePath:'capture/'+path,text:async()=>content,arrayBuffer:async()=>{const b=Buffer.from(content,'base64');return b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength);}});
   const a=boot.a,files=[file('capture.json',JSON.stringify(a.meta)),file('events.tsv','event\tframe\top\tdetail\n'+a.events.map(e=>[e.event,e.frame,e.op,e.detail].join('\t')).join('\n'))];
-  for(const p of a.points){files.push(file(p.dir+'/images.json',JSON.stringify(p.images)));for(const image of p.images)files.push(file(p.dir+'/'+image.file,a.assets[image.data]));}
-  await ids.get('openA').onchange({target:{files}});assert.equal(ids.get('image').hidden,false);assert.match(ids.get('captureName').textContent,/capture/);
+  for(const p of a.points){files.push(file(p.dir+'/images.json',JSON.stringify(p.images)));files.push(file(p.dir+'/buffers.json',JSON.stringify(p.buffers||[])));for(const image of [...p.images,...(p.buffers||[])])files.push(file(p.dir+'/'+image.file,a.assets[image.data]));}
+  await ids.get('openA').onchange({target:{files}});assert.equal(ids.get('image').hidden,false);assert.match(ids.get('captureName').textContent,/capture/);await ids.get('readBuffer').onclick();assert.match(ids.get('bufferReadout').textContent,/u32=255/);
   const raw=files.find(f=>f.webkitRelativePath==='capture/complete/'+a.points.at(-1).images[0].file);raw.arrayBuffer=async()=>new ArrayBuffer(1);
   await ids.get('openA').onchange({target:{files}});assert.equal(ids.get('image').hidden,true);assert.match(ids.get('empty').children[0].textContent,/Truncated/);assert.match(ids.get('status').textContent,/Truncated/);
   console.log('Embedded boot, folder loading, comparison consent, first divergence, raw A/B values, typed push layout, uncaptured events, truncated images and bounds checks passed.');

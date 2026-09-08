@@ -3,7 +3,7 @@
   'use strict';
   const C=InspectorCore,$=id=>document.getElementById(id);
   let A=null,B=null,current=null,selectedEvent=null,slot=null,rawA=null,rawB=null,imageA=null,imageB=null;
-  let schemas={},version=0,zoom=1,panX=0,panY=0,pinned=false,drag=null,lastDiff=null;
+  let history=[],schemas={},version=0,zoom=1,panX=0,panY=0,pinned=false,drag=null,lastDiff=null;
   const cache=new WeakMap();
   const message=(text,error=false)=>{$('status').textContent=text;$('status').classList.toggle('error',error);};
   const attempt=fn=>async(...args)=>{try{await fn(...args);}catch(e){message(e.message,true);}};
@@ -17,19 +17,22 @@
     const points=[];for(const [event,name] of meta.checkpoints){const dir=event===null?'complete':`event_${String(event).padStart(6,'0')}`;let images=[],error=null;
       try{images=JSON.parse(await text(dir+'/images.json'));if(!Array.isArray(images))throw Error('Invalid image list');}catch(e){error=e.message;}
       const metricsText=await text(dir+'/metrics.json',true);let metrics=null;try{metrics=metricsText?JSON.parse(metricsText):null;}catch{metrics={error:'Malformed metrics.json'};}
-      points.push({event,label:name,dir,images,error,resources:await text(dir+'/resources.txt',true),metrics});
+      const bufferText=await text(dir+'/buffers.json',true);
+      points.push({event,label:name,dir,images,error,buffers:bufferText?JSON.parse(bufferText):[],resources:await text(dir+'/resources.txt',true),metrics});
     }
     const schemaText=await text('push-schema.json',true);
     return {meta,points,events:C.trace(await text('events.tsv')),schemas:schemaText?JSON.parse(schemaText):{},name:files[0].webkitRelativePath.split('/')[0],
       async raw(point,image){const path=pathSafe(point.dir+'/'+pathSafe(image.file)),file=map.get(path);if(!file)throw Error('Missing raw attachment: '+path);return new Uint8Array(await file.arrayBuffer());}};
   }
   function fromBundle(data){checkCapture(data.meta);return {...data,async raw(point,image){if(image.error)throw Error(image.error);const encoded=data.assets[image.data];if(typeof encoded!=='string')throw Error('Missing embedded raw attachment');return Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));}};}
-  async function bytes(capture,point,image){let map=cache.get(capture);if(!map){map=new Map();cache.set(capture,map);}const key=point.dir+'/'+image.file;if(!map.has(key))map.set(key,capture.raw(point,image));const b=await map.get(key);C.validate(image,b);return b;}
+  async function bytes(capture,point,image){if(image.error)throw Error(image.error);let map=cache.get(capture);if(!map){map=new Map();cache.set(capture,map);}const key=point.dir+'/'+image.file;if(!map.has(key))map.set(key,capture.raw(point,image));const b=await map.get(key);C.validate(image,b);return b;}
   function option(value,text){const o=document.createElement('option');o.value=value;o.textContent=text;return o;}
   async function refreshCapture(){
+    $('numeric').checked=!!A.meta.comparison?.numeric;$('absolute').value=A.meta.comparison?.absolute??0;$('relative').value=A.meta.comparison?.relative??0;
     version++;schemas=A.schemas||{};current=null;selectedEvent=null;slot=null;lastDiff=null;
     $('captureName').textContent=`${A.name} · frame ${A.meta.frame} · ${A.meta.path||'path unknown'}`;
     $('checkpoint').replaceChildren(...A.points.map((p,i)=>option(i,`${p.event??'End'} · ${label(p.label)}`)));
+    history=C.resourceHistory(A.events);$('historyResource').replaceChildren(...[...new Set(history.map(r=>r.kind+':'+r.id))].map(k=>option(k,k)));showHistory();
     buildTree();await choosePoint(A.points.length-1);
   }
   function buildTree(){
@@ -55,13 +58,14 @@
     $('eventTitle').textContent=event?`#${event.event} · ${event.op}`:'Complete frame';
     $('eventDetails').textContent=event?`Frame ${event.frame}\n`+Object.entries(C.fields(event.detail)).filter(([key])=>key!=='push_hex').map(([key,value])=>`${key}: ${value}`).join('\n'):'All recorded operations in this frame.';
     const f=event?C.fields(event.detail):{},schema=schemas[f.label]||schemas[f.pipeline];
+    showReferences(event);
     if(!f.push_hex){$('push').textContent='No push bytes recorded for this event.';return;}
     let result='A · '+f.push_hex.match(/.{1,8}/g).join(' ')+'\n';
     if(schema){try{result+=C.typedPush(f.push_hex,schema).map(x=>`${x.name} (${x.type} @ ${x.offset}): ${x.values.join(', ')}`).join('\n');}catch(e){result+='Schema error: '+e.message;}}
     else result+='No declared layout. Load a push schema to decode field values.';
     const other=B?.events.find(x=>x.event===event.event&&x.frame===event.frame),bf=other?C.fields(other.detail):{};
     if(bf.push_hex){result+='\n\nB · '+bf.push_hex.match(/.{1,8}/g).join(' ');const bs=(B.schemas||{})[bf.label]||schema;if(bs){try{result+='\n'+C.typedPush(bf.push_hex,bs).map(x=>`${x.name}: ${x.values.join(', ')}`).join('\n');}catch(e){result+='\nSchema error: '+e.message;}}}
-    $('push').textContent=result+'\n\nGPU addresses are process-specific. Referenced memory is not decoded here.';
+    $('push').textContent=result+'\n\nGPU addresses are process-specific. Candidate targets are linked below when their bytes were captured.';
   }
   function clearImage(reason){rawA=rawB=imageA=imageB=null;$('image').hidden=true;$('pixelMarker').hidden=true;$('empty').hidden=false;$('empty').replaceChildren(document.createTextNode(reason));$('imageInfo').textContent='No attachment';$('pixelReadout').textContent='No raw data selected.';}
   async function chooseEvent(event){
@@ -69,14 +73,15 @@
     if(i>=0){await choosePoint(i,false);return;}
     if(event.op==='frame_end'&&event.frame===A.meta.frame&&A.points.some(p=>p.event===null)){await choosePoint(A.points.findIndex(p=>p.event===null),false);return;}
     version++;current=null;$('checkpoint').selectedIndex=-1;$('attachment').replaceChildren();clearImage('No snapshot was captured after this event.');
-    $('uncaptured').hidden=false;$('resources').textContent='No resource snapshot at this event.';$('metrics').textContent='No measurement snapshot at this event.';
+    $('uncaptured').hidden=false;$('resources').textContent='No resource snapshot at this event.';$('metrics').textContent='No measurement snapshot at this event.';$('buffer').replaceChildren();$('bufferReadout').textContent='No buffer snapshot at this event.';
     $('captureCommand').textContent=`inspect_frame.py JOURNAL --replay REPLAY_EXE --frame ${event.frame} --event ${event.event} --out NEW_DIRECTORY --workbench`;
   }
   async function choosePoint(index,updateDetails=true){
     if(!A)return;const p=A.points[index];if(!p)return;version++;clearImage('Loading checkpoint…');current=p;$('checkpoint').value=index;$('uncaptured').hidden=true;
     if(updateDetails)details(A.events.find(e=>e.event===p.event)||null);
-    $('resources').textContent=`Journal: ${A.meta.journal}\nSHA-256: ${A.meta.sha256}\nPath: ${A.meta.path||'unknown'}\nDevice / build: not recorded in capture metadata\n\n`+(p.resources||'Resource snapshot unavailable.');
+    $('resources').textContent=`Journal: ${A.meta.journal}\nSHA-256: ${A.meta.sha256}\nPath: ${A.meta.path||'unknown'}\nReplay environment: ${JSON.stringify(A.meta.metadata||'not recorded',null,2)}\n\n`+(p.resources||'Resource snapshot unavailable.');
     $('metrics').textContent=p.metrics?'Inspection run — not a normal-frame benchmark\nCPU and GPU elapsed times overlap.\n'+JSON.stringify(p.metrics,null,2):'Metrics unavailable.';
+    $('buffer').replaceChildren(...(p.buffers||[]).map((b,i)=>option(i,`${b.kind} ${b.id} · ${b.label} · ${b.size} bytes`)));$('buffer').selectedIndex=0;$('buffer').value='0';$('bufferReadout').textContent='Select a type and decode captured bytes.';showReferences(selectedEvent);
     $('attachment').replaceChildren(...p.images.map(x=>option(x.slot,`${x.label} · ${x.width}×${x.height}`)));
     if(!p.images.some(x=>String(x.slot)===String(slot)))slot=p.images[0]?.slot;
     $('attachment').value=slot??'';await loadImage();
@@ -101,8 +106,8 @@
       let pixels=C.render(imageA,rawA,channel,ev);
       if(mode!=='a'){
         comparisonAllowed();if(!rawB)throw Error('Capture B has no matching raw attachment');
-        const al=C.layout(imageA),bl=C.layout(imageB);if(al.w!==bl.w||al.h!==bl.h||al.f!==bl.f)throw Error('Attachment layouts differ');
-        if(mode==='diff'){lastDiff=C.difference(imageA,rawA,imageB,rawB);pixels=lastDiff.mask;$('differenceResult').textContent=lastDiff.count+' differing texels';}
+        const al=C.layout(imageA),bl=C.layout(imageB);if((imageA.id&&imageB.id&&imageA.id!==imageB.id)||al.w!==bl.w||al.h!==bl.h||al.f!==bl.f)throw Error('Attachment layouts differ');
+        if(mode==='diff'){lastDiff=C.difference(imageA,rawA,imageB,rawB,tolerance());pixels=lastDiff.mask;$('differenceResult').textContent=lastDiff.count+' differing texels';}
         else {const b=C.render(imageB,rawB,channel,ev);if(mode==='b')pixels=b;else{const cut=Math.floor(canvas.width*Number($('wipe').value)/100);for(let y=0;y<canvas.height;y++)pixels.set(b.subarray((y*canvas.width+cut)*4,(y+1)*canvas.width*4),(y*canvas.width+cut)*4);}}
       }
       ctx.putImageData(new ImageData(pixels,canvas.width,canvas.height),0,0);canvas.hidden=false;$('empty').hidden=true;transform();
@@ -113,34 +118,65 @@
   function readPixel(x,y){
     if(!rawA)return;const a=C.pixel(imageA,rawA,x,y);$('pixelX').value=x;$('pixelY').value=y;
     let text=`(${x}, ${y})\nA: ${a.values.map(String).join(', ')}\nBytes: ${a.hex}`;
-    if(rawB){try{comparisonAllowed();const al=C.layout(imageA),bl=C.layout(imageB);if(al.w!==bl.w||al.h!==bl.h||al.f!==bl.f)throw Error('Attachment layouts differ');const b=C.pixel(imageB,rawB,x,y);text+=`\n\nB: ${b.values.map(String).join(', ')}\nBytes: ${b.hex}`;}catch(e){text+='\n\nB unavailable: '+e.message;}}
+    if(rawB){try{comparisonAllowed();const al=C.layout(imageA),bl=C.layout(imageB);if((imageA.id&&imageB.id&&imageA.id!==imageB.id)||al.w!==bl.w||al.h!==bl.h||al.f!==bl.f)throw Error('Attachment layouts differ');const b=C.pixel(imageB,rawB,x,y);text+=`\n\nB: ${b.values.map(String).join(', ')}\nBytes: ${b.hex}`;}catch(e){text+='\n\nB unavailable: '+e.message;}}
     $('pixelReadout').textContent=text;transform();
   }
   async function firstDifference(){
-    comparisonAllowed();$('differenceResult').textContent='Comparing raw checkpoints…';
+    comparisonAllowed();$('narrowCommand').textContent=`python tools/narrow_capture.py ${shellQuote(A.meta.capture_directory||'CAPTURE_A')} ${shellQuote(B.meta.capture_directory||'CAPTURE_B')} --out NEW_DIRECTORY`+($('numeric').checked?` --numeric --absolute ${Number($('absolute').value)} --relative ${Number($('relative').value)}`:'');$('differenceResult').textContent='Comparing raw checkpoints…';
     const sourceA=A,sourceB=B;for(let i=0;i<A.points.length;i++){
-      const a=A.points[i],b=B.points[i],key=x=>[String(x.slot),Number(x.width),Number(x.height),Number(x.format)];
+      const a=A.points[i],b=B.points[i],key=x=>[String(x.slot),x.id??null,Number(x.samples||1),Number(x.width),Number(x.height),Number(x.format)];
       if(a.error||b.error)throw Error(a.error||b.error);
       if(JSON.stringify(a.images.map(key))!==JSON.stringify(b.images.map(key)))throw Error(`Resource layouts differ at ${a.label}`);
       for(let j=0;j<a.images.length;j++){
-        const x=a.images[j],y=b.images[j],ab=await bytes(sourceA,a,x),bb=await bytes(sourceB,b,y);
-        if(A!==sourceA||B!==sourceB)return;const d=C.difference(x,ab,y,bb);
+        const x=a.images[j],y=b.images[j];if(Number(x.samples||1)>1)continue;const ab=await bytes(sourceA,a,x),bb=await bytes(sourceB,b,y);
+        if(A!==sourceA||B!==sourceB)return;const d=C.difference(x,ab,y,bb,tolerance());
         if(d.count){slot=x.slot;$('mode').value='diff';await choosePoint(i);readPixel(...d.first);pinned=true;panX=$('viewport').clientWidth/2-(d.first[0]+.5)*zoom;panY=$('viewport').clientHeight/2-(d.first[1]+.5)*zoom;transform();
           $('differenceResult').textContent=`First: event ${a.event??'End'} · ${x.label} · (${d.first.join(', ')}) · ${d.count} texels`;
           message('First differing captured checkpoint located. Capture individual events within this pass to narrow it further.');return;}
         await new Promise(resolve=>setTimeout(resolve,0));
       }
     }
-    $('differenceResult').textContent='Exact raw match across every captured checkpoint';message('All captured raw attachments match.');
+    $('differenceResult').textContent=($('numeric').checked?'Match within numeric tolerance across captured single-sample attachments':'Exact raw match across captured single-sample attachments');message($('numeric').checked?'Captured single-sample attachments match within numeric tolerance; unresolved MSAA samples are excluded.':'All captured single-sample attachments match; unresolved MSAA samples are excluded.');
   }
+  function shellQuote(value){return "'"+String(value).replaceAll("'","''")+"'";} // PowerShell literal, never executed by the viewer.
+  function tolerance(){return {numeric:$('numeric').checked,absolute:Number($('absolute').value),relative:Number($('relative').value)};}
+  function showHistory(){
+    const key=$('historyResource').value;$('history').replaceChildren();
+    for(const r of history.filter(x=>x.kind+':'+x.id===key)){
+      const b=document.createElement('button');b.textContent=`#${r.event} ${r.op}: ${r.access} (${r.evidence})`;
+      b.onclick=attempt(()=>chooseEvent(A.events.find(e=>e.event===r.event)));$('history').append(b);
+    }
+  }
+  function showReferences(event){
+    $('pushRefs').replaceChildren();if(!event)return;
+    const refs=C.references(event.detail),f=C.fields(event.detail);
+    if(event.op==='draw_indirect')for(const [key,offset,type] of [['commands','command_offset','indirect'],['counts','count_offset','u32'],['indices',null,'u32']])if(f[key])refs.push({kind:'buffer',id:f[key],offset:Number(f[offset]||0),type,label:key});
+    for(const ref of refs){const b=document.createElement('button');b.textContent=`${ref.label||'Address candidate @'+ref.pushOffset}: ${ref.kind} ${ref.id} +${ref.offset}`;
+      b.onclick=attempt(async()=>{if(!current)throw Error('Capture this event before following its memory references');const i=(current.buffers||[]).findIndex(x=>x.kind===ref.kind&&String(x.id)===ref.id);if(i<0)throw Error('Referenced resource was not captured');const buffer=current.buffers[i];$('buffer').value=i;$('bufferOffset').value=ref.offset-Number(buffer.offset||0);$('bufferType').value=ref.type||(schemas.$buffers?.[buffer.label]?'schema':'f32');$('bufferCount').value=1;$('bufferStride').value=0;await readBuffer();});$('pushRefs').append(b);
+    }
+  }
+  async function readBuffer(){
+    $('bufferReadout').textContent='Loading captured bytes…';
+    const point=current,source=A,b=point?.buffers?.[Number($('buffer').value)];if(!b)throw Error('No buffer snapshot selected');
+    if(b.error)throw Error(b.error);const size=Number(b.size);if(!Number.isSafeInteger(size)||size<1||size>64*1024*1024)throw Error('Invalid buffer size');
+    const raw=await source.raw(point,b);if(source!==A||point!==current)return;if(raw.length!==size)throw Error('Truncated or oversized raw buffer');
+    const offset=Number($('bufferOffset').value),schema=schemas.$buffers?.[b.label]||schemas.$buffers?.[b.id];
+    const rows=C.bufferRows(raw,offset,$('bufferType').value||'u32',Number($('bufferCount').value||'16'),Number($('bufferStride').value),schema);
+    $('historyResource').value=b.kind+':'+b.id;showHistory();
+    const format=(items,data)=>items.map(r=>`@${r.offset}: `+r.fields.map(f=>f.name+'='+f.values.join(', ')).join(' | ')).join('\n')+'\nBytes: '+Array.from(data.subarray(offset,offset+64),v=>v.toString(16).padStart(2,'0')).join(' ');
+    let result='A\n'+format(rows,raw);
+    if(B){try{comparisonAllowed();const other=B,p=other.points.find(x=>x.event===point.event),target=p?.buffers?.find(x=>x.kind===b.kind&&String(x.id)===String(b.id));if(!target||target.error||Number(target.size)!==size)throw Error('No compatible B buffer snapshot');const data=await other.raw(p,target);if(source!==A||point!==current||other!==B)return;if(data.length!==size)throw Error('Truncated B buffer');result+='\n\nB\n'+format(C.bufferRows(data,offset,$('bufferType').value||'u32',Number($('bufferCount').value||'16'),Number($('bufferStride').value),schema),data);}catch(e){result+='\n\nB unavailable: '+e.message;}}
+    $('bufferReadout').textContent=result;
+  }
+  $('readBuffer').onclick=attempt(readBuffer);$('buffer').onchange=()=>{$('bufferReadout').textContent='Selection changed. Decode to read this buffer.';};$('historyResource').onchange=showHistory;
   $('openA').onchange=attempt(async e=>{if(!e.target.files.length)return;const c=await fromFolder(e.target.files);A=c;B=null;$('mode').value='a';$('allowDifferent').checked=false;await refreshCapture();if(rawA)message('Capture A loaded. Select an event or attachment.');});
   $('openB').onchange=attempt(async e=>{if(!e.target.files.length)return;B=await fromFolder(e.target.files);if(!A){A=B;B=null;await refreshCapture();}else{details(selectedEvent);await loadImage();}message('Capture B loaded. Different recordings require explicit comparison consent.');});
   $('schema').onchange=attempt(async e=>{if(!e.target.files.length)return;schemas=JSON.parse(await e.target.files[0].text());if(!schemas||typeof schemas!=='object'||Array.isArray(schemas))throw Error('Schema must map pipeline labels to field arrays');details(selectedEvent);message('Push layout loaded. Values are decoded only for matching pipelines.');});
   $('search').oninput=()=>{if(A)buildTree();};$('checkpoint').onchange=attempt(e=>choosePoint(Number(e.target.value)));
-  $('attachment').onchange=attempt(e=>{slot=e.target.value;return loadImage();});
+  $('attachment').onchange=attempt(e=>{slot=e.target.value;const image=current?.images.find(x=>String(x.slot)===String(slot));if(image?.id){$('historyResource').value='image:'+image.id;showHistory();}return loadImage();});
   const step=attempt(async d=>{if(A)await choosePoint(Math.max(0,Math.min(A.points.length-1,A.points.indexOf(current)+d)));});
   $('previous').onclick=()=>step(-1);$('next').onclick=()=>step(1);
-  for(const id of ['mode','channel','exposure','wipe','allowDifferent'])$(id).oninput=attempt(()=>{draw();if(rawA)readPixel(Number($('pixelX').value),Number($('pixelY').value));});
+  for(const id of ['mode','channel','exposure','wipe','allowDifferent','numeric','absolute','relative'])$(id).oninput=attempt(()=>{draw();if(rawA)readPixel(Number($('pixelX').value),Number($('pixelY').value));});
   $('fit').onclick=fit;$('actual').onclick=()=>{zoom=1;panX=panY=16;transform();};$('inspectPixel').onclick=attempt(()=>{readPixel(Number($('pixelX').value),Number($('pixelY').value));pinned=true;});
   $('firstDifference').onclick=attempt(firstDifference);
   $('viewport').onwheel=e=>{if(!rawA)return;e.preventDefault();const r=$('viewport').getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,next=Math.max(.03,Math.min(64,zoom*Math.exp(-e.deltaY*.001)));panX=x-(x-panX)*next/zoom;panY=y-(y-panY)*next/zoom;zoom=next;transform();};

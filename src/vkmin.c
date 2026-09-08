@@ -1,8 +1,8 @@
 /* vkmin.c -- see vkmin.h. Vulkan 1.3 core; dynamic rendering, synchronization2,
  * buffer device address, descriptor indexing and drawIndirectCount are
- * required at init, never probed for. There is no VkRenderPass, no
- * VkFramebuffer, no VkPipelineVertexInputStateCreateInfo, and no
- * `if (extension_supported)` anywhere in this file.
+ * required and checked at init. Optional capabilities choose explicit legacy
+ * and modern paths. Dynamic rendering uses no VkRenderPass or VkFramebuffer;
+ * vertex input is empty because shaders fetch vertices by device address.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
@@ -10,11 +10,13 @@
 #include "vkmin.h"
 #include "vkmin_cvar.h"
 #include <math.h>
+#include <limits.h>
 #include "vkmin_plat.h"
 #include "vkmin_stb.h"
 #include "min_jrnl.h"
 
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -126,7 +128,8 @@ typedef struct {
     VkImageView view;
     VkFormat format;
     VkImageAspectFlags aspect;
-    uint32_t w, h, mips;
+    uint32_t w, h, mips, samples;
+    bool render_to_single_sampled;
     vkmin_use use;       /* what it was last transitioned for */
     bool layout_pending; /* modern path: uploaded into GENERAL, promised SAMPLED at the next frame begin */
     uint32_t tex_index;  /* bindless slot from vkmin_index, or UINT32_MAX */
@@ -145,6 +148,7 @@ typedef struct {
     vkmin_pipeline_desc desc;
     long mtime[3];
     uint32_t *loaded[3];
+    uint32_t push_offsets[VKMIN_PUSH_BYTES / 8];
     uint32_t push_size;  /* what every draw pushes; checked against the SPIR-V at creation */
 } pipe_slot;
 
@@ -174,6 +178,7 @@ typedef struct {
  * Everything else in this file is common to both. */
 typedef struct {
     bool host_image_copy, maintenance5, push_descriptor, pipeline_robustness, robust_buffer_access2;
+    bool render_to_single_sampled;
     /* Probed and reported only, never enabled: the measurements behind two
      * deferred designs, a descriptor heap and unified image layouts. */
     bool descriptor_buffer, unified_image_layouts;
@@ -281,6 +286,8 @@ struct vkmin_ctx {
     uint64_t rec_arena_base, rec_ring_base; /* bases in the recording being replayed */
     VkDeviceSize ring_issued[VKMIN_MAX_RING_ALLOCS]; /* ring offsets handed out this frame */
     int ring_issued_count;
+    uint32_t ring_fields[4096], ring_field_count;
+    bool record_heuristic;
     const char *record_path, *replay_path;
 
     /* Input: one snapshot a frame, taken in frame_begin and read nowhere else.
@@ -294,7 +301,8 @@ struct vkmin_ctx {
     VkCommandBuffer imm_cmd;
 
     /* Memory: one device arena backing one buffer, one device arena for
-     * images, one persistently mapped host ring. Bump allocated, never freed. */
+     * images, one persistently mapped host ring. Freed arena ranges return
+     * after their submission timeline completes. */
     arena buf_arena;
     VkBuffer arena_buf;
     VkDeviceAddress arena_addr;
@@ -481,36 +489,67 @@ enum {
 };
 /* Replay tests opcode membership with a uint32_t bitmask; see payload_ops. */
 _Static_assert(OP_COUNT <= 32, "opcode set must fit a uint32_t bitmask");
-enum { JOURNAL_VERSION = 6 }; /* v6 logical buffer relocation and descriptor reuse; reads v3-v5 */
-enum { RELOC_ARENA = 1, RELOC_RING = 2, RELOC_BUFFER = 3, VKMIN_MAX_RELOCS = 4096 };
+enum { JOURNAL_VERSION = 9 }; /* v9 explicit layout fingerprint; reads v3-v8 */
+enum { RELOC_ARENA = 1, RELOC_RING = 2, RELOC_BUFFER = 3, RELOC_FRAME_RING = 4, VKMIN_MAX_RELOCS = 4096 };
 
 typedef struct { uint32_t magic, version, width, height; uint64_t arena_base, ring_base; } journal_header;
 typedef jrnl_record record_header;
 typedef jrnl_reloc reloc;
 /* Fixed-size mirrors of the descs, with strings copied and pointers dropped. */
 typedef struct { uint64_t size; uint32_t result, has_data; char label[VKMIN_LABEL]; } rec_buffer;
-typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; } rec_image;
-typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result, extra_colors, extra_format[2], push_size; char label[VKMIN_LABEL]; } rec_pipe;
+typedef struct { int32_t w, h, mips; uint32_t format, usage, sampler, result, has_pixels; char label[VKMIN_LABEL]; uint32_t samples, to_single; } rec_image;
+typedef struct { uint32_t vs_bytes, fs_bytes, cs_bytes, color_format, depth, depth_write, compare, cull, blend, bias, result, extra_colors, extra_format[2], push_size; char label[VKMIN_LABEL]; uint32_t samples, alpha_to_coverage; } rec_pipe;
 typedef struct { uint32_t id, mip; uint64_t offset; } rec_upload;
 typedef struct { uint32_t frame_index, has_clear; vkmin_clear clear; vkmin_inputs input; } rec_frame;
 typedef struct { uint32_t magic, version, width, height; } demo_header;
 typedef struct { uint32_t frame_index; vkmin_inputs input; } demo_record;
 typedef struct { uint32_t color, depth, clear_color, clear_depth; float clear[4]; int32_t x, y, w, h; uint32_t extra[2]; } rec_pass;
-typedef struct { rec_pass pass; char label[VKMIN_LABEL]; } rec_named_pass;
+typedef struct { rec_pass pass; char label[VKMIN_LABEL]; uint32_t resolves[4], depth_mode, raster_samples; } rec_named_pass;
+enum { REC_IMAGE_OLD = offsetof(rec_image, samples), REC_PIPE_OLD = offsetof(rec_pipe, samples),
+       REC_PASS_OLD = offsetof(rec_named_pass, resolves) };
+_Static_assert(REC_IMAGE_OLD == 72 && sizeof(rec_image) == 80, "image journal v6/v7 layout");
+_Static_assert(REC_PIPE_OLD == 100 && sizeof(rec_pipe) == 108, "pipeline journal v6/v7 layout");
+_Static_assert(REC_PASS_OLD == 96 && sizeof(rec_named_pass) == 120, "pass journal v5/v7 layout");
 typedef struct { uint32_t image, result; int32_t x, y; } rec_pick;
 typedef struct { uint32_t pipe, push_bytes, a, b, cnt; } rec_draw;
 typedef struct { uint32_t pipe, push_bytes, indices, cmds, counts, max_draws, host_count; uint64_t cmd_offset, count_offset, host_cmds; } rec_indirect;
 typedef struct { uint32_t flags, image_count; } rec_barrier;
 
-/* Pushed data is opaque bytes to vkmin, but some of those bytes are device
+/* A v9 stream declares its native record ABI instead of silently assuming it.
+ * Raw GPU payloads are bytes, not host structs to be reinterpreted by replay.
+ * The two old address bases are unused since v7 and carry the format signature.
+ * Older files retain their original reader; incompatible new files fail at init. */
+static uint64_t journal_abi(void) {
+    const uint32_t shapes[] = {sizeof(journal_header),sizeof(record_header),sizeof(reloc),
+        sizeof(rec_buffer),sizeof(rec_image),sizeof(rec_pipe),sizeof(rec_upload),sizeof(rec_frame),
+        sizeof(rec_pass),sizeof(rec_named_pass),sizeof(rec_draw),sizeof(rec_indirect),sizeof(rec_barrier),
+        sizeof(rec_pick),sizeof(vkmin_transition),offsetof(rec_indirect,cmd_offset),
+        offsetof(rec_frame,input),sizeof(vkmin_inputs),offsetof(vkmin_inputs,axes)};
+    const uint32_t endian = 0x01020304u;
+    const float ieee = 1.0f;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const vkmin_bytes spans[] = {{shapes,sizeof shapes},{&endian,sizeof endian},{&ieee,sizeof ieee}};
+    for (size_t k = 0; k < sizeof spans/sizeof spans[0]; ++k) {
+        const unsigned char *bytes = spans[k].data;
+        for (size_t i = 0; i < spans[k].size; ++i) hash = (hash ^ bytes[i])*UINT64_C(1099511628211);
+    }
+    return hash;
+}
+static bool journal_compatible(const journal_header *h) {
+    return h->version < 9 || (h->arena_base == journal_abi() && h->ring_base == UINT64_C(0x395249574e494d56));
+}
+
+/* Reference implementation selected by --record-heuristic.
+ * Pushed data is opaque bytes to vkmin, but some of those bytes are device
  * addresses the program got from vkmin_address or vkmin_ring_alloc, and a
  * replay in another process will not get the same addresses back. So every
  * 8-byte word is checked against the addresses this run actually issued -- an
  * exact match against a buffer's base or a ring allocation of this frame, never
  * a range test, so a coordinate that happens to fall inside the arena is left
  * alone -- and each hit is journalled as a relocation for vkmin_replay to
- * rewrite. False negatives are harmless (an unrecognised word was not an
- * address); a false positive would corrupt the payload, hence the exact match. */
+ * rewrite. This is a heuristic: interior/unaligned addresses are not recognised,
+ * and an ordinary integer equal to an issued address is indistinguishable.
+ * Recorded payloads must use aligned issued bases and separate byte offsets. */
 static int scan_relocs(const vkmin_ctx *c, const void *data, size_t bytes, reloc *out, int cap) {
     int n = 0;
     const uint8_t *p = data;
@@ -537,11 +576,41 @@ static int scan_relocs(const vkmin_ctx *c, const void *data, size_t bytes, reloc
     return n;
 }
 
-static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr_bytes, const void *data, size_t data_bytes) {
+static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr_bytes, const void *data, size_t data_bytes, vkmin_address_layout fields) {
     if ((!c->rec && !c->rec_shared) || c->rec_depth > 0) return;
     VKMIN_ASSERT(hdr_bytes <= 256 && data_bytes <= (512u << 20), "journal record exceeds reader limits");
     reloc relocs[VKMIN_MAX_RELOCS];
-    const int n = data ? scan_relocs(c, data, data_bytes, relocs, VKMIN_MAX_RELOCS) : 0;
+    int n = 0;
+    if (c->record_heuristic) n = data ? scan_relocs(c, data, data_bytes, relocs, VKMIN_MAX_RELOCS) : 0;
+    else {
+        uint32_t offsets[VKMIN_PUSH_BYTES / 8 + 1];
+        if (op == OP_DRAW || op == OP_DRAW_INDIRECT || op == OP_DISPATCH) {
+            uint32_t pipe; memcpy(&pipe, hdr, sizeof pipe);
+            const pipe_slot *s = &c->pipes[handle_index(pipe)];
+            fields = s->desc.push_addresses;
+            if (fields.count) memcpy(offsets, fields.offsets, fields.count * sizeof *offsets);
+            if (op == OP_DRAW_INDIRECT) offsets[fields.count++] = s->push_size;
+            fields.offsets = offsets;
+        } else if (op == OP_FRAME_END) fields = (vkmin_address_layout){c->ring_fields, c->ring_field_count};
+        else if (op == OP_COPY_TO_RING) { offsets[0] = 0; fields = (vkmin_address_layout){offsets, 1}; }
+        VKMIN_ASSERT(fields.count <= VKMIN_MAX_RELOCS && (!fields.count || fields.offsets), "journal address layout exceeds limits");
+        for (uint32_t k = 0; k < fields.count; ++k) {
+            const uint32_t off = fields.offsets[k];
+            VKMIN_ASSERT(off <= data_bytes && data_bytes-off >= 8 && (!k || (uint64_t)fields.offsets[k-1]+8 <= off), "invalid journal address field");
+            uint64_t address; memcpy(&address, (const uint8_t *)data+off, 8);
+            if (!address) continue;
+            uint32_t kind = 0;
+            for (uint32_t i = 0; i < VKMIN_MAX_BUFFERS; ++i) {
+                const buffer_slot *b = &c->buffers[i];
+                const uint64_t base = c->arena_addr+b->offset;
+                if (b->used && address >= base && address-base < b->size) { kind = RELOC_BUFFER; break; }
+            }
+            const uint64_t base = c->ring_addr+c->slot*c->ring_region;
+            if (!kind && address >= base && address-base < c->ring_head[c->slot]) kind = RELOC_RING;
+            VKMIN_ASSERT(kind, "journal address field does not reference a live buffer or current ring");
+            relocs[n++] = (reloc){off, kind};
+        }
+    }
     uint8_t *encoded = NULL;
     if (n) {
         encoded = malloc(data_bytes);
@@ -549,18 +618,26 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
         memcpy(encoded, data, data_bytes);
         /* v6 and later store a buffer address as identity, not as a number:
          * the handle in the high 32 bits, a byte offset into that buffer in the
-         * low 32. Only exact base matches are recognised today, so the low half
-         * is always zero on write; relocate() adds it back anyway so an interior
-         * pointer could be recorded later without a format change. Recording the
+         * low 32. Explicit fields also preserve interior byte offsets. Recording the
          * handle is what lets a journal replay after the allocator has reused
          * the range for something else. */
         for (int k = 0; k < n; ++k) if (relocs[k].kind == RELOC_BUFFER) {
             uint64_t address; memcpy(&address, encoded + relocs[k].offset, sizeof address);
             for (uint32_t i = 0; i < VKMIN_MAX_BUFFERS; ++i) {
-                if (!c->buffers[i].used || address != c->arena_addr + c->buffers[i].offset) continue;
-                const uint64_t logical = (uint64_t)handle_make(i, c->buffers[i].gen) << 32;
+                if (!c->buffers[i].used || (address < c->arena_addr + c->buffers[i].offset || address-(c->arena_addr+c->buffers[i].offset) >= c->buffers[i].size)) continue;
+                const uint64_t byte = address-c->arena_addr-c->buffers[i].offset;
+                VKMIN_ASSERT(byte <= UINT32_MAX, "journal buffer offset exceeds 32 bits");
+                const uint64_t logical = ((uint64_t)handle_make(i, c->buffers[i].gen) << 32) | byte;
                 memcpy(encoded + relocs[k].offset, &logical, sizeof logical); break;
             }
+        }
+        /* v7 ring pointers are frame-relative, not offsets into the recorder's
+         * whole ring. Replay may use a different ring size or frame-slot count. */
+        for (int k = 0; k < n; ++k) if (relocs[k].kind == RELOC_RING) {
+            uint64_t address; memcpy(&address, encoded + relocs[k].offset, sizeof address);
+            const uint64_t byte = address - c->ring_addr - c->slot*c->ring_region;
+            memcpy(encoded + relocs[k].offset, &byte, sizeof byte);
+            relocs[k].kind = RELOC_FRAME_RING;
         }
         data = encoded;
     }
@@ -574,7 +651,7 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
     free(encoded);
     VKMIN_ASSERT(ok, "journal write failed");
 }
-#define RECORD(c, op, hdr, data, bytes) journal_write((c), (op), &(hdr), sizeof(hdr), (data), (bytes))
+#define RECORD(c, op, hdr, data, bytes) journal_write((c), (op), &(hdr), sizeof(hdr), (data), (bytes), (vkmin_address_layout){0})
 
 /* Monotonic elapsed time: wall-clock corrections must not become frame spikes. */
 static double wall_ms(void) {
@@ -741,8 +818,10 @@ static path_caps query_caps(VkPhysicalDevice phys) {
     VkExtensionProperties *ext = calloc(n ? n : 1, sizeof *ext);
     VKMIN_ASSERT(ext != NULL, "out of memory");
     VK_CHECK_CTX(NULL, vkEnumerateDeviceExtensionProperties(phys, NULL, &n, ext));
+    bool has_msrtss = false;
     bool has_hic = false, has_m5 = false, has_pd = false, has_pr = false, has_r2 = false, has_db = false, has_uil = false;
     for (uint32_t i = 0; i < n; ++i) {
+        if (!strcmp(ext[i].extensionName, VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME)) has_msrtss = true;
         if (!strcmp(ext[i].extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) has_hic = true;
         if (!strcmp(ext[i].extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) has_m5 = true;
         if (!strcmp(ext[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) has_pd = true;
@@ -753,7 +832,8 @@ static path_caps query_caps(VkPhysicalDevice phys) {
     }
     free(ext);
     /* An extension that is present but whose feature bit is off is absent. */
-    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
+    VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT ms = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR, .pNext = &ms};
     VkPhysicalDeviceDescriptorBufferFeaturesEXT db = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT, .pNext = &uil};
     VkPhysicalDeviceHostImageCopyFeaturesEXT hic = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, .pNext = &db};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &hic};
@@ -762,6 +842,7 @@ static path_caps query_caps(VkPhysicalDevice phys) {
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &r2};
     vkGetPhysicalDeviceFeatures2(phys, &f2);
     return (path_caps){
+        .render_to_single_sampled = has_msrtss && ms.multisampledRenderToSingleSampled,
         .host_image_copy = has_hic && hic.hostImageCopy,
         .maintenance5 = has_m5 && m5.maintenance5,
         .push_descriptor = has_pd,
@@ -972,6 +1053,13 @@ static void create_device(vkmin_ctx *c) {
         extensions[ext_count++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
         hic.pNext = c->path == VKMIN_PATH_MODERN ? (void *)&r2 : NULL;
         if (c->path != VKMIN_PATH_MODERN) f12.pNext = &r2;
+    }
+    VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT ms = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT,
+        .pNext = f12.pNext, .multisampledRenderToSingleSampled = VK_TRUE};
+    if (c->caps.render_to_single_sampled) {
+        extensions[ext_count++] = VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME;
+        f12.pNext = &ms;
     }
     const VkDeviceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -1339,7 +1427,7 @@ static use_info use_lookup(vkmin_use use) { // pure
                           VK_ACCESS_2_TRANSFER_READ_BIT};
     case VKMIN_USE_SAMPLED:
         return (use_info){VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
     case VKMIN_USE_COLOR_TARGET:
@@ -1347,12 +1435,15 @@ static use_info use_lookup(vkmin_use use) { // pure
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+    /* Depth resolves execute at COLOR_ATTACHMENT_OUTPUT with COLOR_ATTACHMENT_WRITE,
+     * including EXT single-sample stores. Both sides of later transitions must
+     * retain that scope, not only the early/late depth-test writes. */
     case VKMIN_USE_DEPTH_TARGET:
         return (use_info){VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
     case VKMIN_USE_PRESENT:
         return (use_info){VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
     }
@@ -1501,6 +1592,7 @@ uint32_t vkmin_register_texture(vkmin_ctx *c, vkmin_image img, uint32_t sampler_
 
     const image_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, img.id, s);
+    VKMIN_ASSERT(s->samples <= 1, "bindless textures require a single-sample resolve image");
     collect_retired(c);
     uint32_t index;
     for (;;) {
@@ -1710,9 +1802,8 @@ static void create_swapchain(vkmin_ctx *c) {
             c->swap_extent.width, c->swap_extent.height, c->swap_count, (int)chosen.format, (int)mode);
 }
 
-/* The single recreate site. Everything else only raises need_recreate. Note
- * that the renderer's own size-dependent images (HDR target, depth) are not
- * this layer's business: it reports the new size and the renderer rebuilds. */
+/* The single recreate site. Render dimensions stay fixed; the presentation
+ * blit scales the owned backbuffer into the new window extent. */
 static void recreate_swapchain(vkmin_ctx *c) {
     int w = 0, h = 0;
     plat_framebuffer_size(c->window, &w, &h);
@@ -1764,12 +1855,19 @@ static void print_flags(void) { // io
     printf("  name=value, +name value    set a cvar; --cvars lists them\n");
 }
 
+static uint32_t decimal_argument(const char *text, uint32_t limit) {
+    const vkm_decimal parsed = vkm_parse_decimal(text, limit);
+    VKMIN_ASSERT(parsed.valid && !*parsed.end, "invalid decimal argument '%s' (maximum %u)", text, limit);
+    return parsed.value;
+}
+
 /* The one command-line parser. Every program wants the same flags, so they
  * live here; anything unrecognised is left alone for the program to read. */
 static void parse_command_line(vkmin_ctx *c, int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
-        if (a[0] == '+' && i + 1 < argc) {
+        if (a[0] == '+') {
+            VKMIN_ASSERT(i + 1 < argc, "cvar assignment requires a value: %s", a);
             char joined[256];
             snprintf(joined, sizeof joined, "%s=%s", a + 1, argv[++i]);
             VKMIN_ASSERT(cvar_parse_assignment(&c->config, joined), "bad cvar assignment '%s'", joined);
@@ -1794,55 +1892,55 @@ static void parse_command_line(vkmin_ctx *c, int argc, char **argv) {
         case VKMIN_FLAG_frame:
             c->desc.headless = true;
             c->frame_count = 1;
-            c->frame_list[0] = atoi(w1);
+            c->frame_list[0] = (int)decimal_argument(w1, INT_MAX);
             break;
         case VKMIN_FLAG_frames: {
             c->desc.headless = true;
             c->frame_count = 0;
             const char *p = w1;
-            while (*p) {
-                char *end = NULL;
-                const long v = strtol(p, &end, 10);
-                if (end == p) break;
-                /* Silently keeping the first 64 made a measurement over a
-                 * longer list quietly answer for a shorter one. */
+            do {
+                const vkm_decimal parsed = vkm_parse_decimal(p, INT_MAX);
+                VKMIN_ASSERT(parsed.valid && (!*parsed.end || *parsed.end == ','), "invalid --frames list '%s'", w1);
                 VKMIN_ASSERT(c->frame_count < VKMIN_MAX_FRAME_LIST,
                              "--frames lists more than VKMIN_MAX_FRAME_LIST (%d) frames", VKMIN_MAX_FRAME_LIST);
-                c->frame_list[c->frame_count++] = (int)v;
-                p = *end == ',' ? end + 1 : end;
-            }
+                c->frame_list[c->frame_count++] = (int)parsed.value;
+                if (!*parsed.end) break;
+                p = parsed.end+1;
+            } while (true);
             break;
         }
         case VKMIN_FLAG_out: c->out = w1; break;
         case VKMIN_FLAG_out_dir: c->out_dir = w1; break;
-        case VKMIN_FLAG_exit_after: c->exit_after = atoi(w1); break;
+        case VKMIN_FLAG_exit_after: c->exit_after = (int)decimal_argument(w1, INT_MAX); break;
         case VKMIN_FLAG_events: c->events_path = w1; break;
         case VKMIN_FLAG_metrics: c->metrics_path = w1; break;
         case VKMIN_FLAG_inspect_dir: c->inspect_dir = w1; break;
         case VKMIN_FLAG_stop_after_event: {
-            char *end = NULL;
-            const unsigned long long n = strtoull(w1, &end, 10);
-            VKMIN_ASSERT(w1[0] >= '0' && w1[0] <= '9' && end && !*end && n > 0 && n <= UINT32_MAX,
-                         "--stop-after-event requires a positive event number");
-            c->stop_event = (uint32_t)n;
+            c->stop_event = decimal_argument(w1, UINT32_MAX);
+            VKMIN_ASSERT(c->stop_event, "--stop-after-event requires a positive event number");
             break;
         }
-        case VKMIN_FLAG_budget: c->budget_ms = (float)atof(w1); break;
+        case VKMIN_FLAG_budget: {
+            char *end = NULL;
+            c->budget_ms = strtof(w1, &end);
+            VKMIN_ASSERT(end != w1 && !*end && isfinite(c->budget_ms) && c->budget_ms > 0, "--budget requires positive finite milliseconds");
+            break;
+        }
         case VKMIN_FLAG_size: {
             /* Flags that are spellings of a cvar assignment go through the
              * assignment path so they count as set by the user. */
             char w[64], h[64];
-            snprintf(w, sizeof w, "r_width=%d", atoi(w1));
-            snprintf(h, sizeof h, "r_height=%d", atoi(w2));
-            cvar_parse_assignment(&c->config, w);
-            cvar_parse_assignment(&c->config, h);
+            snprintf(w, sizeof w, "r_width=%u", decimal_argument(w1,32768));
+            snprintf(h, sizeof h, "r_height=%u", decimal_argument(w2,32768));
+            VKMIN_ASSERT(cvar_parse_assignment(&c->config, w) && cvar_parse_assignment(&c->config, h), "invalid --size");
             break;
         }
         case VKMIN_FLAG_path_legacy: cvar_parse_assignment(&c->config, "r_path=1"); break;
         case VKMIN_FLAG_path_modern: cvar_parse_assignment(&c->config, "r_path=2"); break;
         case VKMIN_FLAG_sync_naive: cvar_parse_assignment(&c->config, "r_sync_naive=1"); break;
         case VKMIN_FLAG_no_readback: cvar_parse_assignment(&c->config, "r_readback=0"); break;
-        case VKMIN_FLAG_device: c->desc.device_index = atoi(w1); break;
+        case VKMIN_FLAG_record_heuristic: c->record_heuristic = true; break;
+        case VKMIN_FLAG_device: c->desc.device_index = (int)decimal_argument(w1, INT_MAX); break;
         case VKMIN_FLAG_record: c->record_path = w1; break;
         case VKMIN_FLAG_replay: c->replay_path = w1; c->desc.headless = true; break;
         case VKMIN_FLAG_demo: c->demo_path = w1; break;
@@ -1872,9 +1970,12 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     if (c->desc.width <= 0 || cvar_was_set(&c->config, CV_r_width)) c->desc.width = cvar_get_int(&c->config, CV_r_width);
     if (c->desc.height <= 0 || cvar_was_set(&c->config, CV_r_height)) c->desc.height = cvar_get_int(&c->config, CV_r_height);
     if (cvar_was_set(&c->config, CV_r_path)) c->desc.path = (vkmin_path)cvar_get_int(&c->config, CV_r_path);
-    if (cvar_get_bool(&c->config, CV_r_sync_naive)) c->desc.sync_naive = true;
-    if (!cvar_get_bool(&c->config, CV_r_readback)) c->desc.no_readback = true;
-    c->desc.vsync = cvar_get_bool(&c->config, CV_r_vsync);
+    if (cvar_was_set(&c->config, CV_r_sync_naive)) c->desc.sync_naive = cvar_get_bool(&c->config, CV_r_sync_naive);
+    if (cvar_was_set(&c->config, CV_r_readback)) c->desc.no_readback = !cvar_get_bool(&c->config, CV_r_readback);
+    if (cvar_was_set(&c->config, CV_r_vsync)) c->desc.vsync = cvar_get_bool(&c->config, CV_r_vsync);
+    cvar_set(&c->config, CV_r_sync_naive, c->desc.sync_naive ? 1.f : 0.f);
+    cvar_set(&c->config, CV_r_readback, c->desc.no_readback ? 0.f : 1.f);
+    cvar_set(&c->config, CV_r_vsync, c->desc.vsync ? 1.f : 0.f);
     /* Megabytes on the command line, bytes in the desc. The multiply is done in
      * size_t so a large reservation does not wrap a 32-bit intermediate. */
     if (cvar_was_set(&c->config, CV_r_arena_mb)) {
@@ -1901,7 +2002,8 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
     if (c->replay_path) { /* the recording decides the size */
         FILE *f = jrnl_stream_open(c->replay_path, JRNL_VIDEO);
         journal_header jh;
-        VKMIN_ASSERT(f && fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u, "cannot read journal '%s'", c->replay_path);
+        VKMIN_ASSERT(f && fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u &&
+            jh.version >= 3 && jh.version <= JOURNAL_VERSION && journal_compatible(&jh) && jh.width > 0 && jh.width <= 32768 && jh.height > 0 && jh.height <= 32768, "cannot read journal '%s'", c->replay_path);
         fclose(f);
         c->desc.width = (int)jh.width;
         c->desc.height = (int)jh.height;
@@ -2030,7 +2132,7 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
      * two address bases are what a pre-v6 journal is rebased from on replay;
      * v6 and later record buffer identity instead but still carry them. */
     const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height,
-                               c->arena_addr, c->ring_addr};
+                               journal_abi(), UINT64_C(0x395249574e494d56)};
     if (c->record_path) { /* everything the program does from here is recorded */
         c->rec = fopen(c->record_path, "wb");
         VKMIN_ASSERT(c->rec != NULL, "cannot write journal '%s'", c->record_path);
@@ -2166,7 +2268,7 @@ vkmin_buffer vkmin_make_buffer(vkmin_ctx *c, const vkmin_buffer_desc *desc) {
     RECORD_LEAVE(c);
     rec_buffer rb = {.size = size, .result = b.id, .has_data = desc->data.data != NULL};
     snprintf(rb.label, sizeof rb.label, "%s", s->label);
-    RECORD(c, OP_MAKE_BUFFER, rb, desc->data.data, desc->data.data ? desc->data.size : 0);
+    journal_write(c, OP_MAKE_BUFFER, &rb, sizeof rb, desc->data.data, desc->data.data ? desc->data.size : 0, desc->addresses);
     return b;
 }
 
@@ -2192,22 +2294,25 @@ void vkmin_free_image(vkmin_ctx *c, vkmin_image img) {
     *s = (image_slot){.gen = gen};
 }
 
-uint64_t vkmin_address(vkmin_ctx *c, vkmin_buffer b) {
+uint64_t vkmin_address(const vkmin_ctx *c, vkmin_buffer b) {
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
     return c->arena_addr + s->offset;
 }
 
 void vkmin_buffer_upload(vkmin_ctx *c, vkmin_buffer b, size_t offset, vkmin_bytes upload) {
+    vkmin_buffer_upload_typed(c, b, offset, upload, (vkmin_address_layout){0});
+}
+void vkmin_buffer_upload_typed(vkmin_ctx *c, vkmin_buffer b, size_t offset, vkmin_bytes upload, vkmin_address_layout fields) {
     VKMIN_ASSERT(c && upload.data, "vkmin_buffer_upload: null argument");
     const void *data = upload.data;
     const size_t bytes = upload.size;
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
-    VKMIN_ASSERT(offset + bytes <= s->size, "upload of %zu bytes at %zu overruns a %llu byte buffer",
+    VKMIN_ASSERT(vkm_range_fits(s->size, offset, bytes), "upload of %zu bytes at %zu overruns a %llu byte buffer",
                  bytes, offset, (unsigned long long)s->size);
     const rec_upload ru = {.id = b.id, .offset = offset};
-    RECORD(c, OP_BUFFER_UPLOAD, ru, data, bytes);
+    journal_write(c, OP_BUFFER_UPLOAD, &ru, sizeof ru, data, bytes, fields);
     upload_prepare(c);
     const uint8_t *src = data;
     size_t done = 0;
@@ -2223,6 +2328,113 @@ void vkmin_buffer_upload(vkmin_ctx *c, vkmin_buffer b, size_t offset, vkmin_byte
 }
 
 /* --------------------------------------------------------------- images -- */
+
+vkmin_msaa_info vkmin_msaa_capabilities(const vkmin_ctx *c) {
+    VkPhysicalDeviceDepthStencilResolveProperties resolve = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+    VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &resolve};
+    vkGetPhysicalDeviceProperties2(c->phys, &props);
+    return (vkmin_msaa_info){c->caps.render_to_single_sampled, resolve.supportedDepthResolveModes};
+}
+
+/* Same usage construction for creation and support queries, including the
+ * optional inspection copy. No global framebuffer-limit guess for a format. */
+static VkImageUsageFlags image_usage(const vkmin_ctx *c, uint32_t bits, uint32_t samples) {
+    if (!bits) bits = VKMIN_IMAGE_SAMPLED;
+    VkImageUsageFlags usage = 0;
+    if (bits & VKMIN_IMAGE_SAMPLED) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (bits & VKMIN_IMAGE_COLOR) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (bits & VKMIN_IMAGE_DEPTH) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (samples == 1 && (bits & VKMIN_IMAGE_SAMPLED) && !(bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH)))
+        usage |= c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (samples == 1 && c->inspect_dir && (bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH))) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (bits & VKMIN_IMAGE_READBACK) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        (c->path == VKMIN_PATH_MODERN && samples == 1 ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u);
+    return usage;
+}
+
+uint32_t vkmin_sample_counts(const vkmin_ctx *c, vkmin_format format, uint32_t usage) {
+    VkImageFormatProperties props;
+    const VkResult result = vkGetPhysicalDeviceImageFormatProperties(c->phys, format_lookup(format).vk,
+        VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, image_usage(c, usage, 2), 0, &props);
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return 0;
+    VK_CHECK_CTX(c, result);
+    return props.sampleCounts;
+}
+
+/* Negotiate once for the whole target; all pipelines use the returned count. */
+vkmin_target vkmin_make_target(vkmin_ctx *c, const vkmin_target_desc *d) {
+    VKMIN_ASSERT(c && d && d->width > 0 && d->height > 0, "vkmin_make_target: bad size");
+    VKMIN_ASSERT(d->extra_colors >= 0 && d->extra_colors <= 2 &&
+        (d->color_format != VKMIN_FMT_NONE || (d->depth && !d->extra_colors)), "target attachments");
+    VKMIN_ASSERT(!d->resolve_depth || d->depth, "depth resolve requires depth");
+    VKMIN_ASSERT(d->storage >= VKMIN_MSAA_CONFIG && d->storage <= VKMIN_MSAA_PREFER_SINGLE, "target storage preference");
+    const uint32_t requested = d->samples ? d->samples : (uint32_t)cvar_get_int(&c->config, CV_r_msaa);
+    VKMIN_ASSERT(requested && requested <= 64 && !(requested & (requested-1)), "samples must be 1,2,4,8,16,32 or 64");
+    const bool prefer = d->storage == VKMIN_MSAA_PREFER_SINGLE ||
+        (d->storage == VKMIN_MSAA_CONFIG && cvar_get_bool(&c->config, CV_r_msaa_single));
+    const vkmin_msaa_info caps = vkmin_msaa_capabilities(c);
+    const vkmin_format formats[4] = {d->color_format, d->extra_format[0], d->extra_format[1], VKMIN_FMT_D32_FLOAT};
+    const int colors = d->color_format == VKMIN_FMT_NONE ? 0 : 1+d->extra_colors;
+    uint32_t supported = 127;
+    for (int i = 0; i < 4; ++i) if (i < colors || (i == 3 && d->depth))
+        supported &= vkmin_sample_counts(c, formats[i], i == 3 ? VKMIN_IMAGE_DEPTH : VKMIN_IMAGE_COLOR);
+    VKMIN_ASSERT(supported & 1u, "target formats have no common sample count");
+    vkmin_target t = {.samples = requested};
+    while (!(supported & t.samples)) t.samples >>= 1;
+    t.render_to_single_sampled = t.samples > 1 && prefer && caps.render_to_single_sampled;
+    /* The extension feature alone does not guarantee each format/usage/flag combination. */
+    for (int i = 0; t.render_to_single_sampled && i < 4; ++i) if (i < colors || (i == 3 && d->depth)) {
+        VkImageFormatProperties props;
+        const uint32_t usage = (i == 3 ? VKMIN_IMAGE_DEPTH : VKMIN_IMAGE_COLOR) |
+            (i != 3 || d->resolve_depth ? VKMIN_IMAGE_SAMPLED : 0u);
+        const VkResult result = vkGetPhysicalDeviceImageFormatProperties(c->phys, format_lookup(formats[i]).vk,
+            VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, image_usage(c, usage, 1),
+            VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT, &props);
+        if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) t.render_to_single_sampled = false;
+        else { VK_CHECK_CTX(c, result); t.render_to_single_sampled = (props.sampleCounts & 1u) != 0; }
+    }
+    const bool explicit_ms = t.samples > 1 && !t.render_to_single_sampled;
+    const vkmin_resolve mode = d->depth_resolve_mode ? d->depth_resolve_mode : VKMIN_RESOLVE_SAMPLE_ZERO;
+    vkmin_image *const outputs[4] = {&t.color, &t.extra[0], &t.extra[1], &t.depth};
+    vkmin_image *const attachments[4] = {&t.pass.color, &t.pass.extra[0], &t.pass.extra[1], &t.pass.depth};
+    vkmin_image *const resolves[4] = {&t.pass.color_resolve, &t.pass.extra_resolve[0], &t.pass.extra_resolve[1], &t.pass.depth_resolve};
+    const char *label = d->label ? d->label : "target";
+    for (int i = 0; i < 4; ++i) if (i < colors || (i == 3 && d->depth)) {
+        char name[VKMIN_LABEL];
+        const uint32_t usage = i == 3 ? VKMIN_IMAGE_DEPTH : VKMIN_IMAGE_COLOR;
+        const bool output = i != 3 || d->resolve_depth;
+        vkmin_image_desc image = {.width = d->width, .height = d->height, .format = formats[i],
+            .usage = usage | (output ? VKMIN_IMAGE_SAMPLED : 0u), .sampler = d->sampler,
+            .render_to_single_sampled = t.render_to_single_sampled, .label = name};
+        snprintf(name, sizeof name, "%s.%s%d", label, i == 3 ? "depth" : "color", i == 3 ? 0 : i);
+        if (output || !explicit_ms) *attachments[i] = vkmin_make_image(c, &image);
+        if (output) *outputs[i] = *attachments[i];
+        if (explicit_ms) {
+            if (output) *resolves[i] = *outputs[i];
+            image.usage = usage; image.samples = t.samples;
+            snprintf(name, sizeof name, "%s.msaa%d", label, i);
+            *attachments[i] = vkmin_make_image(c, &image);
+        }
+    }
+    t.pass.raster_samples = t.render_to_single_sampled ? t.samples : 0;
+    t.pass.depth_resolve_mode = mode;
+    t.pass.clear_color = colors > 0; t.pass.clear_depth = d->depth; t.pass.label = d->label;
+    fprintf(stderr, "vkmin: %s MSAA requested %ux, selected %ux (%s)\n", label, requested, t.samples,
+        t.render_to_single_sampled ? "EXT render-to-single-sampled" : "explicit attachments/resolve");
+    return t;
+}
+
+void vkmin_free_target(vkmin_ctx *c, vkmin_target *t) {
+    VKMIN_ASSERT(c && t && !c->in_frame, "free target between frames");
+    const vkmin_image images[8] = {t->color, t->extra[0], t->extra[1], t->depth,
+        t->pass.color, t->pass.extra[0], t->pass.extra[1], t->pass.depth};
+    for (int i = 0; i < 8; ++i) if (images[i].id) {
+        bool duplicate = false;
+        for (int j = 0; j < i; ++j) if (images[j].id == images[i].id) duplicate = true;
+        if (!duplicate) vkmin_free_image(c, images[i]);
+    }
+    *t = (vkmin_target){0};
+}
 
 vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     VKMIN_ASSERT(c && desc && desc->width > 0 && desc->height > 0, "vkmin_make_image: bad argument");
@@ -2244,30 +2456,22 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     s->mips = desc->mip_levels > 0 ? (uint32_t)desc->mip_levels : 1u;
     s->use = VKMIN_USE_UNDEFINED;
     s->external = false;
+    s->samples = desc->samples ? desc->samples : 1;
+    s->render_to_single_sampled = desc->render_to_single_sampled;
 
-    VkImageUsageFlags usage = 0;
-    if (usage_bits & VKMIN_IMAGE_SAMPLED) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    /* Only images that get uploaded need a transfer destination: sampled ones
-     * that are not attachments. On the modern path that is a host transfer. */
-    const bool uploadable = (usage_bits & VKMIN_IMAGE_SAMPLED) && !(usage_bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH));
-    if (uploadable) usage |= c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (c->inspect_dir && (usage_bits & (VKMIN_IMAGE_COLOR | VKMIN_IMAGE_DEPTH))) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (usage_bits & VKMIN_IMAGE_COLOR) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (usage_bits & VKMIN_IMAGE_DEPTH) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    /* Readback mirrors the backbuffer: a transfer source, and on the modern
-     * path a host transfer source too, so vkmin_pick copies from either. */
-    if (usage_bits & VKMIN_IMAGE_READBACK) {
-        usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (c->path == VKMIN_PATH_MODERN ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u);
-    }
-
+    const VkImageUsageFlags usage = image_usage(c, usage_bits, s->samples);
+    /* vkmin's upload/readback/bindless interfaces expose single-sample texels. */
+    VKMIN_ASSERT(s->samples == 1 || (!desc->pixels.data && s->mips == 1 && !(usage_bits & VKMIN_IMAGE_READBACK)),
+                 "multisample images require one mip and resolve before upload/readback");
     const VkImageCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags = desc->render_to_single_sampled ? VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT : 0,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = fi.vk,
         .extent = {s->w, s->h, 1},
         .mipLevels = s->mips,
         .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .samples = (VkSampleCountFlagBits)s->samples,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -2300,7 +2504,8 @@ vkmin_image vkmin_make_image(vkmin_ctx *c, const vkmin_image_desc *desc) {
     }
     RECORD_LEAVE(c);
     rec_image ri = {.w = desc->width, .h = desc->height, .mips = desc->mip_levels, .format = desc->format, .usage = desc->usage,
-                    .sampler = desc->sampler, .result = img.id, .has_pixels = desc->pixels.data != NULL};
+                    .sampler = desc->sampler, .result = img.id, .has_pixels = desc->pixels.data != NULL,
+                    .samples = s->samples, .to_single = desc->render_to_single_sampled};
     snprintf(ri.label, sizeof ri.label, "%s", s->label);
     RECORD(c, OP_MAKE_IMAGE, ri, desc->pixels.data, desc->pixels.data ? mip_bytes(fi, s->w, s->h) : 0);
     return img;
@@ -2489,15 +2694,9 @@ typedef struct {
 
 #include "vkmin_spirv.h"
 
-static void check_spirv(const uint32_t *spv, size_t bytes, const char *label) {
-    VKMIN_ASSERT(spv && bytes >= 4 && bytes % 4 == 0, "'%s': bad SPIR-V size %zu", label, bytes);
-    VKMIN_ASSERT(spv[0] == 0x07230203u, "'%s': SPIR-V magic missing", label);
-}
-
 /* --- legacy-only: transient shader modules ------------------------------- */
 static void legacy_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
-                              size_t bytes, const char *label) {
-    check_spirv(spv, bytes, label);
+                              size_t bytes) {
     const VkShaderModuleCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spv};
     VK_CHECK_CTX(c, vkCreateShaderModule(c->dev, &info, NULL, &s->module));
@@ -2508,9 +2707,8 @@ static void legacy_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBi
 
 /* --- modern-only: SPIR-V inline in the stage ----------------------------- */
 static void modern_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
-                              size_t bytes, const char *label) {
+                              size_t bytes) {
     (void)c;
-    check_spirv(spv, bytes, label);
     s->module = VK_NULL_HANDLE;
     s->inline_code = (VkShaderModuleCreateInfo){
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spv};
@@ -2520,14 +2718,14 @@ static void modern_make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBi
 /* --- end modern-only ----------------------------------------------------- */
 
 static void make_stage(vkmin_ctx *c, shader_stage *s, VkShaderStageFlagBits kind, const uint32_t *spv,
-                       size_t bytes, const char *label) {
-    if (c->path == VKMIN_PATH_LEGACY) legacy_make_stage(c, s, kind, spv, bytes, label);
-    else modern_make_stage(c, s, kind, spv, bytes, label);
+                       size_t bytes) {
+    if (c->path == VKMIN_PATH_LEGACY) legacy_make_stage(c, s, kind, spv, bytes);
+    else modern_make_stage(c, s, kind, spv, bytes);
 }
 
-/* Debug builds ask for robustBufferAccess2 per pipeline where the device has
- * it: the GPU-side counterpart of the bounds-checked handle lookup, fatal in
- * debug and free in release. A property of the build, not a path. */
+/* Debug builds request defined out-of-bounds buffer behavior where supported.
+ * Robustness limits damage; it does not diagnose or abort an invalid access.
+ * This option is a property of the build, not the rendering path. */
 static const void *robustness_chain(const vkmin_ctx *c, VkPipelineRobustnessCreateInfoEXT *info, const void *next) {
     if (!(c->debug && c->caps.pipeline_robustness && c->caps.robust_buffer_access2)) return next;
     *info = (VkPipelineRobustnessCreateInfoEXT){
@@ -2582,6 +2780,14 @@ vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc
     s->desc = *desc;
     s->desc.label = s->label;
     s->push_size = desc->push_size;
+    const vkmin_address_layout fields = desc->push_addresses;
+    VKMIN_ASSERT(fields.count <= VKMIN_PUSH_BYTES/8 && (!fields.count || fields.offsets), "invalid push address layout");
+    for (uint32_t k = 0; k < fields.count; ++k) {
+        const uint32_t off = fields.offsets[k];
+        VKMIN_ASSERT(off <= desc->push_size && desc->push_size-off >= 8 && (!k || (uint64_t)fields.offsets[k-1]+8 <= off), "invalid push address offset");
+        s->push_offsets[k] = off;
+    }
+    s->desc.push_addresses.offsets = s->push_offsets;
     const char *paths[3] = {desc->vs_path, desc->fs_path, desc->cs_path};
     vkmin_bytes *owned[3] = {&s->desc.vs, &s->desc.fs, &s->desc.cs};
     for (int k = 0; k < 3; ++k) {
@@ -2609,8 +2815,8 @@ static void record_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc, vkmin
         for (int k = 0; k < 3; ++k) {
             if (stages[k].data) { memcpy(blob + at, stages[k].data, stages[k].size); at += stages[k].size; }
         }
-        rec_pipe rp = {.vs_bytes = (uint32_t)(desc->vs.data ? desc->vs.size : 0), .fs_bytes = (uint32_t)(desc->fs.data ? desc->fs.size : 0),
-                       .cs_bytes = (uint32_t)(desc->cs.data ? desc->cs.size : 0), .color_format = desc->color_format, .depth = desc->depth,
+        rec_pipe rp = {.samples = desc->samples ? desc->samples : 1, .alpha_to_coverage = desc->alpha_to_coverage, .vs_bytes = (uint32_t)(desc->vs.data ? desc->vs.size : 0), .fs_bytes = (uint32_t)(desc->fs.data ? desc->fs.size : 0),
+                       .cs_bytes = (uint32_t)(desc->cs.data ? desc->cs.size : 0), .color_format = desc->color_format, .depth = (desc->depth ? 1u : 0u) | (desc->depth_attachment ? 2u : 0u),
                        .depth_write = desc->depth_write, .compare = desc->depth_compare, .cull = desc->cull,
                        .blend = desc->blend, .bias = desc->depth_bias, .result = p.id, .extra_colors = (uint32_t)desc->extra_colors,
                        .extra_format = {desc->extra_format[0], desc->extra_format[1]}, .push_size = desc->push_size};
@@ -2622,8 +2828,8 @@ static void record_pipeline(vkmin_ctx *c, const vkmin_pipeline_desc *desc, vkmin
 
 static VkResult make_graphics(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label, VkPipeline *pipe) {
     shader_stage vs = {0}, fs = {0};
-    make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs.data, desc->vs.size, label);
-    if (desc->fs.data) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs.data, desc->fs.size, label);
+    make_stage(c, &vs, VK_SHADER_STAGE_VERTEX_BIT, desc->vs.data, desc->vs.size);
+    if (desc->fs.data) make_stage(c, &fs, VK_SHADER_STAGE_FRAGMENT_BIT, desc->fs.data, desc->fs.size);
     const VkPipelineShaderStageCreateInfo stages[2] = {vs.stage, fs.stage};
     /* No vertex input state: every vertex shader pulls from a device address. */
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -2645,10 +2851,9 @@ static VkResult make_graphics(vkmin_ctx *c, const vkmin_pipeline_desc *desc, con
     };
     const VkPipelineMultisampleStateCreateInfo multisample = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
-    /* Backbuffer passes always have the default depth attached, so pipelines
-     * that render there must declare it whether or not they test against it. */
-    const bool depth_attachment = desc->depth || desc->color_format == VKMIN_FMT_RGBA8_UNORM;
+        .rasterizationSamples = (VkSampleCountFlagBits)(desc->samples ? desc->samples : 1),
+        .sampleShadingEnable = VK_FALSE, .alphaToCoverageEnable = desc->alpha_to_coverage};
+    const bool depth_attachment = desc->depth || desc->depth_attachment;
     const VkPipelineDepthStencilStateCreateInfo depth = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = desc->depth,
@@ -2721,7 +2926,7 @@ static VkResult make_graphics(vkmin_ctx *c, const vkmin_pipeline_desc *desc, con
 
 static VkResult make_compute(vkmin_ctx *c, const vkmin_pipeline_desc *desc, const char *label, VkPipeline *pipe) {
     shader_stage cs = {0};
-    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, desc->cs.data, desc->cs.size, label);
+    make_stage(c, &cs, VK_SHADER_STAGE_COMPUTE_BIT, desc->cs.data, desc->cs.size);
     VkPipelineRobustnessCreateInfoEXT robust;
     const VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -2807,21 +3012,6 @@ static void hot_reload_check(vkmin_ctx *c) {
 
 /* ---------------------------------------------------------------- frame -- */
 
-/* Restate what slot 0 points at, at the top of every frame. It is the same
- * owned image every time -- deliberately, because that is what lets the slot's
- * tracked `use` (TRANSFER_SRC, left there by last frame's readback or present
- * blit) survive into this frame and order this frame's first write after that
- * read. The one place to change if a swapchain image were ever bound directly.
- * `use` is not touched here: resetting it would drop that ordering. */
-static void backbuffer_bind(vkmin_ctx *c, VkImage img, VkImageView view) {
-    image_slot *bb = &c->images[VKMIN_BACKBUFFER_SLOT];
-    bb->img = img;
-    bb->view = view;
-    bb->w = c->extent.width;
-    bb->h = c->extent.height;
-    bb->format = c->backbuffer_format;
-}
-
 /* The one point a frame reads the outside world: the window, the demo file,
  * the frame list. Decides whether there is a frame and which, and takes the
  * input snapshot; frame_begin then hands all of it back as a value. */
@@ -2885,6 +3075,7 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     c->draws = 0;
     c->dispatches = 0;
     c->ring_issued_count = 0;
+    c->ring_field_count = 0;
     c->frame_config = c->config;
     if (cvar_get_bool(&c->frame_config, CV_r_hotreload)) hot_reload_check(c);
     {
@@ -2902,12 +3093,16 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
     /* Timestamps from the frame that last used this slot are complete now. */
     c->ts_count = 0;
     if (c->ts_written[c->slot] > 0) {
-        uint64_t raw[VKMIN_MAX_TIMESTAMPS];
+        uint64_t raw[VKMIN_MAX_TIMESTAMPS][2] = {{0}};
         const uint32_t first = c->slot * VKMIN_MAX_TIMESTAMPS;
-        VK_CHECK_CTX(c, vkGetQueryPoolResults(c->dev, c->query_pool, first, (uint32_t)c->ts_written[c->slot],
-                                       sizeof raw, raw, sizeof raw[0], VK_QUERY_RESULT_64_BIT));
+        const VkResult result = vkGetQueryPoolResults(c->dev, c->query_pool, first, (uint32_t)c->ts_written[c->slot],
+            sizeof raw, raw, sizeof raw[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        /* Unwritten indices stay unavailable after the slot completes. They
+         * are legal gaps, not a GPU failure and never a reason to wait. */
+        if (result != VK_NOT_READY) VK_CHECK_CTX(c, result);
         for (int i = 0; i < c->ts_written[c->slot]; ++i) {
-            c->ts_ms[i] = (double)((raw[i] - raw[0]) & c->timestamp_mask) * (double)c->timestamp_period_ns * 1e-6;
+            c->ts_ms[i] = raw[0][1] && raw[i][1] ?
+                (double)((raw[i][0] - raw[0][0]) & c->timestamp_mask) * (double)c->timestamp_period_ns * 1e-6 : (double)NAN;
         }
         c->ts_count = c->ts_written[c->slot];
     }
@@ -2926,7 +3121,6 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
         if (r != VK_SUBOPTIMAL_KHR) VK_CHECK_CTX(c, r);
         c->window_ms_total += wall_ms() - window_start;
     }
-    backbuffer_bind(c, c->offscreen_img, c->offscreen_view);
 
     c->ring_head[c->slot] = 0;
     VkCommandBuffer cmd = c->cmd[c->slot];
@@ -2957,10 +3151,26 @@ vkmin_frame vkmin_frame_begin(vkmin_ctx *c, const vkmin_clear *clear) {
                          .aspect = (float)c->extent.width / (float)c->extent.height, .input = c->input};
 }
 
+void *vkmin_ring_alloc_typed(vkmin_ctx *c, size_t bytes, uint64_t *addr_out, vkmin_address_layout fields) {
+    uint64_t addr = 0;
+    void *data = vkmin_ring_alloc(c, bytes, &addr);
+    if (addr_out) *addr_out = addr;
+    if (!c->rec && !c->rec_shared) return data;
+    VKMIN_ASSERT(fields.count <= 4096-c->ring_field_count && (!fields.count || fields.offsets), "ring address field limit");
+    for (uint32_t k = 0; k < fields.count; ++k) {
+        const uint32_t off = fields.offsets[k];
+        VKMIN_ASSERT(off <= bytes && bytes-off >= 8 && (!k || (uint64_t)fields.offsets[k-1]+8 <= off), "invalid ring address field");
+        const uint64_t field = addr-c->ring_addr-c->slot*c->ring_region+off;
+        VKMIN_ASSERT(field <= UINT32_MAX, "ring address field exceeds 32 bits");
+        c->ring_fields[c->ring_field_count++] = (uint32_t)field;
+    }
+    return data;
+}
+
 void *vkmin_ring_alloc(vkmin_ctx *c, size_t bytes, uint64_t *addr_out) {
     VKMIN_ASSERT(c && c->in_frame, "vkmin_ring_alloc outside a frame");
     const VkDeviceSize off = align_up(c->ring_head[c->slot], VKMIN_RING_ALIGN);
-    VKMIN_ASSERT(off + bytes <= c->ring_region, "host ring region exhausted: %zu bytes at %llu of %llu",
+    VKMIN_ASSERT(vkm_range_fits(c->ring_region, off, bytes), "host ring region exhausted: %zu bytes at %llu of %llu",
                  bytes, (unsigned long long)off, (unsigned long long)c->ring_region);
     c->ring_head[c->slot] = off + bytes;
     const VkDeviceSize base = c->slot * c->ring_region + off;
@@ -2980,7 +3190,8 @@ void *vkmin_ring_alloc(vkmin_ctx *c, size_t bytes, uint64_t *addr_out) {
 void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc) {
     VKMIN_ASSERT(c && desc && c->in_frame && !c->in_pass, "vkmin_barrier: must be in a frame, outside a pass");
     VkImageMemoryBarrier2 images[16];
-    VKMIN_ASSERT(desc->image_count <= 16, "too many image transitions in one barrier");
+    VKMIN_ASSERT(desc->image_count >= 0 && desc->image_count <= 16 && (!desc->image_count || desc->images),
+                 "barrier requires 0..16 image transitions and their array");
     {
         const rec_barrier rb = {.flags = (desc->compute_to_indirect_draw ? 1u : 0u) | (desc->compute_to_fragment ? 2u : 0u) |
                                          (desc->transfer_to_compute ? 4u : 0u) | (desc->frame_start ? 8u : 0u) |
@@ -3020,7 +3231,7 @@ void vkmin_barrier(vkmin_ctx *c, const vkmin_barrier_desc *desc) {
     if (desc->frame_start) {
         /* Last frame's draws and its count-readback copy read what this
          * frame's compute and fill are about to overwrite: write-after-read,
-         * so an execution dependency with no source access mask. */
+         * with execution ordering for readers and visibility for compute writes. */
         mem.srcStageMask |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
                             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                             VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -3056,7 +3267,7 @@ void vkmin_fill_buffer(vkmin_ctx *c, vkmin_buffer b, size_t offset, size_t bytes
     VKMIN_ASSERT(c && c->in_frame && !c->in_pass, "vkmin_fill_buffer: must be in a frame, outside a pass");
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, b.id, s);
-    VKMIN_ASSERT(offset + bytes <= s->size, "fill overruns buffer");
+    VKMIN_ASSERT(vkm_range_fits(s->size, offset, bytes), "fill overruns buffer");
     const rec_indirect rf = {.cmds = b.id, .cmd_offset = offset, .count_offset = bytes, .max_draws = value};
     RECORD(c, OP_FILL, rf, NULL, 0);
     vkCmdFillBuffer(c->cmd[c->slot], c->arena_buf, s->offset + offset, bytes, value);
@@ -3066,9 +3277,10 @@ void vkmin_copy_to_ring(vkmin_ctx *c, vkmin_buffer src, size_t offset, size_t by
     VKMIN_ASSERT(c && c->in_frame && !c->in_pass, "vkmin_copy_to_ring: must be in a frame, outside a pass");
     const buffer_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, src.id, s);
-    VKMIN_ASSERT(offset + bytes <= s->size, "copy overruns source buffer");
-    VKMIN_ASSERT(ring_addr >= c->ring_addr && ring_addr + bytes <= c->ring_addr + c->ring_cap,
-                 "destination is not in the ring buffer");
+    VKMIN_ASSERT(vkm_range_fits(s->size, offset, bytes), "copy overruns source buffer");
+    VKMIN_ASSERT(ring_addr >= c->ring_addr + c->slot*c->ring_region &&
+                 vkm_range_fits(c->ring_region, ring_addr - c->ring_addr - c->slot*c->ring_region, bytes),
+                 "destination is not in the current ring region");
     {
         const rec_indirect rc = {.cmds = src.id, .cmd_offset = offset, .count_offset = bytes};
         const uint64_t dst = ring_addr;
@@ -3120,18 +3332,20 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
                              .extra = {desc->extra[0].id, desc->extra[1].id},
                              .clear_depth = desc->clear_depth, .clear = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]},
                              .x = desc->x, .y = desc->y, .w = desc->w, .h = desc->h};
-        rec_named_pass named = {.pass = rp};
+        rec_named_pass named = {.pass = rp, .resolves = {desc->color_resolve.id, desc->extra_resolve[0].id, desc->extra_resolve[1].id, desc->depth_resolve.id},
+                                .depth_mode = desc->depth_resolve_mode, .raster_samples = desc->raster_samples};
         snprintf(named.label, sizeof named.label, "%s", desc->label ? desc->label : "vkmin.pass");
         RECORD(c, OP_PASS_BEGIN, named, NULL, 0);
     }
     RECORD_ENTER(c);
     if (c->inspect_dir) {
-        const uint32_t ids[4] = {desc->color.id, desc->depth.id, desc->extra[0].id, desc->extra[1].id};
-        for (int i = 0; i < 4; ++i) if (ids[i] && handle_index(ids[i]) < VKMIN_MAX_IMAGES) c->inspect_targets[handle_index(ids[i])] = true;
+        const uint32_t ids[8] = {desc->color.id, desc->depth.id, desc->extra[0].id, desc->extra[1].id,
+                                 desc->color_resolve.id, desc->depth_resolve.id, desc->extra_resolve[0].id, desc->extra_resolve[1].id};
+        for (int i = 0; i < 8; ++i) if (ids[i] && handle_index(ids[i]) < VKMIN_MAX_IMAGES) c->inspect_targets[handle_index(ids[i])] = true;
     }
     VkCommandBuffer cmd = c->cmd[c->slot];
 
-    VkImageMemoryBarrier2 barriers[4];
+    VkImageMemoryBarrier2 barriers[8];
     uint32_t barrier_count = 0;
     image_slot *color = NULL, *depth = NULL, *extra[2] = {NULL, NULL};
     uint32_t color_count = 0;
@@ -3149,6 +3363,18 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
         VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, desc->depth.id, depth);
         barriers[barrier_count++] = slot_transition(depth, VKMIN_USE_DEPTH_TARGET, desc->clear_depth);
     }
+    image_slot *resolved[4] = {NULL, NULL, NULL, NULL};
+    const uint32_t resolve_ids[4] = {desc->color_resolve.id, desc->extra_resolve[0].id, desc->extra_resolve[1].id, desc->depth_resolve.id};
+    for (int i = 0; i < 4; ++i) if (resolve_ids[i]) {
+        VKMIN_SLOT_LOOKUP(c->images, VKMIN_MAX_IMAGES, resolve_ids[i], resolved[i]);
+        /* Resolve preserves pixels outside the render area; retain prior scopes. */
+        barriers[barrier_count++] = slot_transition(resolved[i], i == 3 ? VKMIN_USE_DEPTH_TARGET : VKMIN_USE_COLOR_TARGET, false);
+    }
+    const bool to_single = desc->raster_samples > 1;
+    /* Sparse MRT layouts are not represented by this wrapper. Vulkan attachment
+     * compatibility is checked by the Khronos layer in Debug builds. */
+    VKMIN_ASSERT(!desc->extra[1].id || desc->extra[0].id, "MRT attachments must be contiguous");
+    VKMIN_ASSERT(color || (!desc->extra[0].id && !desc->extra[1].id), "MRT needs color attachment zero");
     const VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                   .imageMemoryBarrierCount = barrier_count,
                                   .pImageMemoryBarriers = barriers};
@@ -3178,18 +3404,30 @@ void vkmin_pass_begin(vkmin_ctx *c, const vkmin_pass_desc *desc) {
             .loadOp = desc->clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         };
+        if (resolved[i] || (to_single && att->samples <= 1)) {
+            color_att[i].resolveMode = att->format == VK_FORMAT_R32_UINT ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+            color_att[i].resolveImageView = resolved[i] ? resolved[i]->view : VK_NULL_HANDLE;
+            color_att[i].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
         if (i == 0) color_att[i].clearValue.color = (VkClearColorValue){.float32 = {desc->clear[0], desc->clear[1], desc->clear[2], desc->clear[3]}};
     }
+    const VkResolveModeFlagBits depth_mode = desc->depth_resolve_mode ? (VkResolveModeFlagBits)desc->depth_resolve_mode : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
     const VkRenderingAttachmentInfo depth_att = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = depth ? depth->view : VK_NULL_HANDLE,
+        .resolveMode = resolved[3] || (to_single && depth && depth->samples <= 1) ? depth_mode : VK_RESOLVE_MODE_NONE,
+        .resolveImageView = resolved[3] ? resolved[3]->view : VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         .loadOp = desc->clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue = {.depthStencil = {.depth = 1.0f}},
     };
+    const VkMultisampledRenderToSingleSampledInfoEXT ms = {
+        .sType = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT,
+        .multisampledRenderToSingleSampledEnable = VK_TRUE, .rasterizationSamples = (VkSampleCountFlagBits)desc->raster_samples};
     const VkRenderingInfo rendering = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .pNext = to_single ? &ms : NULL,
         .renderArea = {.offset = {desc->x, desc->y}, .extent = {(uint32_t)w, (uint32_t)h}},
         .layerCount = 1,
         .colorAttachmentCount = color_count,
@@ -3229,27 +3467,22 @@ void vkmin_set_depth_bias(vkmin_ctx *c, float constant, float slope) {
     vkCmdSetDepthBias(c->cmd[c->slot], constant, 0.0f, slope);
 }
 
-/* The pipeline knows its push size; the draw only supplies the bytes. Journal
- * records need it before bind_and_push runs, hence the separate lookup. */
-static uint32_t pipe_push_size(vkmin_ctx *c, vkmin_pipeline p) {
-    const pipe_slot *s = NULL;
-    VKMIN_SLOT_LOOKUP(c->pipes, VKMIN_MAX_PIPES, p.id, s);
-    return s->push_size;
-}
-
-/* Every draw and dispatch goes through here: the pipeline and the push block
- * are parameters of the call, never state left behind for the next one, so no
- * draw can inherit half of another draw's setup. */
-static void bind_and_push(vkmin_ctx *c, vkmin_pipeline p, VkPipelineBindPoint want, const void *push) {
+/* Validate vkmin's transport before either journalling or copying push bytes.
+ * One lookup per draw; the checked slot is also what gets bound. */
+static const pipe_slot *draw_pipeline(const vkmin_ctx *c, vkmin_pipeline p, VkPipelineBindPoint want, const void *push) {
     VKMIN_ASSERT(c && c->in_frame, "draw or dispatch outside a frame");
     const pipe_slot *s = NULL;
     VKMIN_SLOT_LOOKUP(c->pipes, VKMIN_MAX_PIPES, p.id, s);
-    const uint32_t bytes = s->push_size;
-    VKMIN_ASSERT(bytes == 0 || push, "'%s' pushes %u bytes but the draw passed no push block", s->label, bytes);
+    VKMIN_ASSERT(s->push_size == 0 || push, "'%s' pushes %u bytes but the draw passed no push block", s->label, s->push_size);
     VKMIN_ASSERT(s->bind_point == want, "'%s' is not a %s pipeline", s->label,
                  want == VK_PIPELINE_BIND_POINT_GRAPHICS ? "graphics" : "compute");
     VKMIN_ASSERT((want == VK_PIPELINE_BIND_POINT_GRAPHICS) == c->in_pass, "draws go inside a pass, dispatches outside");
-    vkCmdBindPipeline(c->cmd[c->slot], want, s->pipe);
+    return s;
+}
+
+static void bind_and_push(vkmin_ctx *c, const pipe_slot *s, const void *push) {
+    const uint32_t bytes = s->push_size;
+    vkCmdBindPipeline(c->cmd[c->slot], s->bind_point, s->pipe);
     if (bytes) {
         vkCmdPushConstants(c->cmd[c->slot], c->pipe_layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
@@ -3258,17 +3491,19 @@ static void bind_and_push(vkmin_ctx *c, vkmin_pipeline p, VkPipelineBindPoint wa
 }
 
 void vkmin_draw(vkmin_ctx *c, vkmin_pipeline p, const void *push, uint32_t vertices, uint32_t instances) {
-    const uint32_t push_bytes = pipe_push_size(c, p);
+    const pipe_slot *pipeline = draw_pipeline(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
+    const uint32_t push_bytes = pipeline->push_size;
     const rec_draw rd = {.pipe = p.id, .push_bytes = push_bytes, .a = vertices, .b = instances};
     RECORD(c, OP_DRAW, rd, push, push_bytes);
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
+    bind_and_push(c, pipeline, push);
     vkCmdDraw(c->cmd[c->slot], vertices, instances, 0, 0);
     c->draws++;
 }
 
 void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipeline p, const void *push, const vkmin_indirect_desc *d) {
     VKMIN_ASSERT(d && vkmin_valid(d->indices), "vkmin_draw_indirect: needs an index buffer");
-    const uint32_t push_bytes = pipe_push_size(c, p);
+    const pipe_slot *pipeline = draw_pipeline(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
+    const uint32_t push_bytes = pipeline->push_size;
     {
         const rec_indirect ri = {.pipe = p.id, .push_bytes = push_bytes, .indices = d->indices.id, .cmds = d->cmds.id,
                                  .counts = d->counts.id, .max_draws = d->max_draws, .host_count = d->host_count,
@@ -3279,34 +3514,38 @@ void vkmin_draw_indirect(vkmin_ctx *c, vkmin_pipeline p, const void *push, const
         memcpy(data + push_bytes, &d->host_cmds, 8);
         RECORD(c, OP_DRAW_INDIRECT, ri, data, push_bytes + 8);
     }
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_GRAPHICS, push);
+    bind_and_push(c, pipeline, push);
     const buffer_slot *ib = NULL;
     VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, d->indices.id, ib);
     vkCmdBindIndexBuffer(c->cmd[c->slot], c->arena_buf, ib->offset, VK_INDEX_TYPE_UINT32);
     if (vkmin_valid(d->cmds)) {
         const buffer_slot *cs = NULL;
         VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, d->cmds.id, cs);
+        VKMIN_ASSERT(vkm_range_fits(cs->size, d->cmd_offset, (uint64_t)d->max_draws * sizeof(DrawCmd)), "indirect commands overrun buffer");
         if (vkmin_valid(d->counts)) {
             const buffer_slot *ns = NULL;
             VKMIN_SLOT_LOOKUP(c->buffers, VKMIN_MAX_BUFFERS, d->counts.id, ns);
+            VKMIN_ASSERT(vkm_range_fits(ns->size, d->count_offset, sizeof(uint32_t)), "indirect count overruns buffer");
             vkCmdDrawIndexedIndirectCount(c->cmd[c->slot], c->arena_buf, cs->offset + d->cmd_offset, c->arena_buf,
                                           ns->offset + d->count_offset, d->max_draws, sizeof(DrawCmd));
         } else if (d->max_draws) {
             vkCmdDrawIndexedIndirect(c->cmd[c->slot], c->arena_buf, cs->offset + d->cmd_offset, d->max_draws, sizeof(DrawCmd));
         }
     } else if (d->host_count) {
-        VKMIN_ASSERT(d->host_cmds >= c->ring_addr && d->host_cmds < c->ring_addr + c->ring_cap,
-                     "indirect commands are not in the ring buffer");
+        VKMIN_ASSERT(d->host_cmds >= c->ring_addr + c->slot*c->ring_region &&
+                     vkm_range_fits(c->ring_region, d->host_cmds - c->ring_addr - c->slot*c->ring_region, (uint64_t)d->host_count*sizeof(DrawCmd)),
+                     "indirect commands overrun the current ring region");
         vkCmdDrawIndexedIndirect(c->cmd[c->slot], c->ring_buf, d->host_cmds - c->ring_addr, d->host_count, sizeof(DrawCmd));
     }
     c->draws++;
 }
 
 void vkmin_dispatch(vkmin_ctx *c, vkmin_pipeline p, const void *push, uint32_t x, uint32_t y, uint32_t z) {
-    const uint32_t push_bytes = pipe_push_size(c, p);
+    const pipe_slot *pipeline = draw_pipeline(c, p, VK_PIPELINE_BIND_POINT_COMPUTE, push);
+    const uint32_t push_bytes = pipeline->push_size;
     const rec_draw rd = {.pipe = p.id, .push_bytes = push_bytes, .a = x, .b = y, .cnt = z};
     RECORD(c, OP_DISPATCH, rd, push, push_bytes);
-    bind_and_push(c, p, VK_PIPELINE_BIND_POINT_COMPUTE, push);
+    bind_and_push(c, pipeline, push);
     vkCmdDispatch(c->cmd[c->slot], x, y, z);
     c->dispatches++;
 }
@@ -3390,8 +3629,8 @@ void vkmin_dump(const vkmin_ctx *c, FILE *out) {
     }
     for (uint32_t i = 0; i < VKMIN_MAX_IMAGES; ++i) {
         const image_slot *s = &c->images[i];
-        if (s->used) fprintf(out, "  image[%u]  gen %u  %-32s %ux%u mips %u  %s  tex %d\n", i, s->gen, s->label, s->w,
-                             s->h, s->mips, uses[s->use], s->tex_index == UINT32_MAX ? -1 : (int)s->tex_index);
+        if (s->used) fprintf(out, "  image[%u]  gen %u  %-32s %ux%u mips %u  %s  tex %d samples %u single_sample_render %u\n", i, s->gen, s->label, s->w,
+                             s->h, s->mips, uses[s->use], s->tex_index == UINT32_MAX ? -1 : (int)s->tex_index, s->samples ? s->samples : 1, (unsigned)s->render_to_single_sampled);
     }
     for (uint32_t i = 0; i < VKMIN_MAX_PIPES; ++i) {
         const pipe_slot *s = &c->pipes[i];
@@ -3624,7 +3863,7 @@ void vkmin_wait(vkmin_ctx *c) {
     collect_retired(c);
 }
 
-/* The read side of scan_relocs: turn the recorded form of each address back
+/* The read side of both typed and heuristic capture: turn the recorded form of each address back
  * into an address of this run. v6 records buffer identity (handle + offset) and
  * so must resolve the handle, which is also a check that the replay is holding
  * the buffer the recording had. v3-v5 recorded raw addresses and are rebased
@@ -3635,6 +3874,12 @@ static bool relocate(const vkmin_ctx *c, uint8_t *data, size_t bytes, const relo
     for (uint32_t i = 0; i < n; ++i) {
         const size_t offset = relocs[i].offset;
         if (offset > bytes || bytes - offset < sizeof(uint64_t)) return false;
+        if (relocs[i].kind == RELOC_FRAME_RING) {
+            uint64_t byte; memcpy(&byte, data+offset, sizeof byte);
+            if (c->journal_version < 7 || byte >= c->ring_region) return false;
+            const uint64_t address = c->ring_addr + c->slot*c->ring_region + byte;
+            memcpy(data+offset, &address, sizeof address); continue;
+        }
         if (relocs[i].kind == RELOC_BUFFER) {
             if (c->journal_version < 6) return false;
             uint64_t logical; memcpy(&logical, data+offset, sizeof logical);
@@ -3669,12 +3914,14 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
     FILE *events = c->events_path ? fopen(c->events_path, "w") : NULL;
     if (c->events_path && !events) { fclose(f); return false; }
     if (events) fprintf(events, "event\tframe\top\tdetail\n");
-    /* File rejection is a reported false result, not a failed program invariant.
-     * Bounds are checked before allocation, relocation or any API call. */
+    /* Framing failures return false. Record bounds are checked before allocation
+     * and relocation; invalid command semantics may still fail wrapper invariants
+     * or Vulkan validation. Replay is not a sandbox for untrusted GPU commands. */
 #define JCHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "journal '%s', record %u: ", path, records); \
     fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); goto invalid; } } while (0)
     journal_header jh;
     JCHECK(fread(&jh, sizeof jh, 1, f) == 1 && jh.magic == 0x4a4d4b56u && (jh.version >= 3 && jh.version <= JOURNAL_VERSION), "bad header");
+    JCHECK(journal_compatible(&jh), "incompatible journal ABI");
     JCHECK(jh.width == (uint32_t)c->desc.width && jh.height == (uint32_t)c->desc.height, "size differs from context");
     JCHECK(jh.version == c->journal_version, "version differs from replay context");
     uint8_t hdr[256] = {0};
@@ -3717,12 +3964,14 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             SAME(b.id, rec.result); break; }
         case OP_FREE_BUFFER: { HDR(vkmin_buffer); JHANDLE(buffers, VKMIN_MAX_BUFFERS, rec.id); vkmin_free_buffer(c, rec); break; }
         case OP_BUFFER_UPLOAD: { HDR(rec_upload); JHANDLE(buffers, VKMIN_MAX_BUFFERS, rec.id); vkmin_buffer_upload(c, (vkmin_buffer){rec.id}, rec.offset, (vkmin_bytes){data, rh.data_bytes}); break; }
-        case OP_MAKE_IMAGE: { HDR(rec_image);
+        case OP_MAKE_IMAGE: { rec_image rec = {0};
+            JCHECK(rh.hdr_bytes == (jh.version >= 7 ? sizeof rec : REC_IMAGE_OLD), "invalid image header"); memcpy(&rec, hdr, rh.hdr_bytes);
             JCHECK(rec.w > 0 && rec.h > 0 && rec.mips >= 0 && rec.mips <= 32 && rec.format < VKMIN_FMT_NONE, "invalid image description");
             JCHECK(rec.sampler < VKMIN_SAMPLER_COUNT && rec.w <= 32768 && rec.h <= 32768, "invalid image size or sampler");
             JCHECK(!rec.has_pixels || rh.data_bytes == mip_bytes(format_lookup((vkmin_format)rec.format), (uint32_t)rec.w, (uint32_t)rec.h), "invalid pixel payload");
             JCHECK(rec.label[sizeof rec.label - 1] == 0 && (rec.has_pixels || !rh.data_bytes), "invalid image data");
             const vkmin_image i = vkmin_make_image(c, &(vkmin_image_desc){.width = rec.w, .height = rec.h, .mip_levels = rec.mips,
+                .samples = rec.samples, .render_to_single_sampled = rec.to_single,
                 .format = (vkmin_format)rec.format, .usage = rec.usage, .sampler = rec.sampler, .pixels = {rec.has_pixels ? data : NULL, rh.data_bytes}, .label = rec.label});
             SAME(i.id, rec.result); break; }
         case OP_FREE_IMAGE: { HDR(vkmin_image); JHANDLE(images, VKMIN_MAX_IMAGES, rec.id); vkmin_free_image(c, rec); break; }
@@ -3744,7 +3993,8 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             } else SAME(vkmin_register_texture(c, (vkmin_image){rec.pipe}, rec.a), slot);
             break; }
         case OP_MAKE_PIPELINE:
-        case OP_REPLACE_PIPELINE: { HDR(rec_pipe);
+        case OP_REPLACE_PIPELINE: { rec_pipe rec = {0};
+            JCHECK(rh.hdr_bytes == (jh.version >= 7 ? sizeof rec : REC_PIPE_OLD), "invalid pipeline header"); memcpy(&rec, hdr, rh.hdr_bytes);
             JCHECK(rec.push_size <= VKMIN_PUSH_BYTES && rec.extra_colors <= 2 && rec.color_format <= VKMIN_FMT_NONE, "invalid pipeline description");
             JCHECK(rec.label[sizeof rec.label - 1] == 0 &&
                 (uint64_t)rec.vs_bytes + rec.fs_bytes + rec.cs_bytes == rh.data_bytes &&
@@ -3753,7 +4003,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             const uint32_t *fs = rec.fs_bytes ? (const uint32_t *)(void *)(data + rec.vs_bytes) : NULL;
             const uint32_t *cs = rec.cs_bytes ? (const uint32_t *)(void *)(data + rec.vs_bytes + rec.fs_bytes) : NULL;
             const vkmin_pipeline_desc pd = {.vs = {vs, rec.vs_bytes}, .fs = {fs, rec.fs_bytes},
-                .cs = {cs, rec.cs_bytes}, .push_size = rec.push_size, .color_format = (vkmin_format)rec.color_format, .depth = rec.depth, .depth_write = rec.depth_write,
+                .cs = {cs, rec.cs_bytes}, .samples = rec.samples, .alpha_to_coverage = rec.alpha_to_coverage, .push_size = rec.push_size, .color_format = (vkmin_format)rec.color_format, .depth = (rec.depth & 1u) != 0, .depth_attachment = jh.version < 8 ? rec.color_format == VKMIN_FMT_RGBA8_UNORM : (rec.depth & 2u) != 0, .depth_write = rec.depth_write,
                 .depth_compare = (vkmin_compare)rec.compare, .cull = (vkmin_cull)rec.cull, .blend = rec.blend, .depth_bias = rec.bias, .label = rec.label,
                 .extra_colors = (int)rec.extra_colors, .extra_format = {(vkmin_format)rec.extra_format[0], (vkmin_format)rec.extra_format[1]}};
             JCHECK((vs || cs) && !(cs && (vs || fs)), "invalid shader stages");
@@ -3804,28 +4054,29 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         case OP_PASS_BEGIN: {
             rec_pass rec = {0};
             rec_named_pass named = {0};
-            JCHECK(rh.hdr_bytes == (jh.version >= 5 ? sizeof named : sizeof rec), "invalid pass header");
+            JCHECK(rh.hdr_bytes == (jh.version >= 7 ? sizeof named : jh.version >= 5 ? REC_PASS_OLD : sizeof rec), "invalid pass header");
             if (jh.version >= 5) {
-                memcpy(&named, hdr, sizeof named);
+                memcpy(&named, hdr, rh.hdr_bytes);
                 JCHECK(named.label[sizeof named.label - 1] == 0, "invalid pass label");
                 rec = named.pass;
             } else memcpy(&rec, hdr, sizeof rec);
-            vkmin_pass_begin(c, &(vkmin_pass_desc){.color = {rec.color}, .extra = {{rec.extra[0]}, {rec.extra[1]}}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
+            vkmin_pass_begin(c, &(vkmin_pass_desc){.color_resolve = {named.resolves[0]}, .extra_resolve = {{named.resolves[1]}, {named.resolves[2]}},
+                .depth_resolve = {named.resolves[3]}, .depth_resolve_mode = (vkmin_resolve)named.depth_mode, .raster_samples = named.raster_samples, .color = {rec.color}, .extra = {{rec.extra[0]}, {rec.extra[1]}}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
                 .clear = {rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}, .x = rec.x, .y = rec.y, .w = rec.w, .h = rec.h, .label = jh.version >= 5 ? named.label : "replay"}); break; }
         case OP_PASS_END: { HDR(uint32_t); (void)rec; vkmin_pass_end(c); break; }
         case OP_VIEWPORT: { HDR(rec_pass); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
         case OP_DEPTH_BIAS: { HDR(vkmin_clear); vkmin_set_depth_bias(c, rec.r, rec.g); break; }
-        case OP_DRAW: { HDR(rec_draw); SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+        case OP_DRAW: { HDR(rec_draw); JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes == rh.data_bytes, "invalid push payload");
             vkmin_draw(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b); break; }
         case OP_DRAW_INDIRECT: { HDR(rec_indirect);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes + 8u == rh.data_bytes, "invalid indirect payload");
             uint64_t host; memcpy(&host, data + rec.push_bytes, 8);
-            SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+            JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
             vkmin_draw_indirect(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL,
                 &(vkmin_indirect_desc){.indices = {rec.indices}, .cmds = {rec.cmds}, .cmd_offset = rec.cmd_offset, .counts = {rec.counts},
                 .count_offset = rec.count_offset, .max_draws = rec.max_draws, .host_cmds = host, .host_count = rec.host_count}); break; }
-        case OP_DISPATCH: { HDR(rec_draw); SAME(pipe_push_size(c, (vkmin_pipeline){rec.pipe}), rec.push_bytes);
+        case OP_DISPATCH: { HDR(rec_draw); JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes == rh.data_bytes, "invalid push payload");
             vkmin_dispatch(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b, rec.cnt); break; }
         case OP_TIMESTAMP: { HDR(uint32_t); vkmin_timestamp(c, (int)rec); break; }

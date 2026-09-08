@@ -51,6 +51,7 @@ def capture(root, schema=None):
             for original in images:
                 image = dict(original)
                 try:
+                    if image.get('error'): raise ValueError(image['error'])
                     raw = child(root, directory + '/' + image['file']).read_bytes()
                     w, h, fmt = int(image['width']), int(image['height']), int(image['format'])
                     if w < 1 or h < 1 or w*h > 16777216:
@@ -70,6 +71,24 @@ def capture(root, schema=None):
                 point['images'].append(image)
         except (OSError, ValueError, TypeError) as error:
             point['error'] = str(error)
+        point['buffers'] = []
+        buffer_text = read_optional(root / directory / 'buffers.json')
+        if buffer_text:
+            for original in json.loads(buffer_text):
+                buffer = dict(original)
+                try:
+                    if buffer.get('error'): raise ValueError(buffer['error'])
+                    size = int(buffer['size'])
+                    if size < 1 or size > 64*1024*1024: raise ValueError('Invalid buffer size')
+                    raw = child(root, directory + '/' + buffer['file']).read_bytes()
+                    if len(raw) != size: raise ValueError('Truncated or oversized raw buffer')
+                    digest = hashlib.sha256(raw).hexdigest()
+                    if buffer.get('sha256') and buffer['sha256'] != digest: raise ValueError('Buffer hash mismatch')
+                    buffer['data'] = digest
+                    assets.setdefault(digest, base64.b64encode(raw).decode('ascii'))
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    buffer['error'] = str(error)
+                point['buffers'].append(buffer)
         points.append(point)
     schema_path = schema or root / 'push-schema.json'
     schemas = json.loads(schema_path.read_text(encoding='utf-8')) if schema_path.is_file() else {}

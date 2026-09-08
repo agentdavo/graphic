@@ -1,0 +1,261 @@
+{
+  "omega key shadow": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "omega armor and plasma": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "omega procedural jump gate": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "omega gate composite": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "omega bloom extraction": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "omega film grade": [
+    {
+      "name": "vertices",
+      "offset": 0,
+      "type": "u64"
+    },
+    {
+      "name": "frame",
+      "offset": 8,
+      "type": "u64"
+    },
+    {
+      "name": "texture_id",
+      "offset": 16,
+      "type": "u32"
+    },
+    {
+      "name": "bloom_id",
+      "offset": 20,
+      "type": "u32"
+    },
+    {
+      "name": "gate_id",
+      "offset": 24,
+      "type": "u32"
+    },
+    {
+      "name": "pass",
+      "offset": 28,
+      "type": "u32"
+    }
+  ],
+  "$buffers": {
+    "omega procedural destroyer": [
+      {
+        "name": "position",
+        "offset": 0,
+        "type": "f32",
+        "count": 3
+      },
+      {
+        "name": "normal_packed",
+        "offset": 12,
+        "type": "u32"
+      },
+      {
+        "name": "color_rg_packed",
+        "offset": 16,
+        "type": "u32"
+      },
+      {
+        "name": "color_b_codes",
+        "offset": 20,
+        "type": "u32"
+      }
+    ],
+    "frame ring": [
+      {
+        "name": "vp",
+        "offset": 0,
+        "type": "f32",
+        "count": 16
+      },
+      {
+        "name": "eye",
+        "offset": 64,
+        "type": "f32",
+        "count": 4
+      },
+      {
+        "name": "seconds_aspect_translation_aperture",
+        "offset": 80,
+        "type": "f32",
+        "count": 4
+      },
+      {
+        "name": "flash",
+        "offset": 96,
+        "type": "f32"
+      },
+      {
+        "name": "hull_texture",
+        "offset": 100,
+        "type": "u32"
+      },
+      {
+        "name": "reserved",
+        "offset": 104,
+        "type": "f32",
+        "count": 2
+      },
+      {
+        "name": "blur",
+        "offset": 112,
+        "type": "f32",
+        "count": 4
+      }
+    ]
+  }
+}

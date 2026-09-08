@@ -467,20 +467,21 @@ int main(int argc,char **argv) {
     }
     // vkmin reserves its arenas once and never grows them, so the defaults
     // (256 MB per arena, 64 MB ring) are what a program actually costs on the
-    // device whether or not it uses them. Omega's high water is 14 MB of mesh
-    // and 38 MB of render targets. 24 MB of buffer covers the whole of
+    // device whether or not it uses them. Omega uploads about 14 MB of mesh.
+    // 24 MB of buffer covers the whole of
     // OMEGA_CAPACITY at 24 bytes a vertex, so the mesh cannot outgrow it before
-    // the assert in triangle() fires; 64 MB of image covers the 2048 shadow map
-    // with room, and the ring takes the mesh upload in one chunk. Exhausting an
+    // the assert in triangle() fires; 160 MB of image covers the 2048 shadow map
+    // and 4x/8x MSAA at 720p. The ring takes the mesh upload in one chunk. Exhausting an
     // arena is a hard failure naming the size it wanted, not corruption, and
     // --metrics reports arena_high_water against these. r_arena_mb,
     // r_image_arena_mb and r_ring_mb override all three from the command line;
-    // raising r_omega_shadow past 2048 wants r_image_arena_mb raised with it.
+    // larger resolutions, shadows or sample counts may need r_image_arena_mb raised.
     cvar_state config; cvar_init(&config);
-    cvar_set(&config,CV_r_default_depth,0); // every pass here attaches omega's own depth
+    cvar_set(&config,CV_r_msaa,4);
+    cvar_set(&config,CV_r_default_depth,0); // explicit passes own their depth; presentation needs none
     vkmin_ctx *gpu=vkmin_init(&(vkmin_desc){.argc=argc,.argv=argv,.title="OMEGA - Through the Blue",
         .width=1280,.height=720,.vsync=true,.headless=headless_build,.config=&config,
-        .device_arena_bytes=24u<<20,.image_arena_bytes=64u<<20,.host_ring_bytes=16u<<20});
+        .device_arena_bytes=24u<<20,.image_arena_bytes=160u<<20,.host_ring_bytes=16u<<20});
     omega_mesh mesh=make_ship();
     fprintf(stderr,"omega: %u triangles; 30-second sequence; Iron Across the Blue 120 BPM, gate and cannons\n",mesh.count/3);
     const vkmin_buffer geometry=vkmin_make_buffer(gpu,&(vkmin_buffer_desc){
@@ -503,34 +504,35 @@ int main(int argc,char **argv) {
     const cvar_state *const cfg=vkmin_frame_config(gpu);
     const vkmin_format hdr_format=cvar_get_bool(cfg,CV_r_hdr_packed)?VKMIN_FMT_R11G11B10_FLOAT:VKMIN_FMT_RGBA16_FLOAT;
     const int shadow_size=cvar_get_int(cfg,CV_r_omega_shadow);
-    const vkmin_image hdr=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
-        .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega HDR"});
+    const vkmin_target scene_target=vkmin_make_target(gpu,&(vkmin_target_desc){
+        .width=width,.height=height,.color_format=hdr_format,.depth=true,
+        .sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega HDR scene"});
+    const vkmin_image hdr=scene_target.color;
     const vkmin_image gate_layer=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
         .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega gate veil"});
     const vkmin_image glow=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width/4>0?width/4:1,.height=height/4>0?height/4:1,
         .format=hdr_format,.usage=VKMIN_IMAGE_COLOR|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega bloom"});
-    const vkmin_image depth=vkmin_make_image(gpu,&(vkmin_image_desc){.width=width,.height=height,
-        .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH,.label="omega depth"});
     const vkmin_image shadow=vkmin_make_image(gpu,&(vkmin_image_desc){.width=shadow_size,.height=shadow_size,
         .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH|VKMIN_IMAGE_SAMPLED,.sampler=VKMIN_SAMPLER_LINEAR_CLAMP,.label="omega key shadow"});
     const uint32_t shadow_index=vkmin_index(gpu,shadow),hdr_index=vkmin_index(gpu,hdr),glow_index=vkmin_index(gpu,glow);
+    const uint32_t push_addresses[] = {offsetof(OmegaPush,vertices), offsetof(OmegaPush,frame)};
     const vkmin_pipeline shadow_pipe=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_vert_spv),
-        .fs=VKMIN_BYTES(omega_shadow_frag_spv),.push_size=sizeof(OmegaPush),.color_format=VKMIN_FMT_NONE,
+        .fs=VKMIN_BYTES(omega_shadow_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.color_format=VKMIN_FMT_NONE,
         .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.label="omega key shadow"});
     const vkmin_pipeline ship=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_vert_spv),
-        .fs=VKMIN_BYTES(omega_hull_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
-        .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.label="omega armor and plasma"});
+        .fs=VKMIN_BYTES(omega_hull_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,.samples=scene_target.samples,.alpha_to_coverage=cvar_get_bool(cfg,CV_r_alpha_to_coverage),.label="omega armor and plasma"});
     const vkmin_pipeline gate=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
-        .fs=VKMIN_BYTES(omega_gate_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .fs=VKMIN_BYTES(omega_gate_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.color_format=hdr_format,
         .cull=VKMIN_CULL_NONE,.label="omega procedural jump gate"});
     const vkmin_pipeline background=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
-        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
-        .depth=true,.depth_write=false,.cull=VKMIN_CULL_NONE,.label="omega gate composite"});
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .depth=true,.depth_write=false,.cull=VKMIN_CULL_NONE,.samples=scene_target.samples,.label="omega gate composite"});
     const vkmin_pipeline bloom=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
-        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.color_format=hdr_format,
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.color_format=hdr_format,
         .cull=VKMIN_CULL_NONE,.label="omega bloom extraction"});
     const vkmin_pipeline post=vkmin_make_pipeline(gpu,&(vkmin_pipeline_desc){.vs=VKMIN_BYTES(omega_screen_vert_spv),
-        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
+        .fs=VKMIN_BYTES(omega_post_frag_spv),.push_addresses={push_addresses,2},.push_size=sizeof(OmegaPush),.cull=VKMIN_CULL_NONE,.label="omega film grade"});
     OmegaPush p={.vertices=vkmin_address(gpu,geometry),.gate_id=vkmin_index(gpu,gate_layer)};
     bool paused=false,muted=false,ok=true; uint32_t absolute=0,phase=0; float orbit=0,elevation=0;
     mat4 previous_vp={{0}}; float previous_ship=0; uint32_t previous_visual=0; bool have_previous=false;
@@ -627,10 +629,10 @@ int main(int argc,char **argv) {
         vkmin_draw(gpu,gate,&p,3,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,2);
         vkmin_barrier(gpu,&(vkmin_barrier_desc){
-            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED},{hdr,VKMIN_USE_COLOR_TARGET},{depth,VKMIN_USE_DEPTH_TARGET}},
-            .image_count=3});
-        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=hdr,.depth=depth,.clear_color=true,.clear_depth=true,
-            .clear={0,0,0,1},.label="omega HDR scene"});
+            .images=(vkmin_transition[]){{gate_layer,VKMIN_USE_SAMPLED}},.image_count=1});
+        vkmin_pass_desc scene_pass=scene_target.pass;
+        scene_pass.clear[3]=1;
+        vkmin_pass_begin(gpu,&scene_pass);
         p.pass=OMEGA_PASS_BACKDROP; p.texture_id=p.gate_id; vkmin_draw(gpu,background,&p,3,1);
         p.pass=OMEGA_PASS_SCENE; p.texture_id=shadow_index; vkmin_draw(gpu,ship,&p,mesh.count,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,3);
@@ -642,15 +644,8 @@ int main(int argc,char **argv) {
         vkmin_barrier(gpu,&(vkmin_barrier_desc){
             .images=(vkmin_transition[]){{glow,VKMIN_USE_SAMPLED},{vkmin_backbuffer(gpu),VKMIN_USE_COLOR_TARGET}},
             .image_count=2});
-        // Pipelines that render at the backbuffer's format always declare a
-        // depth attachment (vkmin.c, make_pipeline), so this pass must supply
-        // one even though the grade is a fullscreen triangle that never tests
-        // depth. Lending it the scene's own depth buffer, which the next frame
-        // clears anyway, is what lets r_default_depth=0 drop vkmin's separate
-        // full-resolution copy. Supplying none instead is a dynamic-rendering
-        // format mismatch: it does not fail, it quietly renders differently.
-        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),.depth=depth,
-            .clear_color=true,.clear_depth=true,.label="omega presentation"});
+        vkmin_pass_begin(gpu,&(vkmin_pass_desc){.color=vkmin_backbuffer(gpu),
+            .clear_color=true,.label="omega presentation"});
         p.pass=OMEGA_PASS_GRADE; p.texture_id=hdr_index; p.bloom_id=glow_index; vkmin_draw(gpu,post,&p,3,1); vkmin_pass_end(gpu);
         vkmin_timestamp(gpu,5);
         vkmin_frame_end(gpu);

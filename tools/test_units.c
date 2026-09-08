@@ -1,6 +1,6 @@
-/* test_units -- vkmin's pure logic, driven directly with no device.
+/* test_units -- vkmin's pure logic and journal framing, with no device.
  *
- * Three units, chosen because each one is wrong quietly rather than loudly:
+ * Core units, chosen because each one is wrong quietly rather than loudly:
  *
  *  - the suballocator, which hands out ranges inside one VkDeviceMemory. A
  *    mistake does not fault and no validation layer reports it; two live
@@ -14,8 +14,8 @@
  *    the trap: block_dim is 4 for BC and 1 everywhere else, so a slip shows
  *    only on compressed textures and only as a wrong picture.
  *
- * None of it touches a Vulkan entry point, so this needs no instance, no
- * device and no driver -- the one check in this tree that runs anywhere.
+ * Range arithmetic, decimal parsing and journal framing are also checked.
+ * None of it touches a Vulkan entry point: no instance, device or driver.
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,6 +38,7 @@
 _Noreturn static void arena_fail(const char *file, int line, const char *fmt, ...);
 #define VKMIN_FAIL(...) arena_fail(__FILE__, __LINE__, __VA_ARGS__)
 #include "vkmin.h"
+#include "min_jrnl.h"
 #include <stdarg.h>
 
 /* _Noreturn like the real vkmin_fail, or format_lookup appears to fall off
@@ -117,6 +118,22 @@ static uint32_t hash(uint32_t x) {
 }
 
 int main(void) {
+    check(vkm_range_fits(16,0,16), "whole logical buffer fits");
+    check(vkm_range_fits(16,16,0), "empty span at end fits");
+    check(!vkm_range_fits(16,17,0), "offset outside logical buffer fails");
+    check(!vkm_range_fits(16,8,9), "span past logical end fails");
+    check(!vkm_range_fits(16,UINT64_MAX-3,8), "wrapped offset plus length fails");
+    check(!vkm_range_fits(128,64,UINT64_MAX), "wrapped ring allocation fails");
+    check(vkm_range_fits(UINT64_MAX,UINT64_MAX-7,7), "largest non-wrapping span fits");
+    const vkm_decimal zero=vkm_parse_decimal("0",UINT32_MAX), full=vkm_parse_decimal("4294967295",UINT32_MAX);
+    check(zero.valid && zero.value==0 && !*zero.end, "decimal zero");
+    check(full.valid && full.value==UINT32_MAX && !*full.end, "decimal maximum");
+    check(!vkm_parse_decimal("4294967296",UINT32_MAX).valid, "decimal overflow refused");
+    check(!vkm_parse_decimal("-1",INT32_MAX).valid && !vkm_parse_decimal("",INT32_MAX).valid, "negative/empty decimal refused");
+    check(!vkm_parse_decimal("16",15).valid, "caller decimal limit");
+    const vkm_decimal list=vkm_parse_decimal("12,34",INT32_MAX), junk=vkm_parse_decimal("12junk",INT32_MAX);
+    check(list.valid && list.value==12 && *list.end==',', "decimal delimiter preserved");
+    check(junk.valid && *junk.end=='j', "decimal trailing junk exposed to caller");
     arena a = {.cap = 1u << 20};
     VkDeviceSize off = 0;
 
@@ -251,6 +268,24 @@ int main(void) {
         if (fi.vk == VK_FORMAT_UNDEFINED || !fi.block_bytes || !fi.block_dim) every_format_sized = false;
     }
     check(every_format_sized, "every format maps to a real VkFormat with a size");
+
+    /* Relocation framing must distinguish absent, complete and truncated data. */
+    FILE *journal = tmpfile();
+    check(journal != NULL, "journal fixture opens");
+    if (journal) {
+        const jrnl_reloc source = {0};
+        jrnl_reloc decoded;
+        jrnl_record record = {0};
+        check(jrnl_record_read(journal, &record, NULL, 0, NULL, 0, NULL, 0), "zero relocations need no storage");
+        record.reloc_count = 1;
+        check(!jrnl_record_read(journal, &record, NULL, 0, NULL, 0, &decoded, 1), "missing relocation is rejected");
+        check(fseek(journal, 0, SEEK_SET) == 0 && fwrite(&source, sizeof source, 1, journal) == 1 &&
+              fseek(journal, 0, SEEK_SET) == 0 &&
+              jrnl_record_read(journal, &record, NULL, 0, NULL, 0, &decoded, 1), "complete relocation is read");
+        check(fseek(journal, 1, SEEK_SET) == 0 &&
+              !jrnl_record_read(journal, &record, NULL, 0, NULL, 0, &decoded, 1), "partial relocation is rejected");
+        fclose(journal);
+    }
 
     printf("pure units: %d checks, %d failures\n", checks, errors);
     return errors ? 1 : 0;

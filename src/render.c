@@ -236,9 +236,10 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
      * and no path gets none: there is no file to re-read. */
     const char *fs_path = desc->fs_path ? desc->fs_path : desc->fs.data ? NULL : "build/lit_pbr.frag.spv";
     const uint32_t push = sizeof(Push); /* every renderer pipeline pushes the one Push block */
-    r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cull_comp_spv), .push_size = push, .label = "vkr.cull"});
-    r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cluster_comp_spv), .push_size = push, .label = "vkr.cluster"});
-    const vkmin_pipeline_desc depth_desc = {.vs = VKMIN_BYTES(depth_vert_spv), .fs = VKMIN_BYTES(depth_frag_spv), .push_size = push,
+    const uint32_t push_addresses[] = {offsetof(Push,frame), offsetof(Push,aux)};
+    r->cull = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cull_comp_spv), .push_addresses = {push_addresses,2}, .push_size = push, .label = "vkr.cull"});
+    r->cluster = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(cluster_comp_spv), .push_addresses = {push_addresses,2}, .push_size = push, .label = "vkr.cluster"});
+    const vkmin_pipeline_desc depth_desc = {.vs = VKMIN_BYTES(depth_vert_spv), .fs = VKMIN_BYTES(depth_frag_spv), .push_addresses = {push_addresses,2}, .push_size = push,
                                         .color_format = VKMIN_FMT_NONE, .depth = true, .depth_write = true, .depth_compare = VKMIN_CMP_LESS,
                                         .depth_bias = true, .cull = VKMIN_CULL_BACK, .label = "vkr.depth"};
     vkmin_pipeline_desc d = depth_desc;
@@ -250,7 +251,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     /* LESS_EQUAL with write on works with and without the prepass: after a
      * prepass it behaves as EQUAL, without one it is the ordinary depth test.
      * One pipeline set instead of two, for a negligible cost. */
-    const vkmin_pipeline_desc fwd_desc = {.vs = VKMIN_BYTES(scene_vert_spv), .fs = fs, .push_size = push,
+    const vkmin_pipeline_desc fwd_desc = {.vs = VKMIN_BYTES(scene_vert_spv), .fs = fs, .push_addresses = {push_addresses,2}, .push_size = push,
                                       .vs_path = "build/scene.vert.spv", .fs_path = fs_path,
                                       .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
                                       .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
@@ -266,17 +267,17 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
     r->fwd_blend = vkmin_make_pipeline(gpu, &f);
 
     const vkmin_format bb = vkmin_backbuffer_format(gpu);
-    r->tonemap = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(tonemap_frag_spv), .push_size = push,
+    r->tonemap = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(tonemap_frag_spv), .push_addresses = {push_addresses,2}, .push_size = push,
                                                               .fs_path = "build/tonemap.frag.spv",
                                                               .color_format = bb, .cull = VKMIN_CULL_NONE, .label = "vkr.tonemap"});
     /* The batcher twice: world quads into the forward pass (HDR, depth
      * tested, MRT extras masked by .blend), screen quads onto the backbuffer. */
-    r->quad_world = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv), .push_size = push,
+    r->quad_world = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv), .push_addresses = {push_addresses,2}, .push_size = push,
                                                                  .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
                                                                  .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
                                                                  .depth = true, .depth_compare = VKMIN_CMP_LESS_EQUAL,
                                                                  .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.world"});
-    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_screen_frag_spv), .push_size = push,
+    r->quad_screen = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_screen_frag_spv), .push_addresses = {push_addresses,2}, .push_size = push,
                                                                   .color_format = bb, .cull = VKMIN_CULL_NONE, .blend = true, .label = "vkr.quads.screen"});
     if (desc->outdoor) {
         r->outside_instances = vkmin_make_buffer(gpu, &(vkmin_buffer_desc){.size = desc->max_instances*sizeof(Instance), .label = "outside.instances"});
@@ -294,8 +295,8 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
                 .sampler = VKMIN_SAMPLER_LINEAR_CLAMP, .label = "outside.bloom"});
             r->bloom_tex[k] = vkmin_index(gpu, r->bloom_target[k]);
         }
-        r->scatter = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(scatter_comp_spv), .push_size = push, .label = "outside.scatter"});
-        vkmin_pipeline_desc full = {.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(sky_frag_spv), .push_size = push,
+        r->scatter = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.cs = VKMIN_BYTES(scatter_comp_spv), .push_addresses = {push_addresses,2}, .push_size = push, .label = "outside.scatter"});
+        vkmin_pipeline_desc full = {.vs = VKMIN_BYTES(fullscreen_vert_spv), .fs = VKMIN_BYTES(sky_frag_spv), .push_addresses = {push_addresses,2}, .push_size = push,
             .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2, .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM},
             .cull = VKMIN_CULL_NONE, .depth = true, .depth_compare = VKMIN_CMP_ALWAYS, .label = "outside.sky"};
         r->sky = vkmin_make_pipeline(gpu, &full);
@@ -307,7 +308,7 @@ vkr *vkr_init(vkmin_ctx *gpu, const vkr_desc *desc) {
         full.fs = VKMIN_BYTES(bloom_frag_spv); full.label = "outside.bloom"; full.color_format = VKMIN_FMT_R11G11B10_FLOAT;
         r->bloom = vkmin_make_pipeline(gpu, &full);
         r->quad_masked = vkmin_make_pipeline(gpu, &(vkmin_pipeline_desc){.vs = VKMIN_BYTES(quad_vert_spv), .fs = VKMIN_BYTES(quad_frag_spv),
-            .push_size = push, .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
+            .push_addresses = {push_addresses,2}, .push_size = push, .color_format = VKMIN_FMT_R11G11B10_FLOAT, .extra_colors = 2,
             .extra_format = {VKMIN_FMT_R32_UINT, VKMIN_FMT_RG16_UNORM}, .depth = true, .depth_write = true,
             .depth_compare = VKMIN_CMP_LESS_EQUAL, .cull = VKMIN_CULL_NONE, .label = "outside.impostors.batcher"});
     }
@@ -892,7 +893,8 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
     memcpy(instances, f->instances, f->instance_count * sizeof(Instance));
     mat4 *bones = vkmin_ring_alloc(gpu, (f->bone_count ? f->bone_count : 1) * sizeof(mat4), &bones_addr);
     if (f->bone_count) memcpy(bones, f->bones, f->bone_count * sizeof(mat4));
-    Frame *frame = vkmin_ring_alloc(gpu, sizeof(Frame), &frame_addr);
+    const uint32_t frame_addresses[] = {offsetof(Frame,vertices), offsetof(Frame,skin_vertices), offsetof(Frame,meshes), offsetof(Frame,materials), offsetof(Frame,instances), offsetof(Frame,lights), offsetof(Frame,views), offsetof(Frame,bones), offsetof(Frame,draw_cmds), offsetof(Frame,draw_counts), offsetof(Frame,cluster_lights), offsetof(Frame,quads), offsetof(Frame,outdoor)};
+    Frame *frame = vkmin_ring_alloc_typed(gpu, sizeof(Frame), &frame_addr, (vkmin_address_layout){frame_addresses,13});
     mat4 projection = f->proj;
     if (use_taa) {
         const vec2 jitter = vkmin_taa_jitter(f->frame.index);
@@ -1237,7 +1239,7 @@ void vkr_frame(vkr *r, const vkr_frame_desc *f) {
             }
         }
     }
-    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu), .depth = vkmin_default_depth(gpu),
+    vkmin_pass_begin(gpu, &(vkmin_pass_desc){.color = vkmin_backbuffer(gpu),
                                              .clear_color = true, .label = "post"});
     Push tm = base_push;
     tm.param = post_tex;

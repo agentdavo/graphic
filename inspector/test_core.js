@@ -21,3 +21,32 @@ assert.deepEqual(C.fields('pipeline=4 label=left texture push_hex=ff00 counts=3,
 assert.equal(C.typedPush('00000000000000000000000080000000',[{name:'gain',offset:12,type:'u32'}])[0].values[0],'128');
 assert.throws(()=>C.typedPush('ff',[{name:'gain',offset:0,type:'u32'}]),/outside/);assert.throws(()=>C.typedPush('zz',[]),/Invalid/);
 console.log('Raw decoder, display transforms, comparison guards and typed layouts passed.');
+
+// Numeric comparisons preserve exact mode and include every source channel.
+const fp=v=>bytes(4,d=>d.setFloat32(0,v,true));
+assert.equal(C.difference(image(10),fp(1),image(10),fp(1.01)).count,1);
+assert.equal(C.difference(image(10),fp(1),image(10),fp(1.01),{numeric:true,absolute:.02}).count,0);
+assert.equal(C.difference(image(10),fp(100),image(10),fp(101),{numeric:true,relative:.02}).count,0);
+assert.equal(C.difference(image(10),fp(0),image(10),fp(-0)).count,1);
+assert.equal(C.difference(image(10),fp(0),image(10),fp(-0),{numeric:true}).count,0);
+assert.equal(C.difference(image(10),fp(Infinity),image(10),fp(-Infinity),{numeric:true,absolute:1e20}).count,1);
+assert.throws(()=>C.difference(image(10),fp(1),image(10),fp(2),{numeric:true,absolute:-1}),/Tolerances/);
+const command=bytes(20,v=>{v.setUint32(0,36,true);v.setUint32(4,2,true);v.setInt32(12,-8,true);});
+assert.equal(C.bufferRows(command,0,'indirect',1)[0].fields[3].values[0],'-8');
+assert.throws(()=>C.bufferRows(command,1,'indirect',1),/outside/);
+assert.throws(()=>C.bufferRows(command,0,'u32',257),/outside/);
+assert.equal(C.bufferRows(command,0,'schema',1,20,[{name:'instances',offset:4,type:'u32'}])[0].fields[0].values[0],'2');
+assert.equal(C.bufferRows(bytes(8,v=>v.setBigUint64(0,9007199254740993n,true)),0,'u64',1)[0].fields[0].values[0],'9007199254740993');
+const history=C.resourceHistory([{event:1,frame:0,op:'pass_begin',detail:'color=1048576 depth=0 extra=0,0'},
+ {event:2,frame:0,op:'draw_indirect',detail:'indices=1048577 commands=1048578 counts=1048579 refs=0:buffer:1048578:20,'},
+ {event:3,frame:0,op:'pass_end',detail:''},{event:4,frame:0,op:'dispatch',detail:''},
+ {event:5,frame:0,op:'free_buffer',detail:'value=1048578'}]);
+assert.equal(history.filter(r=>r.access==='possible write').length,1);
+assert.equal(history.filter(r=>r.access==='read').length,3);
+assert.equal(history.find(r=>r.access==='address candidate').id,'1048578');
+assert.equal(history.at(-1).access,'free');
+console.log('Numeric tolerances, indirect/structured buffers, 64-bit values and resource histories passed.');
+
+const resolves=C.resourceHistory([{event:1,frame:0,op:'pass_begin',detail:'color=10 depth=11 extra=12,0 resolves=20,21,0,22 raster_samples=0'},
+ {event:2,frame:0,op:'draw',detail:''},{event:3,frame:0,op:'pass_end',detail:''}]);
+assert.deepEqual(resolves.filter(r=>r.access==='resolve write').map(r=>[r.event,r.id]),[[3,'20'],[3,'21'],[3,'22']]);

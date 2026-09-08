@@ -23,7 +23,8 @@
  *   pure        reads only its arguments
  *   reads ctx   inspects the context, changes nothing
  *   writes ctx  changes host-side context state
- *   gpu         records GPU work or touches device memory
+ *   gpu         records GPU work or touches device memory; updates tracking
+ *               and may journal to disk when recording is enabled
  *   io          files, the window, stderr
  *
  * Single-threaded: all calls on one thread, in order, no exceptions.
@@ -77,8 +78,12 @@ typedef struct { uint32_t id; } vkmin_buffer;
 typedef struct { uint32_t id; } vkmin_image;
 typedef struct { uint32_t id; } vkmin_pipeline;
 #define vkmin_valid(h) ((h).id != 0u) /* any handle type */
+/* Byte offsets of 64-bit GPU address fields; omitted means no addresses.
+ * Offsets must be increasing and non-overlapping. Metadata is copied/consumed
+ * synchronously. Addresses may point inside a live allocation, at any alignment. */
+typedef struct { const uint32_t *offsets; uint32_t count; } vkmin_address_layout;
 typedef struct { const void *data; size_t size; } vkmin_bytes; /* a pointer and its size, never apart */
-#define VKMIN_BYTES(x) ((vkmin_bytes){(x), sizeof(x)})         /* of an array or object, not a pointer */
+#define VKMIN_BYTES(x) ((vkmin_bytes){&(x), sizeof(x)})         /* of an array or object, not a pointer */
 
 /* The version policy, and the reason there are two paths at all. vkmin targets
  * Vulkan 1.4 but keeps a 1.3 floor: the instance asks for 1.3, and the 1.4-era
@@ -104,6 +109,12 @@ typedef enum { VKMIN_USE_UNDEFINED = 0, VKMIN_USE_TRANSFER_DST, VKMIN_USE_TRANSF
                VKMIN_USE_COLOR_TARGET, VKMIN_USE_DEPTH_TARGET, VKMIN_USE_PRESENT } vkmin_use;
 typedef enum { VKMIN_IMAGE_SAMPLED = 1, VKMIN_IMAGE_COLOR = 2, VKMIN_IMAGE_DEPTH = 4,
                VKMIN_IMAGE_READBACK = 8 /* the host may read it: vkmin_pick */ } vkmin_image_usage;
+/* Resolve bits match Vulkan. Color uses average (integer color: sample zero).
+ * Depth modes must be present in vkmin_msaa_capabilities().depth_resolve_modes. */
+typedef enum { VKMIN_RESOLVE_NONE = 0, VKMIN_RESOLVE_SAMPLE_ZERO = 1,
+               VKMIN_RESOLVE_AVERAGE = 2, VKMIN_RESOLVE_MIN = 4, VKMIN_RESOLVE_MAX = 8 } vkmin_resolve;
+typedef struct { bool render_to_single_sampled; uint32_t depth_resolve_modes; } vkmin_msaa_info;
+
 typedef enum { VKMIN_CMP_LESS = 0, VKMIN_CMP_LESS_EQUAL, VKMIN_CMP_EQUAL, VKMIN_CMP_ALWAYS } vkmin_compare;
 typedef enum { VKMIN_CULL_BACK = 0, VKMIN_CULL_NONE, VKMIN_CULL_FRONT } vkmin_cull;
 enum { VKMIN_KEY_SPACE = 32, VKMIN_KEY_ESCAPE = 256, VKMIN_KEY_ENTER, VKMIN_KEY_TAB, VKMIN_KEY_RIGHT = 262, VKMIN_KEY_LEFT,
@@ -148,6 +159,7 @@ typedef struct {                  /* one snapshot per frame: taken in vkmin_fram
     X(cvars,            "cvars",            0, "list every cvar with its value, then exit")         \
     X(flags,            "flags",            0, "list these flags, then exit")                       \
     X(record,           "record",           1, "FILE: journal every call made after init")          \
+    X(record_heuristic, "record-heuristic", 0, "reference capture path: infer address words (ambiguous)") \
     X(replay,           "replay",           1, "FILE: reissue a journal, headless")                 \
     X(demo,             "demo",             1, "FILE: record each frame's index and input")         \
     X(play,             "play",             1, "FILE: feed recorded input back, one frame a record")\
@@ -180,6 +192,7 @@ typedef struct {
 } vkmin_desc;
 
 typedef struct {
+    vkmin_address_layout addresses; /* address fields in initial data; zero = plain bytes */
     vkmin_bytes data;             /* initial contents; .data 0 = uninitialised */
     size_t size;                  /* 0 = data.size */
     const char *label;            /* 0 = "buffer" */
@@ -192,6 +205,8 @@ typedef struct {
     vkmin_format format;          /* 0 = RGBA8_UNORM */
     uint32_t usage;               /* 0 = SAMPLED */
     uint32_t sampler;             /* VKMIN_SAMPLER_* for vkmin_index; 0 = linear repeat */
+    uint32_t samples;             /* 0 = 1; otherwise 1,2,4,8,16,32,64; query format/usage support */
+    bool render_to_single_sampled; /* EXT image flag: storage remains single-sampled; requires capability */
     const char *label;            /* 0 = "image" */
 } vkmin_image_desc;
 
@@ -199,18 +214,21 @@ typedef struct {
     vkmin_bytes vs;                          /* SPIR-V; required for graphics */
     vkmin_bytes fs;                          /* .data 0 = depth-only */
     vkmin_bytes cs;                          /* set instead of vs: a compute pipeline */
+    vkmin_address_layout push_addresses;     /* address fields in each push block; copied at creation */
     uint32_t push_size;                      /* bytes of the push block every draw passes; must equal the
                                               * push-constant block the SPIR-V declares, or creation aborts */
     vkmin_format color_format;               /* 0 = RGBA8_UNORM (the backbuffer); NONE for depth-only */
     int extra_colors; vkmin_format extra_format[2]; /* further colour attachments (MRT); a blended
                                               * pipeline writes only the first attachment */
-    bool depth;                              /* depth test against a D32 attachment. Backbuffer pipelines
-                                              * always carry the attachment (the default pass has one). */
+    bool depth;                              /* depth test against D32; implies depth_attachment */
+    bool depth_attachment;                   /* D32 attached with testing disabled; independent of color format */
     bool depth_write;                        /* 0 = off (set with .depth for the usual case) */
     vkmin_compare depth_compare;             /* 0 = LESS */
     vkmin_cull cull;                         /* 0 = back faces */
     bool blend;                              /* premultiplied-alpha over */
     bool depth_bias;                         /* enable dynamic depth bias */
+    uint32_t samples;                        /* 0 = 1; must match the pass rasterization sample count */
+    bool alpha_to_coverage;                  /* fixed-function coverage from output alpha; no sample shading */
     const char *label;                       /* 0 = "pipeline" */
     const char *vs_path, *fs_path, *cs_path; /* SPIR-V files to watch when cvar r_hotreload is 1;
                                               * 0 = this pipeline never reloads */
@@ -229,15 +247,37 @@ typedef struct {                  /* everything a frame reads from outside, gath
 typedef struct {
     vkmin_image color;            /* 0 = depth-only pass */
     vkmin_image extra[2];         /* MRT attachments 1 and 2, cleared to zero with the colour */
-    vkmin_image depth;            /* 0 = no depth. A pass on the backbuffer needs one anyway: every
-                                   * pipeline at the backbuffer's format declares a depth attachment
-                                   * (see vkmin_pipeline_desc.depth), and a pass without one is a
-                                   * format mismatch that renders differently rather than failing. */
+    vkmin_image depth;            /* 0 = no depth; must match the pipeline declaration */
     bool clear_color; float clear[4];
     bool clear_depth;             /* to 1.0 */
     int x, y, w, h;               /* render area; w == 0 = whole image */
+    vkmin_image color_resolve, extra_resolve[2], depth_resolve; /* single-sample outputs; 0 = none */
+    vkmin_resolve depth_resolve_mode; /* 0 = SAMPLE_ZERO when depth_resolve is supplied */
+    uint32_t raster_samples;      /* >1 enables EXT render-to-single-sampled; otherwise ordinary MSAA */
     const char *label;            /* debug label; 0 = "vkmin.pass" */
 } vkmin_pass_desc;
+
+/* Convenience target owns all its images. Output images are single-sampled.
+ * pass is a reusable template (clears enabled); copy it to change load/clear/area.
+ * Allocation and pass calls journal as ordinary images/passes, without hidden state. */
+typedef enum { VKMIN_MSAA_CONFIG = 0, VKMIN_MSAA_EXPLICIT, VKMIN_MSAA_PREFER_SINGLE } vkmin_msaa_storage;
+typedef struct {
+    int width, height;
+    vkmin_format color_format;    /* NONE for depth-only */
+    int extra_colors; vkmin_format extra_format[2];
+    bool depth, resolve_depth;    /* D32; resolve_depth requires depth */
+    vkmin_resolve depth_resolve_mode; /* 0 = SAMPLE_ZERO */
+    uint32_t samples;             /* 0 = r_msaa; choose highest supported <= requested */
+    vkmin_msaa_storage storage;   /* 0 = r_msaa_single preference; fallback is explicit */
+    uint32_t sampler;            /* for sampled output images */
+    const char *label;            /* copied into image labels; pass label is borrowed */
+} vkmin_target_desc;
+typedef struct {
+    vkmin_image color, extra[2], depth; /* depth output is 0 unless resolve_depth */
+    uint32_t samples;
+    bool render_to_single_sampled;
+    vkmin_pass_desc pass;
+} vkmin_target;
 
 typedef struct { vkmin_image image; vkmin_use use; } vkmin_transition;
 typedef struct {                  /* one batched barrier at a pass boundary */
@@ -255,7 +295,7 @@ typedef struct {                  /* an indexed indirect draw; set exactly one o
 } vkmin_indirect_desc;
 
 typedef struct {                  /* plain data, for humans and models to read */
-    double gpu_ms[VKMIN_MAX_TIMESTAMPS]; int timestamps;  /* since timestamp 0, last completed frame */
+    double gpu_ms[VKMIN_MAX_TIMESTAMPS]; int timestamps; /* since timestamp 0, last collected slot; unwritten indices = NAN */
     /* Host elapsed totals, not CPU cycles. Frame work excludes timeline waits;
      * readback excludes those waits too. Frame work also excludes window operations.
      * PNG includes encoding and file I/O. --metrics FILE writes totals at shutdown. */
@@ -294,6 +334,8 @@ typedef struct {                  /* what a device offers and what vkmin would d
 
 /* ------------------------------------------------------------ lifecycle -- */
 vkmin_report vkmin_probe(int device_index);                                  // io (a throwaway instance)
+vkmin_msaa_info vkmin_msaa_capabilities(const vkmin_ctx *);                  // reads ctx, gpu
+uint32_t vkmin_sample_counts(const vkmin_ctx *, vkmin_format, uint32_t usage); // reads ctx, gpu; bitmask (4 means 4x), 0 unsupported
 vkmin_ctx *vkmin_init(const vkmin_desc *);                                   // writes ctx, gpu, io
 void vkmin_shutdown(vkmin_ctx *);                                            // writes ctx, gpu, io
 _Noreturn void vkmin_fail(const char *file, int line, const char *fmt, ...) VKMIN_PRINTF(3, 4); // io, aborts
@@ -315,7 +357,8 @@ cvar_state *vkmin_config(vkmin_ctx *);                                       // 
 const cvar_state *vkmin_frame_config(const vkmin_ctx *);                     // reads ctx
 void vkmin_wait(vkmin_ctx *);  /* between frames: complete this context's submitted commands, not presentation */ // gpu
 void vkmin_size(const vkmin_ctx *, int *w, int *h);  /* before the loop, to size targets */ // reads ctx
-void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame host memory */ // writes ctx
+void *vkmin_ring_alloc_typed(vkmin_ctx *, size_t bytes, uint64_t *addr, vkmin_address_layout); // writes ctx
+void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame host memory; valid only for that frame slot */ // writes ctx
 
 /* ------------------------------------------------------------ resources -- */
 /* Free between frames. The handle becomes invalid immediately; storage and
@@ -324,8 +367,12 @@ void *vkmin_ring_alloc(vkmin_ctx *, size_t bytes, uint64_t *addr);  /* per-frame
  * under capacity pressure. Exhausted handle generations never wrap. */
 vkmin_buffer vkmin_make_buffer(vkmin_ctx *, const vkmin_buffer_desc *);      // writes ctx, gpu
 void vkmin_free_buffer(vkmin_ctx *, vkmin_buffer);                           // writes ctx, gpu
-uint64_t vkmin_address(vkmin_ctx *, vkmin_buffer);  /* device address, for the push block */ // reads ctx
+uint64_t vkmin_address(const vkmin_ctx *, vkmin_buffer);  /* device address, for the push block */ // reads ctx
+void vkmin_buffer_upload_typed(vkmin_ctx *, vkmin_buffer, size_t offset, vkmin_bytes, vkmin_address_layout); // gpu
 void vkmin_buffer_upload(vkmin_ctx *, vkmin_buffer, size_t offset, vkmin_bytes);        // gpu
+/* Target owns its image handles; keep the bundle intact. Copy pass to customize it. */
+vkmin_target vkmin_make_target(vkmin_ctx *, const vkmin_target_desc *);     // writes ctx, gpu, io
+void vkmin_free_target(vkmin_ctx *, vkmin_target *); /* between frames; clears bundle */ // writes ctx, gpu
 vkmin_image vkmin_make_image(vkmin_ctx *, const vkmin_image_desc *);         // writes ctx, gpu
 void vkmin_free_image(vkmin_ctx *, vkmin_image);                             // writes ctx, gpu
 void vkmin_image_upload(vkmin_ctx *, vkmin_image, int mip, vkmin_bytes);          // gpu
@@ -333,8 +380,8 @@ uint32_t vkmin_index(vkmin_ctx *, vkmin_image);     /* bindless index with the d
 uint32_t vkmin_register_texture(vkmin_ctx *, vkmin_image, uint32_t sampler); /* a second sampler */ // writes ctx, gpu
 vkmin_image vkmin_load_png(vkmin_ctx *, const char *path, bool srgb);        // writes ctx, gpu, io
 vkmin_image vkmin_backbuffer(const vkmin_ctx *);   /* the owned image presented each frame */ // reads ctx
-vkmin_image vkmin_default_depth(const vkmin_ctx *); /* its depth; passes on the backbuffer attach it.
-                                        1x1 when r_default_depth=0, for programs that attach their own */ // reads ctx
+vkmin_image vkmin_default_depth(const vkmin_ctx *); /* depth for the optional default pass only;
+                                        1x1 when r_default_depth=0. Explicit passes may omit depth. */ // reads ctx
 vkmin_format vkmin_backbuffer_format(const vkmin_ctx *);                     // pure (always RGBA8_UNORM)
 vkmin_pipeline vkmin_make_pipeline(vkmin_ctx *, const vkmin_pipeline_desc *); // writes ctx, gpu
 uint32_t vkmin_pick(vkmin_ctx *, vkmin_image r32_uint, int x, int y); /* one texel of the last
@@ -351,7 +398,7 @@ void vkmin_set_depth_bias(vkmin_ctx *, float constant, float slope);         // 
 void vkmin_draw(vkmin_ctx *, vkmin_pipeline, const void *push, uint32_t vertices, uint32_t instances); // gpu
 void vkmin_draw_indirect(vkmin_ctx *, vkmin_pipeline, const void *push, const vkmin_indirect_desc *); // gpu
 void vkmin_dispatch(vkmin_ctx *, vkmin_pipeline, const void *push, uint32_t x, uint32_t y, uint32_t z); // gpu
-void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, read via stats */ // gpu
+void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, sparse allowed; write 0 as baseline */ // gpu
 
 /* ---------------------------------------------------------- the journal -- */
 /* --record FILE writes every call after init -- function, arguments, data --
@@ -359,7 +406,9 @@ void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, re
  * calls; the render path reads no clock, so the frames are identical. A bug
  * report is a file; a regression is a journal and a frame number. Device
  * addresses inside pushed data are relocated by exact match against the
- * addresses vkmin issued, so a journal replays across runs and paths. */
+ * addresses vkmin issued. Payload addresses must be 8-byte aligned, use an
+ * issued buffer/ring base, and carry interior offsets separately. Untyped bytes
+ * equal to an issued address are ambiguous; relocation is not type reflection. */
 bool vkmin_replay(vkmin_ctx *, const char *path);                            // writes ctx, gpu, io
 /* A demo is the input half of a journal: --demo FILE writes each frame's
  * index and vkmin_inputs; --play FILE feeds them back, one frame per record,

@@ -332,6 +332,18 @@ add_executable(test_units tools/test_units.c)
 target_include_directories(test_units PRIVATE src)
 target_link_libraries(test_units PRIVATE vkmin_flags Vulkan::Vulkan)
 
+add_executable(test_msaa tools/test_msaa.c)
+target_include_directories(test_msaa PRIVATE "${VKMIN_GENERATED_DIR}")
+target_link_libraries(test_msaa PRIVATE vkmin_flags vkmin)
+add_dependencies(test_msaa shaders)
+add_executable(test_relocation tools/test_relocation.c)
+target_include_directories(test_relocation PRIVATE "${VKMIN_GENERATED_DIR}")
+target_link_libraries(test_relocation PRIVATE vkmin_flags vkmin)
+add_dependencies(test_relocation shaders)
+add_executable(test_window tools/test_window.c)
+target_link_libraries(test_window PRIVATE vkmin_flags vkmin)
+
+
 # --------------------------------------------------------- sndmin unit test ---
 # The audio half's pure maths and its song parser. sndmin links neither vkmin
 # nor Vulkan, so this needs no GPU -- and because sndmin renders offline, no
@@ -358,3 +370,11 @@ add_dependencies(omega shaders)
 message(STATUS "vkmin ${PROJECT_VERSION}: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}, "
                "${CMAKE_BUILD_TYPE}, backend ${VKMIN_PLAT_RESOLVED}, "
                "analyser ${VKMIN_ANALYZER}, sanitizers ${VKMIN_SANITIZE}")
+
+# Repeatable device-free checks; GPU suites are explicit because capability coverage varies.
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME units COMMAND test_units)
+    add_test(NAME sound COMMAND test_sndmin)
+    add_test(NAME source-budgets COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/sizes.py" --check)
+endif()

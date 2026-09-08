@@ -63,7 +63,7 @@ Any frame can be rendered on its own, headless:
 
 ### vkmin — the GPU layer
 
-`src/vkmin.h` is 352 lines of header over 3966 of implementation, and the
+`src/vkmin.h` is 408 lines of header over 4200 of implementation, and the
 header is the documentation. Device setup, two device arenas, a persistently
 mapped host ring, bindless textures, pipelines, command recording, timestamps
 and readback. It has no opinion about your scene.
@@ -113,6 +113,109 @@ It exists to be recorded and replayed. Until it did, `render.c`, `cull.comp`,
 `cluster.comp` and the lit shaders ran nowhere, so the agreement check below
 was blind to every line of them. `+d_check_cull 1` additionally compares the
 GPU draw list against the CPU reference and reports the mismatch count.
+
+---
+
+## Hardware MSAA
+
+vkmin supports fixed-function MSAA through Vulkan 1.3 dynamic rendering on
+both execution paths. Image and pipeline descriptions accept `samples` (zero
+means one); `vkmin_sample_counts(ctx, format, usage)` returns the supported
+sample-count mask for that format/usage. Intersect the masks for the color and
+depth attachments, then choose 1, 2, 4, 8, 16, 32 or 64 from the result.
+
+For a complete target, `vkmin_make_target` performs negotiation, allocation and
+resolve wiring. It supports one to three color outputs, optional D32 depth,
+and optional resolved depth. The returned `color`, `extra[]` and requested
+`depth` outputs are single-sampled; `pass` is a reusable pass descriptor with
+clears enabled. Keep the bundle intact and free it between frames with
+`vkmin_free_target`, which releases each owned image once.
+
+```c
+vkmin_target scene = vkmin_make_target(ctx, &(vkmin_target_desc){
+    .width = width, .height = height, .color_format = VKMIN_FMT_RGBA16_FLOAT,
+    .depth = true, .samples = 4, .storage = VKMIN_MSAA_PREFER_SINGLE,
+    .sampler = VKMIN_SAMPLER_LINEAR_CLAMP, .label = "scene"});
+// Set graphics pipeline .samples = scene.samples and .depth = true.
+vkmin_pass_begin(ctx, &scene.pass);
+// Draw geometry, then end the pass and transition scene.color to SAMPLED.
+vkmin_pass_end(ctx);
+```
+
+Target `samples = 0` reads `r_msaa`; storage `VKMIN_MSAA_CONFIG` reads
+`r_msaa_single`. An explicit storage preference overrides that cvar. The helper
+selects the highest common count no greater than requested and falls back to
+ordinary attachments when EXT is unavailable. Low-level image and pipeline
+counts remain exact. Debug builds enable Khronos validation for pipeline/pass
+compatibility and resolve rules. The wrapper checks its own handles, logical
+buffer ranges and C/GLSL transport. Targets have fixed dimensions; recreate them
+between frames to resize.
+
+Depth attachment presence is independent of color format. Pipeline `depth`
+enables testing and declares D32; `depth_attachment` declares D32 without
+testing (including for pipelines used in the default backbuffer/depth pass).
+Both false means no depth attachment, so fullscreen presentation needs no
+dummy depth image. OMEGA and the scene renderer use this depth-free presentation.
+
+A pass specifies `color_resolve`, `extra_resolve[2]` and optionally
+`depth_resolve`. Color resolves average samples; R32_UINT resolves sample zero.
+Depth supports `SAMPLE_ZERO`, `AVERAGE`, `MIN` and `MAX` where reported by
+`vkmin_msaa_capabilities(ctx).depth_resolve_modes`; zero defaults to sample zero
+when a depth resolve is present. Resolve images are single-sampled, match the
+source format and cover the render area. Source images and pipelines use the
+same sample count. Multisampled images have one mip and no direct CPU upload,
+readback or combined-sampler registration; use their resolved images for those.
+
+`alpha_to_coverage` on a pipeline enables fixed-function alpha coverage.
+Sample shading remains disabled: MSAA needs no extra AA shader or history.
+
+If `vkmin_msaa_capabilities(ctx).render_to_single_sampled` is true, images may
+set `render_to_single_sampled=true` with single-sample storage. A pass with
+`raster_samples > 1` enables `VK_EXT_multisampled_render_to_single_sampled`;
+its pipelines use that raster sample count. These flagged single-sample
+attachments resolve implicitly, so leave their explicit resolve handles zero.
+The ordinary multisample attachment path remains available on either Vulkan
+version. The library never silently changes a requested image/pipeline count.
+
+OMEGA now requests **4x MSAA** for its HDR geometry pass. It resolves before
+bloom and grading. Shadow maps and fullscreen effects remain single-sampled.
+vkmin prints the requested and selected count, falling back to the highest
+supported count no greater than the request. Startup controls:
+
+```sh
+./build/omega +r_msaa 1                    # previous single-sample behavior
+./build/omega +r_msaa 4                    # default
+./build/omega +r_msaa 8
+./build/omega +r_msaa 4 +r_msaa_single 1    # prefer EXT; report fallback if absent
+./build/omega +r_msaa 4 +r_alpha_to_coverage 1
+```
+
+OMEGA's opaque shader outputs normally have alpha 1, so alpha-to-coverage is
+exposed for experimentation and is off by default. It does not improve its
+procedural shader details. The image arena is now 160 MiB; larger resolutions
+or high sample counts may require `+r_image_arena_mb N`.
+
+Version-8 journals preserve explicit pipeline depth attachment declarations,
+image samples/flags, pipeline samples/coverage,
+and pass resolve targets/modes. Ring pointers are frame-relative so recording
+and replay can use different ring sizes. Replay still reads versions 3-7
+(versions 3-6 multi-frame ring pointers require the original ring-size setting). An EXT
+recording requires that extension on the replay device. The inspector shows
+sample counts and resolve writes, reads exact resolved pixels and explicitly
+marks unresolved multisample storage as unavailable for raw readout. It does
+not misrepresent an averaged pixel as an individual sample.
+
+```sh
+cmake --build build --target test_msaa replay omega
+python tools/check_msaa.py --build build --out NEW_TEST_DIRECTORY
+```
+
+Use a Debug build for synchronization validation. The GPU regression exercises
+supported sample counts, explicit and helper-created MRT/depth resolves, target
+cleanup/fallback, vertex-stage sampling, sparse timestamps, CLI precedence,
+wrapper bounds/transport, Khronos rejection in Debug, zero-alpha coverage, and exact
+record/replay images on each supported execution path. The optional extension
+cases skip explicitly on devices that do not support them.
 
 ---
 
@@ -302,17 +405,17 @@ within a line on every file in the tree.
 
 | | code | budget |
 | --- | --- | --- |
-| vkmin core (`vkmin.c`, cvar, stb) | 3593 | 4200 |
-| public header `vkmin.h` | 233 | 300 |
-| gpu headers | 397 | 900 |
-| common (`min_*`) | 345 | 700 |
+| vkmin core (`vkmin.c`, cvar, stb) | 3669 | 4200 |
+| public header `vkmin.h` | 266 | 300 |
+| gpu headers | 489 | 900 |
+| common (`min_*`) | 347 | 700 |
 | platform boundary and all four backends | 828 | 1100 |
-| render layer | 1247 | 2600 |
+| render layer | 1250 | 2600 |
 | render headers | 433 | 1000 |
 | sndmin | 1110 | 2200 |
 | sndmin headers | 267 | 900 |
-| shaders, including shared GLSL | 1592 | 2000 |
-| demos (`omega.c`, `scene.c`, the kit) | 1054 | 1400 |
+| shaders, including shared GLSL | 1611 | 2000 |
+| demos (`omega.c`, `scene.c`, the kit) | 1076 | 1400 |
 
 Generated and vendored code — the baked font, the model arrays,
 `src/third_party` — is measured but never budgeted; it is not ours to shrink.

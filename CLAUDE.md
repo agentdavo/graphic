@@ -322,10 +322,12 @@ loader and `glslangValidator`.
   Under it, Windows will not launch `build/omega.exe` without a `./` prefix.
   Run executables from the PowerShell tool, or `env -u
   NoDefaultCurrentDirectoryInExePath` first.
-- There is no test suite, no static-analysis pass beyond the compiler's own
-  `-fanalyzer`, and no `cppcheck` or lavapipe in the tree. Section 4 describes
-  the regime this project is meant to run under, not what a checkout currently
-  enforces.
+- Tests include `test_units`, `test_sndmin`, `tools/test_inspector.py`, and
+  `tools/check_msaa.py` (GPU validation and deterministic replay). GCC builds
+  run `-fanalyzer`; Clang's analyzer can also inspect the core with
+  `clang --analyze -std=c11 -DVKMIN_NO_PLATFORM -Isrc` and the Vulkan SDK
+  include path. There is no `cppcheck` or lavapipe in the tree. Section 4
+  remains the broader regime, not a claim that every listed technique is automated.
 - Validation follows `NDEBUG`, and every CMake build type except `Debug`
   defines it. So `-DCMAKE_BUILD_TYPE=Debug` is the only way to get the
   validation section 7 relies on, and it is worth building periodically for a

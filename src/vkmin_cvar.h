@@ -15,6 +15,9 @@
 #define VKMIN_CVAR_LIST(X)                                                           \
     X(r_host_layouts, 1.0f, "1 supported host image transitions, 0 GPU transition reference") \
     X(r_grass_patch, 1.0f, "valley grass: 1 48-blade patches, 0 single-blade reference") \
+    X(r_msaa, 1.0f, "target default: requested sample count 1/2/4/8/16/32/64")          \
+    X(r_msaa_single, 0.0f, "target default: prefer EXT render-to-single-sampled when available") \
+    X(r_alpha_to_coverage, 0.0f, "Omega startup: alpha-to-coverage on geometry")       \
     X(taa, 0.0f, "temporal AA; --frame N warms up 0..N when enabled")                \
     X(bloom, 0.0f, "HDR bloom strength; fixed exposure via r_exposure")                 \
     X(r_width, 1280.0f, "render width in pixels (headless or window)")               \

@@ -99,7 +99,7 @@ static inline bool jrnl_record_read(FILE *f, const jrnl_record *r, void *hdr, si
                                     void *data, size_t data_cap, jrnl_reloc *relocs, size_t reloc_cap) {
     return r->hdr_bytes <= hdr_cap && r->data_bytes <= data_cap && r->reloc_count <= reloc_cap &&
         jrnl_bytes_read(f, hdr, r->hdr_bytes) && jrnl_bytes_read(f, data, r->data_bytes) &&
-        jrnl_bytes_read(f, relocs, r->reloc_count*sizeof *relocs);
+        (r->reloc_count == 0 || (relocs && fread(relocs, sizeof *relocs, r->reloc_count, f) == r->reloc_count));
 }
 /* Explicit little-endian, so the file says the same thing on a big-endian host.
  * The shift-and-mask is the whole portability story of the container; do not
@@ -167,7 +167,7 @@ static inline bool jrnl_skip(FILE *f, uint32_t bytes) {
  * Two file shapes go in and one comes out:
  *   - a file WITHOUT the JRNL magic is a legacy single-stream journal. It is
  *     already exactly what the caller wants, so it is rewound and returned as
- *     is, `tag` ignored. This is why the magic is read with fread and rewind
+ *     is, `tag` ignored. This is why the magic is read with fread and seek
  *     rather than jrnl_open: a mismatch is a valid outcome here, not an error.
  *   - a file WITH the magic is walked packet by packet; matching payloads are
  *     copied out and everything else is skipped.
@@ -183,7 +183,8 @@ static inline bool jrnl_skip(FILE *f, uint32_t bytes) {
 static inline FILE *jrnl_stream_open(const char *path,uint32_t tag) {
     FILE *f=fopen(path,"rb"); if(!f) return NULL;
     unsigned char magic[8];
-    const size_t got=fread(magic,1,8,f); rewind(f);
+    const size_t got=fread(magic,1,8,f);
+    if(fseek(f,0,SEEK_SET)!=0) { fclose(f); return NULL; }
     const unsigned char shared[8]={'J','R','N','L',1,0,0,0};
     if(got!=8||memcmp(magic,shared,8)!=0) return f;
     if(!jrnl_bytes_read(f,magic,8)) { fclose(f); return NULL; }
@@ -207,6 +208,7 @@ static inline FILE *jrnl_stream_open(const char *path,uint32_t tag) {
     }
     fclose(f);
     if(!ok||result<0||!found) { fclose(out); return NULL; }
-    rewind(out); return out;
+    if(fseek(out,0,SEEK_SET)!=0) { fclose(out); return NULL; }
+    return out;
 }
 #endif
