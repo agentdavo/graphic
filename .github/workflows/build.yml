@@ -222,6 +222,14 @@ jobs:
         run: |
           cmake --build build --target test_units
           ./build/test_units
+      # sndmin links neither vkmin nor Vulkan and renders offline, so its unit
+      # test needs no GPU and no sound card either. Until this existed the
+      # audio half's entire verification was two WAV hashes from omega, and
+      # sndmin_song.c had never been executed by anything.
+      - name: The audio maths and the song parser
+        run: |
+          cmake --build build --target test_sndmin
+          ./build/test_sndmin
       - name: Build shaders
         run: cmake --build build --target shaders
       - name: Build vkmin

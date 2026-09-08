@@ -332,6 +332,13 @@ add_executable(test_units tools/test_units.c)
 target_include_directories(test_units PRIVATE src)
 target_link_libraries(test_units PRIVATE vkmin_flags Vulkan::Vulkan)
 
+# --------------------------------------------------------- sndmin unit test ---
+# The audio half's pure maths and its song parser. sndmin links neither vkmin
+# nor Vulkan, so this needs no GPU -- and because sndmin renders offline, no
+# sound card either. sndmin_song.c had no caller at all before this.
+add_executable(test_sndmin tools/test_sndmin.c)
+target_link_libraries(test_sndmin PRIVATE vkmin_flags sndmin sndmin_null)
+
 # ----------------------------------------------------------------- replay ---
 # A journal replays into a different code path than the one that recorded it,
 # but a replaying context is driven by vkmin_replay rather than the host's own
