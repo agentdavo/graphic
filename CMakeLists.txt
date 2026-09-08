@@ -318,7 +318,7 @@ endif()
 # keeps its own gk_ prefix and its own malloc/exit policy, which is why it sits
 # here and not in src/ with the four library owners.
 add_executable(scene demo/scene.c)
-target_include_directories(scene PRIVATE demo)
+target_include_directories(scene PRIVATE demo "${VKMIN_GENERATED_DIR}")
 target_compile_options(scene PRIVATE ${VKMIN_FP_EXACT})
 target_link_libraries(scene PRIVATE vkmin_flags render vkmin)
 

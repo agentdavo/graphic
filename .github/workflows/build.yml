@@ -100,6 +100,14 @@ jobs:
           ./build/scene --headless --size 320 180 --frame 300 --out out-legacy.png --outdoor --path=legacy
           ./build/scene --headless --size 320 180 --frame 300 --out out-modern.png --outdoor --path=modern
           cmp out-legacy.png out-modern.png
+      # vkr_desc.fs lets a game supply its own fragment shader. Nothing
+      # exercised it, so both the feature and the cel shader it selects were
+      # embedded and never run.
+      - name: A caller-supplied fragment shader agrees too
+        run: |
+          ./build/scene --headless --size 320 180 --frame 300 --out cel.png --record cel.vkj --cel
+          ./build/replay --replay cel.vkj --frame 300 --path=legacy --out cel-replay.png
+          cmp cel.png cel-replay.png
       # The one agreement check the tree can still make: a frame rendered
       # directly, and the same frame replayed from its journal by a different
       # program on the other code path. Byte equality or nothing.

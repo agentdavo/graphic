@@ -16,6 +16,7 @@
  * is a real check of the render layer, which is the point of the program.
  */
 #include "gamekit.h"
+#include "shaders.h"   /* for the alternative fragment shaders below */
 
 enum { GRID = 12, OBJECTS = GRID * GRID, GROUND = OBJECTS, INSTANCES = OBJECTS + 1,
        LIGHTS = 4, BILLBOARDS = 6, SPACING = 4 };
@@ -57,8 +58,11 @@ int main(int argc, char **argv) {
         "  +r_gpu_cull 0                     any cvar; --cvars lists them\n");
     /* Outdoor is decided before vkr_init because it creates the sky, water,
      * history and bloom targets there, so it cannot be a per-frame cvar. */
-    bool outdoor = false;
-    for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--outdoor")) outdoor = true;
+    bool outdoor = false, cel = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--outdoor")) outdoor = true;
+        if (!strcmp(argv[i], "--cel")) cel = true;
+    }
     cvar_state config = opt.config;
     vkmin_ctx *gpu = vkmin_init(&(vkmin_desc){.argc = argc, .argv = argv, .title = "scene",
         .width = 1280, .height = 720, .vsync = true, .headless = opt.headless, .config = &config,
@@ -68,7 +72,12 @@ int main(int argc, char **argv) {
     vkmin_size(gpu, &width, &height);
     vkr *r = vkr_init(gpu, &(vkr_desc){.width = width, .height = height, .shadow_atlas = 2048,
         .max_vertices = 8192, .max_indices = 16384, .max_meshes = 8, .max_materials = 8,
-        .max_instances = INSTANCES + BILLBOARDS, .outdoor = outdoor});
+        .max_instances = INSTANCES + BILLBOARDS, .outdoor = outdoor,
+        /* render.h offers vkr_desc.fs so a game can supply its own fragment
+         * shader "composed from shaders/lib". Nothing exercised that, which
+         * left both the feature and lit_cel.frag embedded but never run.
+         * Passing the shipped cel shader is the smallest thing that does. */
+        .fs = cel ? VKMIN_BYTES(lit_cel_frag_spv) : (vkmin_bytes){0}});
 
     const gk_shapes shapes = gk_upload_shapes(r);
     const uint32_t checker = gk_checker_texture(gpu, 256, 16,
@@ -121,12 +130,17 @@ int main(int argc, char **argv) {
          * build_views negates it to recover to_sun. Passing it through
          * unnegated puts the sun below the horizon and every surface loses its
          * direct term, which looks like flat ambient rather than an error. */
+        /* Cel shading quantises N.L to a ramp and adds a stepped specular, so
+         * the same radiance that reads as lit under PBR saturates under it.
+         * Scaling here rather than leaving it blown keeps the image useful as
+         * a regression target: a frame that is mostly white hides changes. */
+        const float lit = cel ? 0.45f : 1.0f;
         const vec4 to_sun = vkmin_sun_direction(9.0f + 2.0f * sinf(t * 0.05f));
-        lights[0] = gk_sun((vec3){-to_sun.x, -to_sun.y, -to_sun.z}, 3.2f);
+        lights[0] = gk_sun((vec3){-to_sun.x, -to_sun.y, -to_sun.z}, 3.2f * lit);
         for (uint32_t k = 0; k < LIGHTS; ++k) {
             const vec3 p = light_position(k, frame);
             const vec3 tint = {0.4f + 0.6f * gk_hash(31u, k), 0.4f + 0.6f * gk_hash(37u, k), 0.5f + 0.5f * gk_hash(41u, k)};
-            lights[1u + k] = gk_point_light(p, 18.0f, tint, 40.0f);
+            lights[1u + k] = gk_point_light(p, 18.0f, tint, 40.0f * lit);
         }
 
         /* Transparent, drawn after the opaque pass and sorted back to front. */
@@ -179,7 +193,11 @@ int main(int argc, char **argv) {
             .lights = lights, .light_count = LIGHTS + 1u,
             .quads = billboards, .quad_count = BILLBOARDS,
             .overlay_text = overlay,
-            .look = {.outline = 0.35f, .fog = {0.42f, 0.48f, 0.58f}, .fog_density = 0.004f},
+            .look = {.outline = 0.35f, .fog = {0.42f, 0.48f, 0.58f}, .fog_density = 0.004f,
+                     /* Read only by lit_cel.frag, so they are dead with the
+                      * default PBR shader and exercised with --cel. */
+                     .rim_strength = cel ? 0.6f : 0.0f, .rim_power = cel ? 2.5f : 0.0f,
+                     .spec_step = cel ? 0.35f : 0.0f},
             .outdoor = outdoor ? &outside : NULL,
             .frame = f});
         vkmin_frame_end(gpu);
