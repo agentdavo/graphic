@@ -192,10 +192,10 @@ typedef struct {
 } vkmin_desc;
 
 typedef struct {
-    vkmin_address_layout addresses; /* address fields in initial data; zero = plain bytes */
     vkmin_bytes data;             /* initial contents; .data 0 = uninitialised */
     size_t size;                  /* 0 = data.size */
     const char *label;            /* 0 = "buffer" */
+    vkmin_address_layout addresses; /* address fields in initial data; zero = plain bytes */
 } vkmin_buffer_desc;
 
 typedef struct {
@@ -214,7 +214,6 @@ typedef struct {
     vkmin_bytes vs;                          /* SPIR-V; required for graphics */
     vkmin_bytes fs;                          /* .data 0 = depth-only */
     vkmin_bytes cs;                          /* set instead of vs: a compute pipeline */
-    vkmin_address_layout push_addresses;     /* address fields in each push block; copied at creation */
     uint32_t push_size;                      /* bytes of the push block every draw passes; must equal the
                                               * push-constant block the SPIR-V declares, or creation aborts */
     vkmin_format color_format;               /* 0 = RGBA8_UNORM (the backbuffer); NONE for depth-only */
@@ -232,6 +231,7 @@ typedef struct {
     const char *label;                       /* 0 = "pipeline" */
     const char *vs_path, *fs_path, *cs_path; /* SPIR-V files to watch when cvar r_hotreload is 1;
                                               * 0 = this pipeline never reloads */
+    vkmin_address_layout push_addresses;     /* address fields in each push block; copied at creation */
 } vkmin_pipeline_desc;
 
 typedef struct { float r, g, b, a; } vkmin_clear;
@@ -404,11 +404,15 @@ void vkmin_timestamp(vkmin_ctx *, int index);   /* 0..VKMIN_MAX_TIMESTAMPS-1, sp
 /* --record FILE writes every call after init -- function, arguments, data --
  * to an append-only file. vkmin_replay reads it back and issues the same
  * calls; the render path reads no clock, so the frames are identical. A bug
- * report is a file; a regression is a journal and a frame number. Device
- * addresses inside pushed data are relocated by exact match against the
- * addresses vkmin issued. Payload addresses must be 8-byte aligned, use an
- * issued buffer/ring base, and carry interior offsets separately. Untyped bytes
- * equal to an issued address are ambiguous; relocation is not type reflection. */
+ * report is a file; a regression is a journal and a frame number. Address
+ * fields are declared with push_addresses, buffer addresses, or the typed
+ * upload/ring functions. Undeclared bytes are never inferred to be pointers;
+ * declared fields may be unaligned and may reference an interior byte.
+ * --record-heuristic retains the ambiguous base-matching reference path.
+ * v9 fingerprints record packing, endianness and floating representation;
+ * incompatible files are rejected. The native replay API requires trusted
+ * commands/shaders. tools/replay_isolated.py supplies CPU-only containment
+ * for untrusted files; tools/check_journal.py checks files without a GPU. */
 bool vkmin_replay(vkmin_ctx *, const char *path);                            // writes ctx, gpu, io
 /* A demo is the input half of a journal: --demo FILE writes each frame's
  * index and vkmin_inputs; --play FILE feeds them back, one frame per record,

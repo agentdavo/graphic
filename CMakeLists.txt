@@ -178,7 +178,8 @@ list(APPEND VKMIN_SHADER_DEPS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/render_shared.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vkmin_gpu.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/min_types.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/omega/omega_shared.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/omega/omega_shared.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/omega/omega_mounts.h")
 
 # SPIR-V 1.5 keeps discard as OpKill; newer compilers otherwise introduce the
 # optional shaderDemoteToHelperInvocation feature without asking us.
@@ -360,7 +361,7 @@ add_executable(replay tools/replay.c)
 target_link_libraries(replay PRIVATE vkmin_flags vkmin)
 
 # ------------------------------------------------------------------ omega ---
-add_executable(omega omega/omega.c)
+add_executable(omega omega/omega.c omega/omega_model.c)
 target_include_directories(omega PRIVATE omega "${VKMIN_GENERATED_DIR}")
 target_compile_options(omega PRIVATE ${VKMIN_FP_EXACT})
 target_link_libraries(omega PRIVATE vkmin_flags vkmin sndmin ${OMEGA_AUDIO})
@@ -374,7 +375,16 @@ message(STATUS "vkmin ${PROJECT_VERSION}: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPI
 # Repeatable device-free checks; GPU suites are explicit because capability coverage varies.
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(test_omega_weapons tools/test_omega_weapons.c)
+    target_include_directories(test_omega_weapons PRIVATE omega src)
+    target_link_libraries(test_omega_weapons PRIVATE vkmin_flags)
+    if(NOT WIN32)
+        target_link_libraries(test_omega_weapons PRIVATE m)
+    endif()
+    add_test(NAME omega-weapons COMMAND test_omega_weapons)
     add_test(NAME units COMMAND test_units)
     add_test(NAME sound COMMAND test_sndmin)
+    add_test(NAME journal-admission COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_journal.py")
     add_test(NAME source-budgets COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/sizes.py" --check)
 endif()

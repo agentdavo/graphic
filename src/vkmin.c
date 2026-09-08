@@ -288,6 +288,7 @@ struct vkmin_ctx {
     int ring_issued_count;
     uint32_t ring_fields[4096], ring_field_count;
     bool record_heuristic;
+    uint32_t replay_fields[4096], replay_field_count, replay_op;
     const char *record_path, *replay_path;
 
     /* Input: one snapshot a frame, taken in frame_begin and read nowhere else.
@@ -584,7 +585,8 @@ static void journal_write(vkmin_ctx *c, uint32_t op, const void *hdr, size_t hdr
     if (c->record_heuristic) n = data ? scan_relocs(c, data, data_bytes, relocs, VKMIN_MAX_RELOCS) : 0;
     else {
         uint32_t offsets[VKMIN_PUSH_BYTES / 8 + 1];
-        if (op == OP_DRAW || op == OP_DRAW_INDIRECT || op == OP_DISPATCH) {
+        if (c->replaying && c->replay_op == op) fields = (vkmin_address_layout){c->replay_fields,c->replay_field_count};
+        else if (op == OP_DRAW || op == OP_DRAW_INDIRECT || op == OP_DISPATCH) {
             uint32_t pipe; memcpy(&pipe, hdr, sizeof pipe);
             const pipe_slot *s = &c->pipes[handle_index(pipe)];
             fields = s->desc.push_addresses;
@@ -980,7 +982,7 @@ static void pick_physical_device(vkmin_ctx *c) {
     fprintf(stderr, "vkmin: path = %s (%s)%s\n", c->path == VKMIN_PATH_MODERN ? "modern" : "legacy", reason,
             c->debug ? (c->caps.pipeline_robustness && c->caps.robust_buffer_access2
                             ? "; debug pipelines use robustBufferAccess2"
-                            : "; robustBufferAccess2 absent, debug pipelines without it")
+                            : "; per-pipeline robustness unavailable in debug pipelines")
                      : "");
 }
 
@@ -1383,8 +1385,13 @@ static void imm_end(vkmin_ctx *c) {
     VK_CHECK_CTX(c, vkEndCommandBuffer(c->imm_cmd));
     const VkCommandBufferSubmitInfo cmd_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = c->imm_cmd};
+    /* Host completion lets us reuse staging memory. The device-side wait also
+     * carries prior GPU writes into the next immediate submission's scope. */
+    const VkSemaphoreSubmitInfo prior = {.sType=VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,.semaphore=c->timeline,
+        .value=c->timeline_value,.stageMask=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     const VkSemaphoreSubmitInfo signal = timeline_signal(c);
     const VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                                  .waitSemaphoreInfoCount = prior.value ? 1u : 0u, .pWaitSemaphoreInfos = &prior,
                                   .commandBufferInfoCount = 1,
                                   .pCommandBufferInfos = &cmd_info,
                                   .signalSemaphoreInfoCount = 1,
@@ -2128,9 +2135,8 @@ vkmin_ctx *vkmin_init(const vkmin_desc *desc) {
         .height = default_depth_extent ? default_depth_extent : desc->height,
         .format = VKMIN_FMT_D32_FLOAT, .usage = VKMIN_IMAGE_DEPTH,
         .label = "vkmin.default_depth"});
-    /* The same header for --record and for the stream shared with audio. The
-     * two address bases are what a pre-v6 journal is rebased from on replay;
-     * v6 and later record buffer identity instead but still carry them. */
+    /* The same header for --record and the stream shared with audio. Version 9
+     * reuses the obsolete address-base words for a native ABI fingerprint. */
     const journal_header jh = {0x4a4d4b56u, JOURNAL_VERSION, (uint32_t)desc->width, (uint32_t)desc->height,
                                journal_abi(), UINT64_C(0x395249574e494d56)};
     if (c->record_path) { /* everything the program does from here is recorded */
@@ -2379,8 +2385,7 @@ vkmin_target vkmin_make_target(vkmin_ctx *c, const vkmin_target_desc *d) {
     for (int i = 0; i < 4; ++i) if (i < colors || (i == 3 && d->depth))
         supported &= vkmin_sample_counts(c, formats[i], i == 3 ? VKMIN_IMAGE_DEPTH : VKMIN_IMAGE_COLOR);
     VKMIN_ASSERT(supported & 1u, "target formats have no common sample count");
-    vkmin_target t = {.samples = requested};
-    while (!(supported & t.samples)) t.samples >>= 1;
+    vkmin_target t = {.samples = vkm_choose_samples(supported,requested)};
     t.render_to_single_sampled = t.samples > 1 && prefer && caps.render_to_single_sampled;
     /* The extension feature alone does not guarantee each format/usage/flag combination. */
     for (int i = 0; t.render_to_single_sampled && i < 4; ++i) if (i < colors || (i == 3 && d->depth)) {
@@ -3873,7 +3878,9 @@ void vkmin_wait(vkmin_ctx *c) {
 static bool relocate(const vkmin_ctx *c, uint8_t *data, size_t bytes, const reloc *relocs, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) {
         const size_t offset = relocs[i].offset;
-        if (offset > bytes || bytes - offset < sizeof(uint64_t)) return false;
+        if (offset > bytes || bytes - offset < sizeof(uint64_t) ||
+            (i && (uint64_t)relocs[i-1].offset+8 > offset)) return false;
+        if (c->journal_version >= 9 && relocs[i].kind != RELOC_FRAME_RING && relocs[i].kind != RELOC_BUFFER) return false;
         if (relocs[i].kind == RELOC_FRAME_RING) {
             uint64_t byte; memcpy(&byte, data+offset, sizeof byte);
             if (c->journal_version < 7 || byte >= c->ring_region) return false;
@@ -3948,7 +3955,21 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         }
         JCHECK(jrnl_record_read(f, &rh, hdr, sizeof hdr, data, cap, relocs, VKMIN_MAX_RELOCS),
                      "truncated journal");
+        /* Validate framing before inspection casts any header. This is replay
+         * admission, not validation duplicated in the shipping draw path. */
+        const uint16_t header_sizes[OP_COUNT] = {0, sizeof(rec_buffer),sizeof(vkmin_buffer),sizeof(rec_upload),
+            sizeof(rec_image),sizeof(vkmin_image),sizeof(rec_upload),sizeof(rec_draw),sizeof(rec_draw),sizeof(rec_pipe),
+            sizeof(rec_frame),sizeof(rec_upload),sizeof(rec_upload),sizeof(rec_barrier),sizeof(rec_indirect),sizeof(rec_indirect),
+            sizeof(rec_named_pass),sizeof(uint32_t),sizeof(rec_pass),sizeof(vkmin_clear),sizeof(rec_draw),sizeof(rec_indirect),
+            sizeof(rec_draw),sizeof(uint32_t),sizeof(rec_pick),sizeof(rec_pipe)};
+        uint32_t expected = header_sizes[rh.op];
+        if (jh.version < 7 && rh.op == OP_MAKE_IMAGE) expected = REC_IMAGE_OLD;
+        if (jh.version < 7 && (rh.op == OP_MAKE_PIPELINE || rh.op == OP_REPLACE_PIPELINE)) expected = REC_PIPE_OLD;
+        if (jh.version < 7 && rh.op == OP_PASS_BEGIN) expected = jh.version < 5 ? sizeof(rec_pass) : REC_PASS_OLD;
+        JCHECK(rh.hdr_bytes == expected, "invalid record header size");
         JCHECK(relocate(c, data, rh.data_bytes, relocs, rh.reloc_count), "invalid relocation");
+        c->replay_op=rh.op; c->replay_field_count=rh.reloc_count;
+        for (uint32_t k=0;k<rh.reloc_count;++k) c->replay_fields[k]=relocs[k].offset;
         ++records;
         if (events) inspect_event(c, events, records, &rh, hdr, data);
         if (stopped && rh.op != OP_RING_ALLOC && rh.op != OP_FRAME_END) continue;
@@ -3957,25 +3978,37 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
 #define SAME(got, want) JCHECK((got) == (want), "replay diverged: value differs from recording")
 #define JHANDLE(pool, limit, id) JCHECK((id) != 0 && handle_index(id) < (limit) && \
     c->pool[handle_index(id)].used && c->pool[handle_index(id)].gen == handle_gen(id), "invalid " #pool " handle")
+        JCHECK((rh.op != OP_FREE_BUFFER && rh.op != OP_FREE_IMAGE && rh.op != OP_BUFFER_UPLOAD && rh.op != OP_IMAGE_UPLOAD && rh.op != OP_PICK) || !c->in_frame, "host operation inside frame");
+        JCHECK(rh.op < OP_FRAME_END || rh.op >= OP_PICK || c->in_frame, "command outside frame");
+        JCHECK((rh.op != OP_BARRIER && rh.op != OP_FILL && rh.op != OP_COPY_TO_RING) || !c->in_pass, "transfer/barrier inside pass");
         switch (rh.op) {
         case OP_MAKE_BUFFER: { HDR(rec_buffer);
             JCHECK(rec.size > 0 && rec.size <= c->buf_arena.cap && rec.label[sizeof rec.label - 1] == 0 && rh.data_bytes <= rec.size && (rec.has_data || !rh.data_bytes), "invalid buffer data");
+            JCHECK(!rec.has_data || !c->in_frame,"initial upload inside frame");
             const vkmin_buffer b = vkmin_make_buffer(c, &(vkmin_buffer_desc){.size = rec.size, .data = {rec.has_data ? data : NULL, rh.data_bytes}, .label = rec.label});
             SAME(b.id, rec.result); break; }
         case OP_FREE_BUFFER: { HDR(vkmin_buffer); JHANDLE(buffers, VKMIN_MAX_BUFFERS, rec.id); vkmin_free_buffer(c, rec); break; }
-        case OP_BUFFER_UPLOAD: { HDR(rec_upload); JHANDLE(buffers, VKMIN_MAX_BUFFERS, rec.id); vkmin_buffer_upload(c, (vkmin_buffer){rec.id}, rec.offset, (vkmin_bytes){data, rh.data_bytes}); break; }
+        case OP_BUFFER_UPLOAD: { HDR(rec_upload); JHANDLE(buffers, VKMIN_MAX_BUFFERS, rec.id);
+            JCHECK(vkm_range_fits(c->buffers[handle_index(rec.id)].size, rec.offset, rh.data_bytes), "upload overruns logical buffer"); vkmin_buffer_upload(c, (vkmin_buffer){rec.id}, rec.offset, (vkmin_bytes){data, rh.data_bytes}); break; }
         case OP_MAKE_IMAGE: { rec_image rec = {0};
             JCHECK(rh.hdr_bytes == (jh.version >= 7 ? sizeof rec : REC_IMAGE_OLD), "invalid image header"); memcpy(&rec, hdr, rh.hdr_bytes);
             JCHECK(rec.w > 0 && rec.h > 0 && rec.mips >= 0 && rec.mips <= 32 && rec.format < VKMIN_FMT_NONE, "invalid image description");
             JCHECK(rec.sampler < VKMIN_SAMPLER_COUNT && rec.w <= 32768 && rec.h <= 32768, "invalid image size or sampler");
             JCHECK(!rec.has_pixels || rh.data_bytes == mip_bytes(format_lookup((vkmin_format)rec.format), (uint32_t)rec.w, (uint32_t)rec.h), "invalid pixel payload");
             JCHECK(rec.label[sizeof rec.label - 1] == 0 && (rec.has_pixels || !rh.data_bytes), "invalid image data");
+            JCHECK(!rec.has_pixels || !c->in_frame,"initial image upload inside frame");
             const vkmin_image i = vkmin_make_image(c, &(vkmin_image_desc){.width = rec.w, .height = rec.h, .mip_levels = rec.mips,
                 .samples = rec.samples, .render_to_single_sampled = rec.to_single,
                 .format = (vkmin_format)rec.format, .usage = rec.usage, .sampler = rec.sampler, .pixels = {rec.has_pixels ? data : NULL, rh.data_bytes}, .label = rec.label});
             SAME(i.id, rec.result); break; }
-        case OP_FREE_IMAGE: { HDR(vkmin_image); JHANDLE(images, VKMIN_MAX_IMAGES, rec.id); vkmin_free_image(c, rec); break; }
-        case OP_IMAGE_UPLOAD: { HDR(rec_upload); JHANDLE(images, VKMIN_MAX_IMAGES, rec.id); vkmin_image_upload(c, (vkmin_image){rec.id}, (int)rec.mip, (vkmin_bytes){data, rh.data_bytes}); break; }
+        case OP_FREE_IMAGE: { HDR(vkmin_image); JHANDLE(images, VKMIN_MAX_IMAGES, rec.id); JCHECK(!c->images[handle_index(rec.id)].external,"cannot free backbuffer"); vkmin_free_image(c, rec); break; }
+        case OP_IMAGE_UPLOAD: { HDR(rec_upload); JHANDLE(images, VKMIN_MAX_IMAGES, rec.id);
+            const image_slot *s=&c->images[handle_index(rec.id)];
+            JCHECK(rec.mip < s->mips && rec.mip < 32,"invalid image mip");
+            format_info fi={0};
+            for (int k=0;k<(int)VKMIN_FMT_NONE;++k) if (format_lookup((vkmin_format)k).vk == s->format) fi=format_lookup((vkmin_format)k);
+            const uint32_t w=s->w>>rec.mip, h=s->h>>rec.mip;
+            JCHECK(fi.block_bytes && rh.data_bytes==mip_bytes(fi,w?w:1,h?h:1),"invalid mip payload"); vkmin_image_upload(c, (vkmin_image){rec.id}, (int)rec.mip, (vkmin_bytes){data, rh.data_bytes}); break; }
         case OP_INDEX:
         case OP_REGISTER: { HDR(rec_draw); JHANDLE(images, VKMIN_MAX_IMAGES, rec.pipe);
             const uint32_t slot = rh.op == OP_INDEX ? rec.a : rec.b;
@@ -3995,7 +4028,7 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
         case OP_MAKE_PIPELINE:
         case OP_REPLACE_PIPELINE: { rec_pipe rec = {0};
             JCHECK(rh.hdr_bytes == (jh.version >= 7 ? sizeof rec : REC_PIPE_OLD), "invalid pipeline header"); memcpy(&rec, hdr, rh.hdr_bytes);
-            JCHECK(rec.push_size <= VKMIN_PUSH_BYTES && rec.extra_colors <= 2 && rec.color_format <= VKMIN_FMT_NONE, "invalid pipeline description");
+            JCHECK(rec.push_size <= VKMIN_PUSH_BYTES && rec.push_size % 4 == 0 && rec.compare <= VKMIN_CMP_ALWAYS && rec.cull <= VKMIN_CULL_FRONT && rec.extra_format[0] <= VKMIN_FMT_NONE && rec.extra_format[1] <= VKMIN_FMT_NONE && rec.extra_colors <= 2 && rec.color_format <= VKMIN_FMT_NONE, "invalid pipeline description");
             JCHECK(rec.label[sizeof rec.label - 1] == 0 &&
                 (uint64_t)rec.vs_bytes + rec.fs_bytes + rec.cs_bytes == rh.data_bytes &&
                 (rec.vs_bytes | rec.fs_bytes | rec.cs_bytes) % 4u == 0, "invalid shader payload");
@@ -4027,10 +4060,14 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
                 s->pipe = candidate;
             }
             break; }
-        case OP_FRAME_BEGIN: { HDR(rec_frame); c->frame_index = rec.frame_index; c->input = rec.input; c->armed = true;
+        case OP_FRAME_BEGIN: { HDR(rec_frame); JCHECK(!c->in_frame, "nested frame"); c->frame_index = rec.frame_index; c->input = rec.input; c->armed = true;
             (void)vkmin_frame_begin(c, rec.has_clear ? &rec.clear : NULL); break; }
-        case OP_RING_ALLOC: { HDR(rec_upload); uint64_t addr = 0; vkmin_ring_alloc(c, (size_t)rec.offset, &addr); break; }
+        case OP_RING_ALLOC: { HDR(rec_upload);
+            JCHECK(vkm_range_fits(c->ring_region, align_up(c->ring_head[c->slot], VKMIN_RING_ALIGN), rec.offset) &&
+                   c->ring_issued_count < VKMIN_MAX_RING_ALLOCS, "ring allocation exceeds limits");
+            uint64_t addr = 0; vkmin_ring_alloc(c, (size_t)rec.offset, &addr); break; }
         case OP_FRAME_END: { HDR(rec_upload);
+            JCHECK(!c->in_pass || c->in_default_pass || stopped,"frame ended with open explicit pass");
             JCHECK(rec.offset == c->ring_head[c->slot] && rh.data_bytes == rec.offset && rec.offset <= c->ring_region, "ring usage differs");
             memcpy(c->ring_mapped + c->slot * c->ring_region, data, rh.data_bytes);
             if (stopped && c->in_pass) { vkmin_pass_end(c); c->in_default_pass = false; }
@@ -4042,14 +4079,24 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
             if (stopped) finished = true;
             break; }
         case OP_BARRIER: { HDR(rec_barrier);
-            JCHECK(rec.image_count <= VKMIN_MAX_IMAGES && (uint64_t)rec.image_count * sizeof(vkmin_transition) == rh.data_bytes, "invalid barrier payload");
+            JCHECK(rec.image_count <= 16 && (uint64_t)rec.image_count * sizeof(vkmin_transition) == rh.data_bytes, "invalid barrier payload");
+            for (uint32_t k=0;k<rec.image_count;++k) {
+                vkmin_transition t; memcpy(&t,data+k*sizeof t,sizeof t);
+                JHANDLE(images,VKMIN_MAX_IMAGES,t.image.id);
+                JCHECK((unsigned)t.use <= VKMIN_USE_PRESENT,"invalid image use enum");
+            }
             vkmin_barrier(c, &(vkmin_barrier_desc){.images = (const vkmin_transition *)(void *)data, .image_count = (int)rec.image_count,
                 .compute_to_indirect_draw = rec.flags & 1u, .compute_to_fragment = rec.flags & 2u, .transfer_to_compute = rec.flags & 4u,
                 .frame_start = rec.flags & 8u, .compute_to_transfer = rec.flags & 16u, .compute_to_compute = rec.flags & 32u}); break; }
-        case OP_FILL: { HDR(rec_indirect); vkmin_fill_buffer(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, rec.max_draws); break; }
+        case OP_FILL: { HDR(rec_indirect); JHANDLE(buffers,VKMIN_MAX_BUFFERS,rec.cmds);
+            JCHECK(vkm_range_fits(c->buffers[handle_index(rec.cmds)].size,rec.cmd_offset,rec.count_offset), "fill overruns logical buffer"); vkmin_fill_buffer(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, rec.max_draws); break; }
         case OP_COPY_TO_RING: { HDR(rec_indirect);
             JCHECK(rh.data_bytes == 8, "invalid copy payload");
             uint64_t dst; memcpy(&dst, data, 8);
+            JHANDLE(buffers,VKMIN_MAX_BUFFERS,rec.cmds);
+            JCHECK(vkm_range_fits(c->buffers[handle_index(rec.cmds)].size,rec.cmd_offset,rec.count_offset), "copy overruns logical buffer");
+            const uint64_t base=c->ring_addr+c->slot*c->ring_region;
+            JCHECK(dst >= base && vkm_range_fits(c->ring_region,dst-base,rec.count_offset), "copy overruns ring");
             vkmin_copy_to_ring(c, (vkmin_buffer){rec.cmds}, rec.cmd_offset, rec.count_offset, dst); break; }
         case OP_PASS_BEGIN: {
             rec_pass rec = {0};
@@ -4060,27 +4107,46 @@ bool vkmin_replay(vkmin_ctx *c, const char *path) {
                 JCHECK(named.label[sizeof named.label - 1] == 0, "invalid pass label");
                 rec = named.pass;
             } else memcpy(&rec, hdr, sizeof rec);
+            JCHECK(!c->in_pass && (rec.color || rec.depth), "invalid pass state");
+            const uint32_t attachments[] = {rec.color,rec.depth,rec.extra[0],rec.extra[1],named.resolves[0],named.resolves[1],named.resolves[2],named.resolves[3]};
+            for (uint32_t k=0;k<8;++k) if (attachments[k]) { JHANDLE(images,VKMIN_MAX_IMAGES,attachments[k]); }
+            JCHECK(!rec.extra[1] || rec.extra[0], "sparse MRT");
+            JCHECK(named.depth_mode <= VKMIN_RESOLVE_MAX, "invalid resolve enum");
             vkmin_pass_begin(c, &(vkmin_pass_desc){.color_resolve = {named.resolves[0]}, .extra_resolve = {{named.resolves[1]}, {named.resolves[2]}},
                 .depth_resolve = {named.resolves[3]}, .depth_resolve_mode = (vkmin_resolve)named.depth_mode, .raster_samples = named.raster_samples, .color = {rec.color}, .extra = {{rec.extra[0]}, {rec.extra[1]}}, .depth = {rec.depth}, .clear_color = rec.clear_color, .clear_depth = rec.clear_depth,
                 .clear = {rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}, .x = rec.x, .y = rec.y, .w = rec.w, .h = rec.h, .label = jh.version >= 5 ? named.label : "replay"}); break; }
-        case OP_PASS_END: { HDR(uint32_t); (void)rec; vkmin_pass_end(c); break; }
-        case OP_VIEWPORT: { HDR(rec_pass); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
-        case OP_DEPTH_BIAS: { HDR(vkmin_clear); vkmin_set_depth_bias(c, rec.r, rec.g); break; }
+        case OP_PASS_END: { HDR(uint32_t); (void)rec; JCHECK(c->in_pass,"end without pass"); vkmin_pass_end(c); break; }
+        case OP_VIEWPORT: { HDR(rec_pass); JCHECK(c->in_pass,"viewport outside pass"); vkmin_set_viewport(c, rec.x, rec.y, rec.w, rec.h); break; }
+        case OP_DEPTH_BIAS: { HDR(vkmin_clear); JCHECK(c->in_pass,"depth bias outside pass"); vkmin_set_depth_bias(c, rec.r, rec.g); break; }
         case OP_DRAW: { HDR(rec_draw); JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes == rh.data_bytes, "invalid push payload");
+            JCHECK(c->in_pass && c->pipes[handle_index(rec.pipe)].bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS,"invalid draw state");
             vkmin_draw(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b); break; }
         case OP_DRAW_INDIRECT: { HDR(rec_indirect);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes + 8u == rh.data_bytes, "invalid indirect payload");
             uint64_t host; memcpy(&host, data + rec.push_bytes, 8);
             JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
+            JCHECK(c->in_pass && c->pipes[handle_index(rec.pipe)].bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS,"invalid indirect draw state");
+            JHANDLE(buffers,VKMIN_MAX_BUFFERS,rec.indices);
+            if (rec.cmds) {
+                JHANDLE(buffers,VKMIN_MAX_BUFFERS,rec.cmds);
+                JCHECK(vkm_range_fits(c->buffers[handle_index(rec.cmds)].size,rec.cmd_offset,(uint64_t)rec.max_draws*sizeof(DrawCmd)),"indirect commands overrun buffer");
+                if (rec.counts) { JHANDLE(buffers,VKMIN_MAX_BUFFERS,rec.counts);
+                    JCHECK(vkm_range_fits(c->buffers[handle_index(rec.counts)].size,rec.count_offset,4),"indirect count overruns buffer"); }
+            } else if (rec.host_count) {
+                const uint64_t base=c->ring_addr+c->slot*c->ring_region;
+                JCHECK(host >= base && vkm_range_fits(c->ring_region,host-base,(uint64_t)rec.host_count*sizeof(DrawCmd)),"indirect commands overrun ring");
+            }
             vkmin_draw_indirect(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL,
                 &(vkmin_indirect_desc){.indices = {rec.indices}, .cmds = {rec.cmds}, .cmd_offset = rec.cmd_offset, .counts = {rec.counts},
                 .count_offset = rec.count_offset, .max_draws = rec.max_draws, .host_cmds = host, .host_count = rec.host_count}); break; }
         case OP_DISPATCH: { HDR(rec_draw); JHANDLE(pipes, VKMIN_MAX_PIPES, rec.pipe); SAME(c->pipes[handle_index(rec.pipe)].push_size, rec.push_bytes);
             JCHECK(rec.push_bytes <= VKMIN_PUSH_BYTES && rec.push_bytes == rh.data_bytes, "invalid push payload");
+            JCHECK(!c->in_pass && c->pipes[handle_index(rec.pipe)].bind_point == VK_PIPELINE_BIND_POINT_COMPUTE,"invalid dispatch state");
             vkmin_dispatch(c, (vkmin_pipeline){rec.pipe}, rec.push_bytes ? data : NULL, rec.a, rec.b, rec.cnt); break; }
-        case OP_TIMESTAMP: { HDR(uint32_t); vkmin_timestamp(c, (int)rec); break; }
+        case OP_TIMESTAMP: { HDR(uint32_t); JCHECK(rec < VKMIN_MAX_TIMESTAMPS,"timestamp index out of range"); vkmin_timestamp(c, (int)rec); break; }
         case OP_PICK: { HDR(rec_pick); JHANDLE(images, VKMIN_MAX_IMAGES, rec.image);
+            JCHECK(c->images[handle_index(rec.image)].format == VK_FORMAT_R32_UINT,"pick requires R32_UINT");
             const uint32_t picked = vkmin_pick(c, (vkmin_image){rec.image}, rec.x, rec.y);
             JCHECK(picked == rec.result, "pick differs: %u, recorded %u", picked, rec.result); break; }
         default: JCHECK(false, "unknown opcode");

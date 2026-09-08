@@ -57,7 +57,7 @@ void main() {
         discard;
     }
     if(material==3 || material==4) {
-        bool capitalExhaust=material==3 && structure<.5 && local.z>15.;
+        bool capitalExhaust=material==3 && structure<.5 && local.z>14.8;
         vec3 emitted;
         if(capitalExhaust) {
             // A white combustion core grades into a saturated periwinkle rim.
@@ -150,7 +150,7 @@ void main() {
     if(structure>.5) c+=base*vec3(3.,2.6,2.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
     // The plasma muzzle lights illuminate the forward armor in world space.
     for(int j=0;j<2;j++) {
-        vec3 light=vec3(j==0?-OMEGA_MUZZLE_X:OMEGA_MUZZLE_X,.4,OMEGA_MUZZLE_Z-.1+F.scene.z)-world;
+        vec3 light=vec3(j==0?-OMEGA_MUZZLE_X:OMEGA_MUZZLE_X,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z+F.scene.z)-world;
         float d=length(light);
         c+=vec3(1.3,.012,.003)*F.flash*max(dot(n,normalize(light)),0.)/(1.+d*d*.5);
     }
@@ -160,12 +160,16 @@ void main() {
         c+=vec3(8.,.65,.08)*F.flash*exp(-d*d*1.4);
         c+=base*vec3(3.,.18,.025)*F.flash/(1.+d*d*.12);
     }
-    if(structure<.5) for(int battery=0;battery<2;battery++) {
-        float level=opponent?omegaParticleLight(ship,false):
-            omegaParticleLight(0,true)+omegaParticleLight(1,true)+omegaParticleLight(2,true);
-        vec3 light=opponent?omegaParticleMuzzle(ship,battery):omegaParticleImpact(battery);
-        float d=length(world-light);
-        c+=vec3(.08,.7,1.8)*level*(base/(1.+d*d*.2)+exp(-d*d*1.5));
+    if(structure<.5) for(int source=0;source<3;source++) for(int battery=0;battery<2;battery++) {
+        if(opponent && source!=ship) continue;
+        for(int shot=0;shot<3;shot++) {
+            int index=source*6+battery*3+shot;
+            float age=F.pulse_start[index].w-(opponent?0.:float(OMEGA_PARTICLE_FLIGHT));
+            float level=age>=0.?exp(-age*(opponent?.65:.32)):0.;
+            vec3 light=(opponent?F.pulse_start[index].xyz:F.pulse_end[index].xyz)-world;
+            float d=length(light);
+            c+=vec3(.08,.7,1.8)*level*(base/(1.+d*d*.2)+exp(-d*d*1.5));
+        }
     }
     float inside=smoothstep(OMEGA_GATE_MOUTH_Z-2.,OMEGA_GATE_MOUTH_Z+14.,world.z)*F.scene.w*(1.-structure);
     c+=base*vec3(.06,.55,1.6)*inside;

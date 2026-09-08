@@ -8,7 +8,7 @@
 #include "vkmin_cvar.h"
 #include "vkmin_math.h"
 #include "sndmin.h"
-#include "omega_shared.h"
+#include "omega_weapons.h"
 #include "omega_score.h"
 #include "omega_model.h"
 #include "omega_surface.h"
@@ -23,7 +23,7 @@
 #include <threads.h>
 #endif
 
-enum { OMEGA_CAPACITY=750000, OMEGA_TICKS=OMEGA_SEQUENCE_TICKS, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1620 };
+enum { OMEGA_CAPACITY=OMEGA_MODEL_COUNT*4+20000, OMEGA_TICKS=OMEGA_SEQUENCE_TICKS, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1620 };
 typedef struct { OmegaVertex *v; uint32_t count; uint32_t part; } omega_mesh;
 typedef struct {
     sndmin_sound drone, gate, closing, cannon, cannon_long, particle, tick;
@@ -149,7 +149,7 @@ static omega_mesh make_ship(void) {
         const OmegaPackedVertex v=omega_model[i];
         m.v[m.count++]=omega_vertex((vec3){(float)v.x*.001f,(float)v.y*.001f,(float)v.z*.001f},
             (vec3){(float)v.nx/32767.f,(float)v.ny/32767.f,(float)v.nz/32767.f},
-            (vec4){(float)v.r/255.f,(float)v.g/255.f,(float)v.b/255.f,1},v.material,v.part);
+            (vec4){(float)v.r/255.f,(float)v.g/255.f,(float)v.b/255.f,1},v.material,v.part>=2?32u+(uint32_t)v.part-2u:v.part);
     }
     // Three formation hulls, each with fixed and independently rotating parts.
     // Only the part code changes, so the copy edits the code field in place
@@ -157,24 +157,20 @@ static omega_mesh make_ship(void) {
     for(uint32_t ship=0;ship<3;++ship) for(size_t i=0;i<OMEGA_MODEL_COUNT;++i) {
         OmegaVertex v=m.v[i];
         const uint32_t codes=v.color_b_codes>>16;
-        v.color_b_codes=(v.color_b_codes&0xffffu)|((codes+((4u+2u*ship)<<8))<<16);
+        v.color_b_codes=(v.color_b_codes&0xffffu)|((codes+(((codes>>8)>=32?24u*(ship+1):4u+2u*ship)<<8))<<16);
         m.v[m.count++]=v;
     }
-    // Broadside turrets on the fixed forward/aft machinery of each opponent.
+    // Pulses are attached to authored, articulated port batteries 4 and 5.
     for(unsigned ship=0;ship<3;++ship) for(unsigned battery=0;battery<2;++battery) {
-        m.part=4u+2u*ship;
-        const float z=battery?10.f:-10.f;
-        hull(&m,(vec3){-1.8f,.7f,z},(vec3){1.f,.65f,1.2f},.18f,armor,0);
-        tube(&m,(vec3){-2.f,.7f,z},(vec3){-2.8f,.7f,z},.20f,.12f,steel,0,8);
         for(unsigned shot=0;shot<3;++shot) {
             m.part=10u+ship*6u+battery*3u+shot;
-            tube(&m,(vec3){0,0,0},(vec3){0,0,1},.16f,.07f,(vec4){.2f,.8f,1,1},8,8);
+            tube(&m,(vec3){0,0,0},(vec3){0,0,1},.04f,.03f,(vec4){.2f,.8f,1,1},8,8);
         }
     }
     m.part=0;
     for(int side=-1;side<=1;side+=2) {
         const float x=(float)side*OMEGA_MUZZLE_X;
-        tube(&m,(vec3){x,.4f,OMEGA_MUZZLE_Z},(vec3){x,.4f,-100.f},.09f,.075f,red,5,12);
+        tube(&m,(vec3){x,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z},(vec3){x,OMEGA_MUZZLE_Y,-100.f},.09f,.075f,red,5,12);
     }
     // Small four-wing escorts establish the capital ship's scale.
     m.part=2;
@@ -245,13 +241,6 @@ static float smooth(float a,float b,float t) { const float s=clamp01((t-a)/(b-a)
  * mouth to a steady 22 units/second and flies on past the camera, as in the
  * footage. Position and speed are continuous; the hull centre crosses the
  * mouth at 10.25 seconds (tick 615). */
-static float ship_position(float t) {
-    const float start=OMEGA_GATE_ENTRANCE_Z-20.f,speed=220.f,brake=70.f,cruise=22.f,rate=3.7f;
-    const float travel=fmaxf(0,t-4.5f),brake_time=(start-brake)/speed;
-    if(travel<brake_time) return start-speed*travel;
-    const float dt=travel-brake_time;
-    return brake-cruise*dt-(speed-cruise)/rate*(1-expf(-rate*dt));
-}
 /* Shared audiovisual rhythm: two 14-tick taps, then a 78-tick sustained beam.
  * At tick 615 the hull center reaches the mouth: half the ship is out. */
 static omega_pulse cannon_pulse(uint32_t tick) {
@@ -266,13 +255,6 @@ static float cannon_flash(uint32_t tick) {
     if(!pulse.duration) return 0;
     const float age=(float)pulse.age/60.f,duration=(float)pulse.duration/60.f;
     return (1-smooth(duration-.07f,duration,age))*(.90f+.10f*cosf(age*80));
-}
-/* Same integer schedule as GLSL: three staggered pulses per battery. */
-static int particle_age(uint32_t tick,unsigned ship,unsigned shot) {
-    const int elapsed=(int)tick-OMEGA_PARTICLE_START-(int)ship*OMEGA_PARTICLE_STAGGER;
-    if(elapsed<0) return -1;
-    const int age=elapsed%OMEGA_PARTICLE_PERIOD-(int)shot*OMEGA_PARTICLE_SHOT_SPACING;
-    return (int)tick-age<OMEGA_PARTICLE_END?age:-1;
 }
 /* Screen position of a hull-space point in UV, or a negative w when behind the
  * camera. Column-major, as vkmin_math builds its matrices. */
@@ -408,7 +390,7 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
     const omega_pulse pulse=cannon_pulse(tick);
     if(!paused && pulse.duration && pulse.age==0) {
         for(int side=-1;side<=1;side+=2) {
-            const vec3 muzzle={(float)side*OMEGA_MUZZLE_X,.4f,OMEGA_MUZZLE_Z+ship_position((float)tick/60)};
+            const vec3 muzzle={(float)side*OMEGA_MUZZLE_X,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z+ship_position((float)tick/60)};
             const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){
                 .sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
                 .voice={.gain=.85f,.position=muzzle,.min_radius=50,.max_radius=420}});
@@ -418,8 +400,8 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
     if(!paused) for(unsigned ship=0;ship<3;++ship) for(unsigned shot=0;shot<3;++shot) {
         const int age=particle_age(tick,ship,shot);
         if(age!=0 && age!=OMEGA_PARTICLE_FLIGHT) continue;
-        const vec3 source=age==0?(vec3){ship==1?45.f:(ship==2?75.f:0.f),ship==1?38.f:(ship==2?-26.f:0.f),
-            ship_position(t)-OMEGA_BATTLE_SEPARATION+(ship==1?-50.f:(ship==2?45.f:0.f))}:(vec3){-2,0,ship_position(t)};
+        const omega_trajectory path=omega_projectile(ship,0,shot,t-(float)age/60.f);
+        const vec3 source=age==0?path.start:path.end;
         const sndmin_voice report=sndmin_play(audio,&(sndmin_play_desc){.sound=a->particle,.spatial=true,
             .voice={.position=source,.gain=age==0?.46f:.28f,.pitch=age==0?1.f:.55f,.min_radius=60,.max_radius=450}});
         if(!report.id) return false;
@@ -428,8 +410,9 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
 }
 
 int main(int argc,char **argv) {
-    const char *wav=NULL; bool offline=false,audio_only=false,score_only=false;
+    const char *wav=NULL; bool offline=false,audio_only=false,score_only=false,weapon_view=false;
     for(int k=1;k<argc;++k) {
+        if(!strcmp(argv[k],"--weapon-view")) weapon_view=true;
         if(!strcmp(argv[k],"--audio-out") && k+1<argc) { wav=argv[++k]; offline=true; }
         else if(!strcmp(argv[k],"--headless") || !strcmp(argv[k],"--frame") || !strcmp(argv[k],"--frames")) offline=true;
         else if(!strcmp(argv[k],"--audio-only")) { audio_only=true; offline=true; }
@@ -467,8 +450,8 @@ int main(int argc,char **argv) {
     }
     // vkmin reserves its arenas once and never grows them, so the defaults
     // (256 MB per arena, 64 MB ring) are what a program actually costs on the
-    // device whether or not it uses them. Omega uploads about 14 MB of mesh.
-    // 24 MB of buffer covers the whole of
+    // device whether or not it uses them. Omega uploads about 47 MB of mesh.
+    // 64 MB of buffer covers the whole of
     // OMEGA_CAPACITY at 24 bytes a vertex, so the mesh cannot outgrow it before
     // the assert in triangle() fires; 160 MB of image covers the 2048 shadow map
     // and 4x/8x MSAA at 720p. The ring takes the mesh upload in one chunk. Exhausting an
@@ -481,7 +464,7 @@ int main(int argc,char **argv) {
     cvar_set(&config,CV_r_default_depth,0); // explicit passes own their depth; presentation needs none
     vkmin_ctx *gpu=vkmin_init(&(vkmin_desc){.argc=argc,.argv=argv,.title="OMEGA - Through the Blue",
         .width=1280,.height=720,.vsync=true,.headless=headless_build,.config=&config,
-        .device_arena_bytes=24u<<20,.image_arena_bytes=160u<<20,.host_ring_bytes=16u<<20});
+        .device_arena_bytes=64u<<20,.image_arena_bytes=160u<<20,.host_ring_bytes=64u<<20});
     omega_mesh mesh=make_ship();
     fprintf(stderr,"omega: %u triangles; 30-second sequence; Iron Across the Blue 120 BPM, gate and cannons\n",mesh.count/3);
     const vkmin_buffer geometry=vkmin_make_buffer(gpu,&(vkmin_buffer_desc){
@@ -593,6 +576,11 @@ int main(int argc,char **argv) {
                 aim=(vec3){20,3,battle_z-10.f};
             }
         }
+        if(weapon_view) {
+            const vec3 origin=omega_formation(1,t);
+            eye=vkmin_vec3_add(origin,omega_rotate((vec3){-11,5,7},false));
+            aim=vkmin_vec3_add(origin,omega_rotate((vec3){-1.46f,0,1.4f},false));
+        }
         const mat4 vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
         // The hull's screen motion since the last frame drives a shutter smear;
         // Use consecutive simulation ticks only; sparse captures are not motion.
@@ -613,6 +601,7 @@ int main(int argc,char **argv) {
             .flash=cannon_flash(visual),
             .hull_texture=vkmin_index(gpu,surface),
             .blur={motion.x,motion.y,.6f,0}};
+        omega_weapon_frame(scene,visual);
         vkmin_timestamp(gpu,0);
         p.pass=OMEGA_PASS_SHADOW; p.texture_id=shadow_index;
         vkmin_barrier(gpu,&(vkmin_barrier_desc){

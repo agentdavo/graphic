@@ -18,16 +18,37 @@ Reviewed all of `src/vkmin.h` and `src/vkmin.c`, including initialization, featu
 ## Verification
 
 - GCC Debug and RelWithDebInfo builds use the project's warnings-as-errors and `-fanalyzer` settings.
-- Device-free suite: 60 checks; sound suite: 28 checks; inspector suite: 10 tests.
+- Device-free suite: 66 checks; sound suite: 28 checks; inspector suite: 10 tests.
 - GPU regression covers supported 1x/2x/4x/8x counts, MRT and depth resolve, alpha-to-coverage, helper cleanup/fallback, vertex sampling, exact legacy/modern replay, sparse timestamp reuse, wrapper failure paths, CLI precedence and malformed inputs. Debug additionally checks Khronos rejection of invalid Vulkan configurations.
 - Omega frame 720 at 1280x720 and 8x MSAA remains byte-identical to the pre-review image. A saved version-7 multi-frame journal replays frame 300 byte-identically. Current journals also exercise replay with different ring sizes and naive synchronization.
 - Standalone Clang analysis: `clang --analyze -std=c11 -DVKMIN_NO_PLATFORM -Isrc -isystem C:/VulkanSDK/1.4.357.0/include src/vkmin.c`.
-- Source budgets pass: core 3669/4200 code lines, public header 266/300. The core is 53 code lines smaller than the start of this review.
+- Source budgets pass: core 3815/4200 code lines, public header 272/300. Private GPU headers now include the pure-logic and arena headers in their 601/900 count.
 
-## Boundaries and remaining limitations
+## Follow-up: disposition of every boundary
 
-This is a focused correction of the existing implementation, not a claim that every practice in the regime is automated. No debugger stepping session or resize interaction was performed. Hardware verification used Intel Vulkan 1.4; the legacy execution path was tested there, not on a separate Vulkan 1.3 device. Counts 16x/32x/64x and `VK_EXT_multisampled_render_to_single_sampled` are unsupported on this device and explicitly skipped.
+- **Debugger and window lifecycle:** performed real GDB stepping through frame begin/end, inspected locals and call stacks, and traced 94 distinct functions during a complete initialization/frame/shutdown cycle. Automated three resizes, minimize, restore and close on an isolated Xvfb/Openbox display. Actual geometry, iconic state and three swapchain recreation waits were verified. These are repeatable scripts and CI steps; they do not imply that one frame visits every branch.
+- **Vulkan versions and optional MSAA:** added software-driver coverage alongside Intel Vulkan 1.4. Current Mesa covers 1x/4x/8x plus both alpha-to-coverage settings with `VK_EXT_multisampled_render_to_single_sampled`. Actual Mesa 24.0.5 reports Vulkan 1.3 and replays the supported 1x/4x and extension captures with identical images, using a current validation layer. Forced legacy/modern paths remain a separate comparison. A version-reporting environment override was not accepted as 1.3 evidence.
+- **16x/32x/64x:** exercised the complete bitmask/fallback algorithm through 64x in pure tests and added hard `--require-samples`/`--require-single` coverage gates. None of the available drivers supports 16x/32x/64x for this fixture. Actual rendering at those counts remains unverified; reports identify missing coverage rather than counting a fallback as success.
+- **Ambiguous relocation:** replaced default scanning with explicit public address layouts for pipeline pushes, initial buffers, typed uploads and typed ring allocations. Interior and unaligned buffer/ring pointers relocate; equal integer values remain unchanged. Metadata is bounded and copied synchronously, and replay can itself be re-recorded. Omega and render supply the layouts. The old heuristic path remains explicitly selectable for comparison/migration.
+- **Native ABI/endianness:** version 9 rejects incompatible native-layout fingerprints before device creation. Typed captures replayed Windows-to-Linux and Linux-to-Windows byte-for-byte. This guards compatibility; it cannot reconstruct an unknown legacy ABI or impose a canonical layout on opaque shader data. Versions 3–8 remain readable on compatible runtimes, with explicit legacy admission in the offline tool.
+- **Malformed and unfamiliar captures:** added bounded, device-free admission, including eight unit tests, all partial truncations and 1000 deterministic mutations. Native replay checks opcode/header shape before inspection, relocation references and wrapper-owned frame/pass/handle/range contracts before issuing affected calls. Nine malformed command cases exit cleanly without a wrapper abort or validation error. Vulkan semantics remain Khronos validation's responsibility.
+- **Execution containment:** added a software-only Podman runner with no host GPU or network, read-only input/root, unprivileged UID, dropped capabilities, memory/CPU/process/storage limits and deadlines. Seven Vulkan 1.4 cases passed exact-image and inspected-policy checks; an oversized replay was terminated by enforced limits. The Vulkan 1.3 run covers the six compatible cases. Native GPU replay remains for trusted captures; a container still depends on its runtime/kernel.
+- **Immediate uploads:** validation across driver/layer versions exposed the need for an explicit GPU timeline dependency between immediate submissions. Added that dependency while retaining the host staging wait; repeated typed uploads and the MSAA suite pass synchronization validation.
 
-Address relocation still recognizes aligned issued address bases heuristically. An integer equal to an address is ambiguous, and interior or unaligned addresses are not recognized; use separately recorded offsets. Legacy payloads retain native ABI/endianness constraints. Replay framing is bounded, but semantically invalid commands can still fail wrapper invariants or Vulkan validation: journal replay is not a sandbox for untrusted GPU commands.
+The follow-up also rechecked the outdoor/cel scene at frames 299–301: frame 300
+replays byte-identically. Windows Debug and optimized builds, Linux Debug,
+GCC analysis, independent Clang analysis and all CTest checks pass.
 
-Further restructuring should follow a measured need. The existing explicit context, bounded storage and parallel legacy/modern paths remain appropriate; splitting them merely to shorten functions would add indirection without improving correctness.
+Local evidence is under `build/boundaries/`: `debug-cycle.log`,
+`debug-functions.json`, `window-glfw-ready/result.json`,
+`windows-msaa-complete/result.json`, `lavapipe-msaa-verified/result.json`,
+`relocation-final/`, `windows-final/`, `scene-final/`, `replay-errors/`,
+`isolated-final/result.json` and `isolated-13-final/result.json`.
+CI regenerates evidence and uploads its boundary-coverage artifact.
+See [journal contracts and isolated replay](replay.md) for commands and limits.
+
+The restructuring item is a design constraint, not unfinished implementation:
+retain explicit state, bounded storage and the comparison paths. Further splits
+need a measured correctness or performance reason. Hardware coverage at high
+counts, unknown legacy layouts and kernel-level containment guarantees cannot
+be manufactured by restructuring `vkmin.h/c`.

@@ -1,0 +1,18 @@
+# Isolated replay deliberately has a software Vulkan driver and no host devices.
+FROM docker.io/library/ubuntu:26.04 AS build
+RUN apt-get update -qq && apt-get install -y --no-install-recommends gcc libc6-dev cmake ninja-build libvulkan-dev glslang-tools python3
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src ./src
+COPY tools ./tools
+COPY omega ./omega
+COPY demo ./demo
+RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVKMIN_HEADLESS=ON -DBUILD_TESTING=OFF && cmake --build /build --target replay -j2
+FROM docker.io/library/ubuntu:26.04
+RUN apt-get update -qq && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-validationlayers && \
+    mkdir -p /input /out && chmod 1777 /out && \
+    set -- /usr/share/vulkan/icd.d/lvp_icd*.json && test "$#" -eq 1 && ln -s "$1" /opt/lavapipe.json
+COPY --from=build /build/replay /usr/local/bin/replay
+ENV VK_DRIVER_FILES=/opt/lavapipe.json MESA_SHADER_CACHE_DISABLE=true HOME=/tmp
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/replay"]

@@ -33,6 +33,13 @@ static bool vkm_range_fits(uint64_t capacity, uint64_t offset, uint64_t bytes) {
     return offset <= capacity && bytes <= capacity-offset;
 }
 
+/* Target preference negotiation; independent of what the current GPU supports. */
+static uint32_t vkm_choose_samples(uint32_t supported, uint32_t requested) {
+    if (!requested || requested > 64 || (requested & (requested-1))) return 0;
+    for (uint32_t samples=requested;samples;samples>>=1) if (supported & samples) return samples;
+    return 0;
+}
+
 /* Decimal CLI input without atoi's silent zero, truncation or overflow.
  * end names the first unconsumed character; callers decide which delimiters fit. */
 typedef struct { uint32_t value; const char *end; bool valid; } vkm_decimal;

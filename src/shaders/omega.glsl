@@ -38,18 +38,19 @@ vec3 omegaFormation(int ship) {
     return omegaOpponent()+(ship==1?vec3(45,38,-50):(ship==2?vec3(75,-26,45):vec3(0)));
 }
 vec3 omegaOpponentRotate(vec3 p) { return vec3(OMEGA_FORMATION_COS*p.x+OMEGA_FORMATION_SIN*p.z,p.y,-OMEGA_FORMATION_SIN*p.x+OMEGA_FORMATION_COS*p.z); }
-vec3 omegaImpact(float side) { return omegaOpponent()+vec3(side*OMEGA_MUZZLE_X,.4,1.8); }
+vec3 omegaImpact(float side) { return F.beam_hit[side<0.?0:1].xyz; }
+int omegaLatestShot(int ship) {
+    int shot=0;
+    for(int j=1;j<3;j++) if(F.pulse_start[ship*6+j].w>=0.) shot=j;
+    return shot;
+}
 vec3 omegaParticleMuzzle(int ship,int battery) {
-    return omegaFormation(ship)+omegaOpponentRotate(vec3(-2.8,.7,battery==0?-10.:10.));
+    return F.pulse_start[ship*6+battery*3+omegaLatestShot(ship)].xyz;
 }
-vec3 omegaParticleImpact(int battery) { return vec3(-2.,.7,F.scene.z+(battery==0?-10.:10.)); }
-float omegaParticleAge(int ship,int shot) {
-    float tick=floor(F.scene.x*60.+.1);
-    float elapsed=tick-float(OMEGA_PARTICLE_START+ship*OMEGA_PARTICLE_STAGGER);
-    if(elapsed<0.) return -1.;
-    float age=mod(elapsed,float(OMEGA_PARTICLE_PERIOD))-float(shot*OMEGA_PARTICLE_SHOT_SPACING);
-    return tick-age<float(OMEGA_PARTICLE_END)?age:-1.;
+vec3 omegaParticleImpact(int ship,int battery) {
+    return F.pulse_end[ship*6+battery*3+omegaLatestShot(ship)].xyz;
 }
+float omegaParticleAge(int ship,int shot) { return F.pulse_start[ship*6+shot].w; }
 float omegaParticleLight(int ship,bool impact) {
     float level=0.;
     for(int shot=0;shot<3;shot++) {
@@ -106,13 +107,14 @@ vec3 omegaContactGlow(vec2 uv,vec3 point,float level,vec3 hue) {
 }
 vec3 omegaFlares(vec2 uv) {
     vec3 color=vec3(0);
-    for(int ship=0;ship<3;ship++) for(int battery=0;battery<2;battery++) {
-        vec3 muzzle=omegaParticleMuzzle(ship,battery);
-        float facing=max(dot(normalize(F.eye.xyz-muzzle),omegaOpponentRotate(vec3(-1,0,0))),0.);
-        color+=omegaContactGlow(uv,muzzle,omegaParticleLight(ship,false)*facing,vec3(.08,.7,1.3));
-        vec3 hit=omegaParticleImpact(battery);
-        float visible=smoothstep(0.,.15,normalize(F.eye.xyz-hit).x*-1.);
-        color+=omegaContactGlow(uv,hit,omegaParticleLight(ship,true)*visible,vec3(.12,.8,1.6));
+    for(int ship=0;ship<3;ship++) for(int battery=0;battery<2;battery++) for(int shot=0;shot<3;shot++) {
+        int index=ship*6+battery*3+shot;
+        float age=F.pulse_start[index].w;
+        vec3 muzzle=F.pulse_start[index].xyz,hit=F.pulse_end[index].xyz;
+        float facing=max(dot(normalize(F.eye.xyz-muzzle),normalize(hit-muzzle)),0.);
+        if(age>=0.) color+=omegaContactGlow(uv,muzzle,exp(-age*.65)*facing,vec3(.08,.7,1.3));
+        if(age>=float(OMEGA_PARTICLE_FLIGHT))
+            color+=omegaContactGlow(uv,hit,exp(-(age-float(OMEGA_PARTICLE_FLIGHT))*.32),vec3(.12,.8,1.6));
     }
     // Compact white-hot contact and amber halo where each red beam meets armor.
     for(int side=-1;side<=1;side+=2) {

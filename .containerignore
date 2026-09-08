@@ -1,0 +1,12 @@
+*
+!CMakeLists.txt
+!src
+!src/**
+!tools
+!tools/**
+!omega
+!omega/**
+!demo
+!demo/**
+**/__pycache__
+**/*.pyc

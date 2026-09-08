@@ -269,6 +269,15 @@ int main(void) {
     }
     check(every_format_sized, "every format maps to a real VkFormat with a size");
 
+    bool all_sample_bits=true;
+    for (uint32_t n=1;n<=64;n<<=1) all_sample_bits &= vkm_choose_samples(n,n)==n;
+    check(all_sample_bits,"every sample bit including 16x/32x/64x is preserved");
+    check(vkm_choose_samples(1|16|32,64)==32,"64x falls back to supported 32x");
+    check(vkm_choose_samples(1|16|64,32)==16,"32x falls back to supported 16x without upgrading");
+    check(vkm_choose_samples(1,64)==1,"unsupported MSAA falls back to single sample");
+    check(vkm_choose_samples(0,64)==0,"empty capability mask cannot negotiate");
+    check(vkm_choose_samples(127,3)==0 && vkm_choose_samples(127,128)==0 && vkm_choose_samples(127,0)==0,"invalid preferences are refused");
+
     /* Relocation framing must distinguish absent, complete and truncated data. */
     FILE *journal = tmpfile();
     check(journal != NULL, "journal fixture opens");

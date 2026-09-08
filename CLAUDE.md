@@ -326,8 +326,12 @@ loader and `glslangValidator`.
   `tools/check_msaa.py` (GPU validation and deterministic replay). GCC builds
   run `-fanalyzer`; Clang's analyzer can also inspect the core with
   `clang --analyze -std=c11 -DVKMIN_NO_PLATFORM -Isrc` and the Vulkan SDK
-  include path. There is no `cppcheck` or lavapipe in the tree. Section 4
-  remains the broader regime, not a claim that every listed technique is automated.
+  include path. `tools/test_journal.py` exercises offline admission, including
+  deterministic mutations. CI provisions lavapipe and checks typed relocation,
+  optional MSAA, isolated replay and a real Vulkan 1.3 software driver.
+  `tools/debug_cycle.gdb` steps a frame; `tools/debug_functions.py` traces the
+  functions reached during a complete cycle. There is no `cppcheck` in the tree.
+  Section 4 remains the broader regime, not a claim that every technique is automated.
 - Validation follows `NDEBUG`, and every CMake build type except `Debug`
   defines it. So `-DCMAKE_BUILD_TYPE=Debug` is the only way to get the
   validation section 7 relies on, and it is worth building periodically for a
@@ -335,10 +339,10 @@ loader and `glslangValidator`.
   found a real one -- a journal-supplied opcode indexing an array with the
   bounds check three hundred lines away behind a macro. Treat the two build
   types as two analysers, in the spirit of section 4.
-- Only `--exit-after N` ends a windowed run on its own, which is what makes
-  the swapchain create/destroy path testable under validation without a human
-  at the keyboard. Resize is still manual: nothing in the tree can drag a
-  window.
+- `--exit-after N` bounds a windowed run. `tools/check_window.py` uses Xvfb,
+  Openbox and xdotool to resize, minimize, restore and close `test_window`
+  under validation without touching the user's desktop. It verifies actual
+  window geometry/state and swapchain recreation metrics.
 
 ---
 

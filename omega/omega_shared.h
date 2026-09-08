@@ -20,8 +20,7 @@
 #define OMEGA_GATE_THROAT_RADIUS 1.5f
 #define OMEGA_GATE_ENTRANCE_Z 1200.0f
 /* Bow cannon muzzles in hull space; the beams and their lights start here. */
-#define OMEGA_MUZZLE_Z -20.2f
-#define OMEGA_MUZZLE_X 0.9f
+#include "omega_mounts.h"
 /* About nine kilometres between centres at the authored 1.7 km hull scale. */
 #define OMEGA_BATTLE_SEPARATION 190.0f
 #define OMEGA_SEQUENCE_TICKS 1800
@@ -46,7 +45,7 @@
  *   color_rg        half r, half g
  *   color_b_codes   low half: b. high 16: material | part<<8
  * Colour is half float, not unorm8, because the pylon window is 1.6 and would
- * clamp. Codes are small integers: material 0..8, part 0..27. */
+ * clamp. Codes are small integers: material 0..8, part 0..127. */
 VKMIN_STRUCT(OmegaVertex) { F32 x, y, z; U32 normal, color_rg, color_b_codes; };
 /* Per-frame state lives in a ring-allocated block addressed from the push
  * constants, so the push carries only what varies per draw: the pass, the
@@ -59,6 +58,10 @@ VKMIN_STRUCT(OmegaScene) {
     U32 hull_texture;
     F32 reserved[2];
     vec4 blur;  /* xy: hull motion this frame in UV; z: shutter fraction */
+    mat4 turrets[96]; /* four ships, twelve mounts, yaw housing + pitched barrels */
+    vec4 beam_hit[2];
+    vec4 pulse_start[18]; /* xyz birth muzzle, w age in ticks */
+    vec4 pulse_end[18];
 };
 VKMIN_STRUCT(OmegaPush) {
     ADDR vertices;
@@ -75,7 +78,7 @@ VKMIN_STRUCT(OmegaPush) {
 #define OMEGA_PASS_GRADE 4u
 #ifndef VKMIN_GLSL
 _Static_assert(sizeof(OmegaVertex)==24, "omega vertex layout");
-_Static_assert(sizeof(OmegaScene)==128, "omega scene layout");
+_Static_assert(sizeof(OmegaScene)==6880, "omega scene layout");
 _Static_assert(sizeof(OmegaPush)==32, "omega push layout");
 #endif
 #endif

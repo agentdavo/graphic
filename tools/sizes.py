@@ -26,7 +26,7 @@ GROUPS = {
     'vkmin core':        (4200, ['src/vkmin.c', 'src/vkmin_cvar.c', 'src/vkmin_stb.c']),
     'public header':     ( 300, ['src/vkmin.h']),
     'gpu headers':       ( 900, ['src/vkmin_gpu.h', 'src/vkmin_spirv.h', 'src/vkmin_inspect.h',
-                                 'src/vkmin_cvar.h', 'src/vkmin_math.h', 'src/vkmin_stb.h']),
+                                 'src/vkmin_cvar.h', 'src/vkmin_math.h', 'src/vkmin_stb.h', 'src/vkmin_pure.h', 'src/vkmin_arena.h']),
     'common':            ( 700, ['src/min_types.h', 'src/min_math.h', 'src/min_jrnl.h']),
     'platform':          (1100, ['src/vkmin_plat.h', 'src/vkmin_plat_common.h', 'src/vkmin_plat_sdl.h',
                                  'src/vkmin_plat_glfw.c', 'src/vkmin_plat_sdl2.c',
@@ -42,12 +42,13 @@ GROUPS = {
                                  'src/sndmin_plat.h', 'src/sndmin_io.h']),
     'shaders':           (2000, ['src/shaders/*.vert', 'src/shaders/*.frag', 'src/shaders/*.comp',
                                  'src/shaders/*.glsl', 'src/shaders/lib/*.glsl']),
-    'demos':             (1400, ['omega/omega.c', 'demo/scene.c', 'demo/gamekit.h', 'demo/anim.h']),
+    'demos':             (1400, ['omega/omega.c', 'omega/omega_weapons.h', 'omega/omega_shared.h', 'demo/scene.c', 'demo/gamekit.h', 'demo/anim.h']),
 }
 
 # Generated, vendored or data: measured for information, never budgeted. The
 # font and the model are baked arrays, and third_party is not ours to shrink.
-EXCLUDED = ['src/render_font.h', 'omega/omega_model.h', 'omega/omega_surface.h', 'src/third_party/*']
+EXCLUDED = ['src/render_font.h', 'omega/omega_model.h', 'omega/omega_model.c',
+            'omega/omega_mounts.h', 'omega/omega_surface.h', 'src/third_party/*']
 
 
 def code_lines(text):

@@ -56,7 +56,8 @@ int main(int argc, char **argv) {
         .format=VKMIN_FMT_D32_FLOAT,.usage=VKMIN_IMAGE_DEPTH,.label="depth resolve"});
     const vkmin_pipeline pipe=vkmin_make_pipeline(c,&(vkmin_pipeline_desc){
         .vs=VKMIN_BYTES(ex_tri_vert_spv),.fs=VKMIN_BYTES(ex_msaa_frag_spv),.push_size=sizeof(float),
-        .samples=invalid && !strcmp(invalid,"pipeline")?(samples==1?2u:1u):samples,.alpha_to_coverage=coverage,.depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,
+        .color_format=invalid && !strcmp(invalid,"pipeline")?VKMIN_FMT_BGRA8_UNORM:VKMIN_FMT_RGBA8_UNORM,
+        .samples=samples,.alpha_to_coverage=coverage,.depth=true,.depth_write=true,.cull=VKMIN_CULL_NONE,
         .extra_colors=1,.label="MSAA MRT coverage"});
     const vkmin_pipeline no_test=vkmin_make_pipeline(c,&(vkmin_pipeline_desc){
         .vs=VKMIN_BYTES(ex_tri_vert_spv),.fs=VKMIN_BYTES(ex_msaa_frag_spv),.push_size=sizeof(float),

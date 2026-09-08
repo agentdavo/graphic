@@ -10,9 +10,10 @@ int main(int argc, char **argv) {
     const float values[] = {0.0f, 0.75f, 0.25f, 1.0f};
     const vkmin_buffer source = vkmin_make_buffer(c,&(vkmin_buffer_desc){.data=VKMIN_BYTES(values),.label="address source"});
     const uint64_t address = vkmin_address(c,source)+4;
-    const uint32_t field[] = {1}, push_field[] = {offsetof(Push,address)};
-    unsigned char packed[24] = {0};
-    memcpy(packed+1,&address,8); memcpy(packed+9,&address,8);
+    const uint32_t field[] = {1}, ring_fields[] = {1,17}, push_field[] = {offsetof(Push,address)};
+    unsigned char packed[32] = {0};
+    const uint64_t integer = address-4;
+    memcpy(packed+1,&address,8); memcpy(packed+9,&integer,8);
     const vkmin_buffer packed_buffer = vkmin_make_buffer(c,&(vkmin_buffer_desc){.data=VKMIN_BYTES(packed),
         .addresses={field,1},.label="packed pointer and integer"});
     vkmin_buffer_upload_typed(c,packed_buffer,0,VKMIN_BYTES(packed),(vkmin_address_layout){field,1});
@@ -22,9 +23,11 @@ int main(int argc, char **argv) {
     while(vkmin_running(c)) {
         (void)vkmin_frame_begin(c,&(vkmin_clear){0,0,0,1});
         uint64_t ring_address=0;
-        unsigned char *ring=vkmin_ring_alloc_typed(c,sizeof packed,&ring_address,(vkmin_address_layout){field,1});
+        unsigned char *ring=vkmin_ring_alloc_typed(c,sizeof packed,&ring_address,(vkmin_address_layout){ring_fields,2});
         memcpy(ring,packed,sizeof packed);
-        const Push push={address,address};
+        const uint64_t interior = ring_address+1;
+        memcpy(ring+17,&interior,8);
+        const Push push={address,integer};
         vkmin_draw(c,p,&push,3,1);
         vkmin_frame_end(c);
     }

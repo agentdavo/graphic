@@ -3,7 +3,7 @@
 A small Vulkan 1.4 renderer and an audio engine, both in C11, sharing one
 deterministic replay format.
 
-![OMEGA — the gate opens and the destroyer comes through](docs/images/omega.gif)
+![OMEGA emerges and exchanges fire](docs/images/omega.gif)
 
 Two independent libraries, an optional render layer, a demo that exercises
 them, and an offline frame inspector. There is no engine here: nothing owns
@@ -13,7 +13,7 @@ your loop, and nothing calls back into your code.
 
 ## OMEGA — Through the Blue
 
-The demo this is built to run. A procedural destroyer emerges from a blue jump
+The demo this is built to run. A Blender-authored destroyer emerges from a blue jump
 gate and fires its forward cannons, with a rotating habitat, escorts, custom
 shaders, shadows and bloom. Four truss pylons reach from the mouth toward the
 camera and charge with red flares; a white flash opens a funnel with a dark
@@ -21,6 +21,14 @@ throat; the ship approaches, passes the camera, and the gate closes. Thirty
 seconds at 60 Hz, scored by *Iron Across the Blue* at 120 BPM — synthesised at
 runtime by sndmin, with no audio files anywhere in the repository. The grade
 clips highlights and bleeds chroma the way 1990s broadcast CGI did.
+
+The refined hull has 160,120 triangles, with a recessed launch bay, paired bow
+cannons, twelve twin-gun turrets, detailed habitat bearings and deep engine
+nozzles. The bow beams start at the modeled bores; secondary turrets traverse
+and elevate before firing from alternating barrels. Projectile paths retain
+their launch pose, and their flashes and spatial audio share those positions.
+Model references and the demo's mechanical assumptions are recorded in
+[the model notes](docs/omega-model.md).
 
 ```sh
 cmake -S . -B build -G Ninja
@@ -36,6 +44,10 @@ cmake --build build
 | **t = 11 s** — the cut to the broadside two-shot | **t = 17 s** — low stern-quarter, engines in the foreground |
 | ![Broadside](docs/images/omega-broadside.jpg) | ![The fleet](docs/images/omega-fleet.jpg) |
 | **t = 23 s** — reverse along the lead hull, toward the attacker | **t = 28 s** — the high widening tableau and the final salvo |
+
+![Articulated twin-gun batteries firing from their barrel mouths](docs/images/omega-weapons.jpg)
+
+The inspection camera (`--weapon-view`) shows the secondary batteries at **t = 13.53 s**.
 
 The whole sequence with its score is
 [docs/omega-through-the-blue.mp4](docs/omega-through-the-blue.mp4) — 1280×720
@@ -195,10 +207,11 @@ exposed for experimentation and is off by default. It does not improve its
 procedural shader details. The image arena is now 160 MiB; larger resolutions
 or high sample counts may require `+r_image_arena_mb N`.
 
-Version-8 journals preserve explicit pipeline depth attachment declarations,
+Version-9 journals preserve explicit pipeline depth attachment declarations,
 image samples/flags, pipeline samples/coverage,
 and pass resolve targets/modes. Ring pointers are frame-relative so recording
-and replay can use different ring sizes. Replay still reads versions 3-7
+and replay can use different ring sizes. Address fields are now declared explicitly;
+an ABI fingerprint rejects incompatible native layouts. Replay still reads versions 3-8
 (versions 3-6 multi-frame ring pointers require the original ring-size setting). An EXT
 recording requires that extension on the replay device. The inspector shows
 sample counts and resolve writes, reads exact resolved pixels and explicitly
@@ -216,6 +229,16 @@ cleanup/fallback, vertex-stage sampling, sparse timestamps, CLI precedence,
 wrapper bounds/transport, Khronos rejection in Debug, zero-alpha coverage, and exact
 record/replay images on each supported execution path. The optional extension
 cases skip explicitly on devices that do not support them.
+Use `--require-samples 1 4` and `--require-single` to turn missing coverage into
+a failure. The device-free suite also checks negotiation through 64x; this
+does not claim that 16x/32x/64x rendering was tested on unavailable hardware.
+
+Journal users must declare address fields with `vkmin_pipeline_desc.push_addresses`,
+`vkmin_buffer_desc.addresses`, `vkmin_buffer_upload_typed` and
+`vkmin_ring_alloc_typed`. Empty layouts mean plain bytes. The metadata distinguishes
+integers from pointers and supports unaligned fields and interior addresses.
+Omega and the render layer supply these layouts. See [journal contracts and isolated
+replay](docs/replay.md) for migration, compatibility and execution limits.
 
 ---
 
@@ -405,17 +428,17 @@ within a line on every file in the tree.
 
 | | code | budget |
 | --- | --- | --- |
-| vkmin core (`vkmin.c`, cvar, stb) | 3669 | 4200 |
-| public header `vkmin.h` | 266 | 300 |
-| gpu headers | 489 | 900 |
+| vkmin core (`vkmin.c`, cvar, stb) | 3815 | 4200 |
+| public header `vkmin.h` | 272 | 300 |
+| gpu headers | 601 | 900 |
 | common (`min_*`) | 347 | 700 |
 | platform boundary and all four backends | 828 | 1100 |
-| render layer | 1250 | 2600 |
+| render layer | 1252 | 2600 |
 | render headers | 433 | 1000 |
 | sndmin | 1110 | 2200 |
 | sndmin headers | 267 | 900 |
-| shaders, including shared GLSL | 1611 | 2000 |
-| demos (`omega.c`, `scene.c`, the kit) | 1076 | 1400 |
+| shaders, including shared GLSL | 1635 | 2000 |
+| demos (Omega, its weapon/shared headers, scene and kit) | 1226 | 1400 |
 
 Generated and vendored code — the baked font, the model arrays,
 `src/third_party` — is measured but never budgeted; it is not ours to shrink.

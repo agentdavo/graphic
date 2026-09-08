@@ -20,7 +20,7 @@ void main() {
     if(material==8) {
         int code=partCode-10,ship=code/6,battery=(code%6)/3,shot=code%3;
         float age=omegaParticleAge(ship,shot);
-        vec3 start=omegaParticleMuzzle(ship,battery),end=omegaParticleImpact(battery);
+        vec3 start=F.pulse_start[code].xyz,end=F.pulse_end[code].xyz;
         vec3 axis=normalize(end-start),right=normalize(cross(axis,vec3(0,1,0))),up=cross(right,axis);
         float head=clamp(age/float(OMEGA_PARTICLE_FLIGHT),0.,1.);
         float tail=clamp((age-3.)/float(OMEGA_PARTICLE_FLIGHT),0.,1.);
@@ -30,6 +30,17 @@ void main() {
         gl_Position=F.vp*vec4(world,1);
         if(age<0. || age>float(OMEGA_PARTICLE_FLIGHT)+3. || o.pass==OMEGA_PASS_SHADOW)
             gl_Position=vec4(2,2,2,1);
+        return;
+    }
+    bool articulated=partCode>=32;
+    int owner=articulated?(partCode-32)/24:0;
+    if(articulated) {
+        mat4 pose=F.turrets[partCode-32];
+        p=(pose*vec4(p,1)).xyz; n=mat3(pose)*n;
+        world=p; normal=n; tint=color; tint.a=owner>0?-float(owner):0.;
+        if(owner==0) tint.rgb*=smoothstep(4.5,5.1,F.scene.x);
+        gl_Position=o.pass==OMEGA_PASS_SHADOW?omegaShadow(p):F.vp*vec4(p,1);
+        if(owner==0 && F.scene.x<4.5) gl_Position=vec4(2,2,2,1);
         return;
     }
     bool opponent=partCode>3;

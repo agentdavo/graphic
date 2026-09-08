@@ -3,15 +3,14 @@
 # suite, the goldens, the package consumers) are no longer in the tree.
 #
 # Warnings are errors and GCC's analyser runs in the normal build, so a clean
-# build here is the check. It is not a substitute for the suite that was
-# removed: nothing below compares a recorded frame against a replayed one.
+# build is one check; the regressions below also compare captures and replays.
 name: build
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
   linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       # Ubuntu 24.04's mesa-vulkan-drivers is Mesa 24.0, and lavapipe of that
@@ -22,10 +21,13 @@ jobs:
       - name: Install Vulkan, a current lavapipe, glslang and a backend
         run: |
           sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build libvulkan-dev glslang-tools spirv-tools \
-            mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev vulkan-tools
+            mesa-vulkan-drivers vulkan-validationlayers libglfw3-dev vulkan-tools \
+            gdb clang xvfb openbox xdotool x11-utils xauth podman
           dpkg -l mesa-vulkan-drivers | tail -1
       # Ubuntu 24.04's libvulkan-dev is Vulkan 1.3.275 era, and this is a 1.4
       # codebase: unifiedImageLayouts, hostImageCopy and maintenance5 are not
@@ -37,19 +39,62 @@ jobs:
         run: |
           git clone --depth 1 --branch vulkan-sdk-1.4.357.0 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vulkan-headers"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DVulkan_INCLUDE_DIR="$RUNNER_TEMP/vulkan-headers/include"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVulkan_INCLUDE_DIR="$RUNNER_TEMP/vulkan-headers/include"
       - name: Build
         run: cmake --build build
+      - name: Device-free admission, arithmetic and sound regressions
+        run: ctest --test-dir build --output-on-failure
+      - name: Independent Clang analysis
+        run: |
+          clang --analyze -std=c11 -DVKMIN_NO_PLATFORM -Isrc -isystem "$RUNNER_TEMP/vulkan-headers/include" src/vkmin.c 2> clang-analysis.txt
+          cat clang-analysis.txt
+          test ! -s clang-analysis.txt
+      - name: Select an installed software ICD
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          paths=list(Path('/usr/share/vulkan/icd.d').glob('lvp_icd*.json'))
+          assert len(paths)==1, paths
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write('VK_DRIVER_FILES='+str(paths[0])+'\n')
+          PY
+      - name: Typed relocation and required extension coverage
+        run: |
+          python3 tools/check_relocation.py --build build --out build/typed-check
+          python3 tools/check_replay_errors.py --replay build/replay --journal build/typed-check/typed.vkj --out build/replay-errors
+          python3 tools/check_msaa.py --build build --out build/msaa-check --require-single --require-samples 1 4
+      - name: Step and trace one complete cycle
+        run: |
+          mkdir -p build/boundaries
+          timeout 60 gdb --batch -x tools/debug_cycle.gdb build/test_msaa > build/boundaries/debug-cycle.log 2>&1
+          timeout 60 gdb --batch -ex 'set debuginfod enabled off' -ex 'set print thread-events off' -ex 'source tools/debug_functions.py' -ex 'run --frame 0 --out build/boundaries/debug-functions.png' build/test_msaa > build/boundaries/debug-functions.log 2>&1
+          python3 -c "import json; from pathlib import Path; assert 'vkmin_shutdown' in json.loads(Path('build/boundaries/debug-functions.json').read_text())"
+      - name: Resize, minimize and restore on an isolated display
+        run: |
+          xvfb-run -a sh -c 'openbox > build/boundaries/openbox.log 2>&1 & python3 tools/check_window.py --binary build/test_window --out build/window-check'
+      - name: Isolated CPU replay without a host GPU or network
+        run: |
+          podman build -f tools/Containerfile.replay -t localhost/vkmin-replay:9 .
+          python3 tools/check_isolated.py --typed build/typed-check --captures build/msaa-check --out build/isolated-check --limit-test
+      - name: Actual Vulkan 1.3 software driver
+        run: |
+          podman build -f tools/Containerfile.replay-1.3 -t localhost/vkmin-replay:1.3 .
+          python3 tools/check_isolated.py --typed build/typed-check --captures build/msaa-check --out build/isolated-1.3-check --image localhost/vkmin-replay:1.3 --api 1.3 --samples 1 4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boundary-coverage
+          path: |
+            build/boundaries
+            build/typed-check
+            build/msaa-check/result.json
+            build/window-check
+            clang-analysis.txt
+            build/isolated-check/result.json
+            build/isolated-1.3-check/result.json
       - name: Validate every SPIR-V module
         run: cmake --build build --target validate-shaders
-      # No VK_DRIVER_FILES here, deliberately. Setting it *replaces* the
-      # loader's search path rather than adding to it, so naming one ICD file
-      # that turns out not to exist leaves the loader with no drivers at all
-      # and vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER -- which is
-      # exactly what happened, and what the annotation below finally showed.
-      # On a GPU-less runner lavapipe is the only ICD installed, so letting
-      # the loader find it is both simpler and correct. The pinned path in
-      # CLAUDE.md is a Windows workaround and does not belong here.
+      # VK_DRIVER_FILES above names a verified installed ICD, not an assumed path.
       - name: What the loader can see
         run: |
           echo "::notice::ICDs: $(ls /usr/share/vulkan/icd.d/ 2>&1 | tr '\n' ' ')"
@@ -74,13 +119,9 @@ jobs:
           fi
       - name: Render a frame under lavapipe
         run: ./build/omega --headless --size 640 360 --frame 300 --out frame300.png
-      # vkmin targets 1.4 with a 1.3 floor, and the two paths must produce the
-      # same pixels. lavapipe is the natural place to check it: a software
-      # rasteriser is exactly the "1.3 driver is supported, not degraded" case,
-      # and it will normally select LEGACY on its own. Forcing both and
-      # comparing is stronger than the record/replay check, which only proves a
-      # journal replays -- this proves the floor renders.
-      - name: The 1.3 floor and the 1.4 path render the same pixels
+      # Forced execution paths on the current driver are separate coverage
+      # from the actual Vulkan 1.3 driver container above.
+      - name: Legacy and modern paths render the same pixels
         run: |
           ./build/omega --headless --size 320 180 --frame 300 --out legacy.png --path=legacy
           ./build/omega --headless --size 320 180 --frame 300 --out modern.png --path=modern

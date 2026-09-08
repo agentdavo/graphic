@@ -59,7 +59,7 @@ def main():
     parser.add_argument('--work', type=Path, default=ROOT / 'build/video')
     parser.add_argument('--out', type=Path, default=ROOT / 'docs')
     parser.add_argument('--size', type=int, nargs=2, default=(1280, 720))
-    parser.add_argument('--gif', type=int, nargs=2, default=(450, 655),
+    parser.add_argument('--gif', type=int, nargs=2, default=(600, 930),
                         help='first and last tick of the GIF excerpt')
     parser.add_argument('--skip-capture', action='store_true', help='reuse frames already on disk')
     args = parser.parse_args()
@@ -114,6 +114,10 @@ def main():
         for name, tick in STILLS.items():
             run([ffmpeg, '-y', '-i', frames / f'{TITLE}_{tick:04d}.png',
                  '-q:v', '2', images / f'omega-{name}.jpg'], log)
+        weapon = args.work / 'weapons.png'
+        run([args.exe, '--headless', '--weapon-view', '--size', width, height,
+             '--frame', 812, '--out', weapon], log)
+        run([ffmpeg, '-y', '-i', weapon, '-q:v', '2', images / 'omega-weapons.jpg'], log)
 
     for path in sorted(args.out.rglob('*')):
         if path.is_file():
