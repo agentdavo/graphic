@@ -32,6 +32,47 @@ void main() {
             gl_Position=vec4(2,2,2,1);
         return;
     }
+    if(partCode>=OMEGA_FURY_PART) {
+        int index=partCode-OMEGA_FURY_PART;
+        int ship=index<OMEGA_FURY_HERO?0:1+(index-OMEGA_FURY_HERO)/OMEGA_FURY_WING;
+        mat4 pose=F.fury[index];
+        p=(pose*vec4(p,1)).xyz; n=mat3(pose)*n;
+        world=p; normal=n; tint=color; tint.a=ship>0?-float(ship):0.;
+        if(ship==0) tint.rgb*=smoothstep(4.5,5.1,F.scene.x);
+        gl_Position=o.pass==OMEGA_PASS_SHADOW?omegaShadow(p):F.vp*vec4(p,1);
+        if(ship==0 && (F.scene.x<4.5 || omegaFuryAge(index)<0.)) gl_Position=vec4(2,2,2,1);
+        return;
+    }
+    if(material==10) {
+        // A round blob, billboarded to the eye. The index rides in the
+        // vertex's own z, exactly as the embers do.
+        OmegaBolt b=omegaBolt(p.z);
+        vec3 toEye=normalize(F.eye.xyz-b.centre);
+        vec3 right=normalize(cross(toEye,vec3(0,1,0)));
+        vec3 up=cross(right,toEye);
+        float size=OMEGA_BOLT_SIZE*(.75+.45*b.fade);
+        world=b.centre+right*(p.x*size)+up*(p.y*size);
+        normal=toEye; local=p;
+        tint=vec4(vec3(6.2,1.5,9.5)*(.35+.65*b.fade),0);
+        gl_Position=F.vp*vec4(world,1);
+        if(b.live<.5 || o.pass==OMEGA_PASS_SHADOW) gl_Position=vec4(2,2,2,1);
+        return;
+    }
+    if(material==9) {
+        // The quad corners are baked at (+-.5,+-.5); the ember's index rides
+        // in the vertex's own z, which is the only place left that costs
+        // nothing. Drawn as a streak along its velocity, billboarded about it.
+        OmegaEmber e=omegaEmber(p.z);
+        vec3 along=normalize(e.velocity);
+        vec3 side=normalize(cross(along,normalize(F.eye.xyz-e.centre)));
+        float length=OMEGA_EMBER_SIZE*(2.0+4.2*e.fade);
+        world=e.centre+along*(p.x*length)+side*(p.y*OMEGA_EMBER_SIZE);
+        normal=along; local=p;
+        tint=vec4(vec3(9.,2.4,.30)*e.fade*e.fade,0);
+        gl_Position=F.vp*vec4(world,1);
+        if(e.live<.5 || o.pass==OMEGA_PASS_SHADOW) gl_Position=vec4(2,2,2,1);
+        return;
+    }
     bool articulated=partCode>=32;
     int owner=articulated?(partCode-32)/24:0;
     if(articulated) {
@@ -47,7 +88,7 @@ void main() {
     int ship=opponent?(partCode-4)/2:0;
     int part=opponent?partCode-4-2*ship:partCode;
     if(part==1) {
-        float a=F.scene.x*.17+.23+float(ship)*1.1;
+        float a=F.scene.x*OMEGA_HABITAT_RATE+OMEGA_HABITAT_PHASE+float(ship)*OMEGA_HABITAT_STAGGER;
         mat2 r=mat2(cos(a),sin(a),-sin(a),cos(a));
         p.xy=r*p.xy; n.xy=r*n.xy;
     }
@@ -59,7 +100,6 @@ void main() {
         p=omegaOpponentRotate(p)+omegaFormation(ship);
         n=omegaOpponentRotate(n);
     } else if(partCode<3) p.z+=F.scene.z;
-    if(partCode==2) p.y+=.15*sin(F.scene.x*.8+p.x);
     world=p; normal=n; tint=color; tint.a=opponent?-1.-float(ship):(partCode>=3?1.:0.);
     if(partCode<3) tint.rgb*=smoothstep(4.5,5.1,F.scene.x);
     gl_Position=o.pass==OMEGA_PASS_SHADOW?omegaShadow(p):F.vp*vec4(p,1);

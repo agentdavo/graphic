@@ -60,6 +60,78 @@ void main() {
     float nebula=.5+.25*sin(dot(ray,vec3(8,31,13))+1.3*sin(dot(ray,vec3(19,-17,23))))
         +.25*sin(dot(ray,vec3(-11,47,29)));
     color+=vec3(.05,.08,.34)*band*pow(max(nebula,0.),3.)*.008;
+    // The gas giant. One ray-sphere and one ray-plane against the same ray the
+    // stars use, so the body occludes them, the ring occludes the body, and
+    // the body drops its own shadow across the ring. What sells the scale is
+    // not the size on screen: it is limb darkening, a terminator narrow enough
+    // to have an edge, and a ring the ships are plainly not going to disturb.
+    vec3 planetSun=normalize(vec3(.62,.50,.60));
+    vec3 planetAxis=normalize(vec3(.19,.95,-.25));
+    vec3 toCentre=omegaPlanetCentre()-F.eye.xyz;
+    float along=dot(toCentre,ray);
+    float rr=OMEGA_PLANET_RADIUS*OMEGA_PLANET_RADIUS;
+    float miss=dot(toCentre,toCentre)-along*along;
+    float front=(along>0. && miss<rr)?along-sqrt(rr-miss):-1.;
+    if(front>0.) {
+        vec3 sn=normalize(F.eye.xyz+ray*front-omegaPlanetCentre());
+        float lat=dot(sn,planetAxis),lon=atan(sn.z,sn.x);
+        // Domain-warped belts. Parallel sines read as wallpaper at this size;
+        // the shear is what makes them look driven by something.
+        float shear=.30*sin(lon*3.+lat*8.)+.16*sin(lon*7.-lat*13.+1.1);
+        float bands=.5+.5*sin(lat*16.+shear+1.3*sin(lat*31.+.4));
+        vec3 belt=mix(vec3(.13,.16,.26),vec3(.56,.42,.25),bands);
+        belt=mix(belt,vec3(.09,.11,.19),pow(abs(lat),4.));
+        float storm=exp(-(pow((lat+.24)*11.,2.)+pow(sin((lon-1.2)*.5)*6.,2.)));
+        belt=mix(belt,vec3(.62,.30,.16),storm*.85);
+        float mu=max(dot(sn,-ray),0.);
+        belt*=.48+.52*pow(mu,.45);                 // limb darkening
+        float day=dot(sn,planetSun);
+        float lit=smoothstep(-.04,.20,day);
+        float scatter=exp(-pow(day*8.,2.));        // the thin warm terminator line
+        float limb=pow(1.-mu,3.5);
+        color=belt*(.010+.115*lit)+vec3(.50,.26,.12)*scatter*.045
+            +vec3(.24,.46,.92)*limb*(.04+.55*smoothstep(-.30,.45,day));
+    }
+    // The atmosphere, on rays that graze past the body rather than hit it. A
+    // thin arc outside the silhouette is what makes a planet read as a planet
+    // instead of a painted disc, and it cannot come from shading the surface:
+    // every point that would carry it is over the horizon.
+    if(along>0.) {
+        float graze=sqrt(max(miss,0.));
+        float shell=1.-smoothstep(OMEGA_PLANET_RADIUS*.997,OMEGA_PLANET_RADIUS*1.060,graze);
+        if(shell>0. && graze>OMEGA_PLANET_RADIUS*.997) {
+            vec3 gn=normalize(F.eye.xyz+ray*along-omegaPlanetCentre());
+            color+=vec3(.34,.60,1.10)*shell*pow(max(dot(gn,planetSun),0.),.65)*.62;
+        }
+    }
+    // The ring. Visible where it passes in front of the body, or beside it.
+    // The plane test stays out of a branch so the derivative below is taken in
+    // uniform control flow, and the divisor is clamped rather than guarded.
+    float faceOn=dot(ray,planetAxis);
+    {
+        float ringT=dot(toCentre,planetAxis)/(abs(faceOn)<1e-4?1e-4:faceOn);
+        vec3 radial=F.eye.xyz+ray*ringT-omegaPlanetCentre();
+        float r=length(radial)/OMEGA_PLANET_RADIUS;
+        // Both edges are antialiased in screen space, not in ring radius. At
+        // grazing incidence r crosses the whole annulus inside one pixel, so a
+        // fade written in r collapses to a hard line precisely where the ring
+        // is thinnest -- which is what was clipping it short of the limb.
+        float edge=max(fwidth(r)*1.4,.010);
+        if(ringT>0. && r>1.30-edge && r<2.02+edge && (front<0. || ringT<front)) {
+            float grain=.55+.45*sin(r*63.)*sin(r*27.+1.);
+            float density=grain*smoothstep(1.30-edge,1.30+edge*2.,r)
+                *(1.-smoothstep(2.02-edge*2.,2.02+edge,r));
+            if(r>1.58 && r<1.67) density*=.12;      // the division
+            // The planet's own shadow, cast along the sun: a point behind the
+            // body and within its radius of the axis is in eclipse.
+            float sunAlong=dot(radial,planetSun);
+            float sunPerp=length(radial-planetSun*sunAlong);
+            float eclipse=(sunAlong<0. && sunPerp<OMEGA_PLANET_RADIUS)?.10:1.;
+            vec3 dust=mix(vec3(.40,.36,.30),vec3(.68,.62,.51),grain);
+            float level=(.022+.058*max(dot(planetAxis,planetSun),0.))*eclipse;
+            color=mix(color,dust*level,clamp(density,0.,1.));
+        }
+    }
     vec3 skyColor=color;
     if(F.scene.w>.005) {
         float aperture=F.scene.w,time=F.scene.x;

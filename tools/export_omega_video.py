@@ -16,17 +16,17 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 TITLE = 'OMEGA - Through the Blue'          # vkmin names PNGs after the window title
-SEQUENCE = 1800                             # OMEGA_SEQUENCE_TICKS, 60 a second
+SEQUENCE = 3600                             # OMEGA_SEQUENCE_TICKS, 60 a second
 BATCH = 63                                  # VKMIN_MAX_FRAME_LIST is 64, less the warm-up tick
 
 # t seconds -> tick. The beats are the demo's own, from omega.c's camera cuts.
 STILLS = {
-    'gate-charging':   180,   # t=3   pylons charging, the mouth still dark
-    'gate-open':       480,   # t=8   the flash has opened the funnel
-    'emergence':       660,   # t=11  cut to the broadside two-shot
-    'engines':        1000,   # t=16.7 low stern-quarter, engines in the foreground
-    'broadside':      1400,   # t=23  reverse along the lead hull, toward the attacker
-    'fleet':          1700,   # t=28  high widening tableau, the final salvo
+    'gate-charging':   180,   # t=3    pylons charging, the mouth still dark
+    'gate-open':       480,   # t=8    the flash has opened the funnel
+    'emergence':       780,   # t=13   the launch beat: bay wave out, gas giant behind
+    'engines':        1194,   # t=19.9 the fly-by, at the hull's closest approach
+    'broadside':      1400,   # t=23   reverse along the lead hull, toward the attacker
+    'fleet':          1700,   # t=28   high widening tableau, the final salvo
 }
 
 
@@ -90,7 +90,8 @@ def main():
         mp4 = args.out / 'omega-through-the-blue.mp4'
         run([ffmpeg, '-y', '-framerate', '60', '-i', pattern, '-i', wav,
              '-c:v', 'libx264', '-preset', 'slow', '-crf', '20', '-pix_fmt', 'yuv420p',
-             '-c:a', 'aac', '-b:a', '192k', '-t', '30', '-movflags', '+faststart', mp4], log)
+             '-c:a', 'aac', '-b:a', '384k', '-ac', '6', '-t', '60',
+             '-movflags', '+faststart', mp4], log)
 
         # A GIF needs its own palette or the gate's blues band badly. Markdown
         # animates a GIF from a plain image link, which no video format gets.

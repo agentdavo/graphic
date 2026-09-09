@@ -51,6 +51,13 @@ vec3 omegaParticleImpact(int ship,int battery) {
     return F.pulse_end[ship*6+battery*3+omegaLatestShot(ship)].xyz;
 }
 float omegaParticleAge(int ship,int shot) { return F.pulse_start[ship*6+shot].w; }
+// The launch schedule, from the constants omega_weapons.h computes poses
+// with. The shader needs only enough of it to hide a fighter still in the
+// bay; omega_fury_age is the same two lines, and they change together.
+float omegaFuryAge(int index) {
+    if(index<OMEGA_FURY_WING || index>=OMEGA_FURY_HERO) return 1e9;
+    return F.scene.x-(OMEGA_FURY_LAUNCH_START+float((index-OMEGA_FURY_WING)/2)*OMEGA_FURY_LAUNCH_INTERVAL);
+}
 float omegaParticleLight(int ship,bool impact) {
     float level=0.;
     for(int shot=0;shot<3;shot++) {
@@ -85,6 +92,69 @@ vec4 omegaShadow(vec3 world) {
     return vec4(dot(right,world)/25.,-dot(up,world)/25.,(60.-dot(light,world))/120.,1);
 }
 float hash21(vec2 p) { return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+vec3 omegaPlanetCentre() { return vec3(OMEGA_PLANET_X,OMEGA_PLANET_Y,OMEGA_PLANET_Z); }
+// One ember of the impact spray, as a pure function of its index and the
+// clock: birth staggered by a hash, so the fountain is continuous while the
+// guns are firing and nothing has to be stored between frames.
+// One pulse bolt, as a pure function of its index and the clock. The index
+// splits into the fighter that fired it and which shot of the burst it is;
+// firing follows the same three lines of attack schedule omega_fury_run uses
+// on the CPU, from the same constants, because the shader cannot see a pose
+// that was evaluated at a moment it no longer has.
+struct OmegaBolt { vec3 centre; float live, fade; };
+OmegaBolt omegaBolt(float index) {
+    int fighter=int(mod(index,float(OMEGA_FURY_HERO)));
+    int shot=int(index)/OMEGA_FURY_HERO;
+    float since=F.scene.x-(OMEGA_FURY_ATTACK+float(fighter)*OMEGA_FURY_STAGGER);
+    float laps=since/OMEGA_FURY_CYCLE;
+    float phase=laps-floor(laps);
+    // The muzzle is whatever omega_weapon_frame froze at the instant this
+    // round left, not wherever its fighter is now. The bursts -- four rounds
+    // together then a gap -- are set by the same arithmetic on the CPU side.
+    vec4 fired=F.bolt[int(index)];
+    vec3 muzzle=fired.xyz;
+    float age=max(F.scene.x-fired.w,0.);
+    // A round flies from the muzzle it left toward what it was aimed at, and
+    // stops there rather than continuing to infinity.
+    vec3 mark=omegaFormation(int(mod(float(fighter),3.)));
+    vec3 toward=mark-muzzle;
+    float range=max(length(toward)-14.,4.);
+    float flown=OMEGA_BOLT_SPEED*age;
+    OmegaBolt b;
+    b.centre=muzzle+normalize(toward)*min(flown,range);
+    b.fade=1.-age/OMEGA_BOLT_LIFE;
+    // Only on the way in, and only until the round arrives: a fighter breaking
+    // off is running, not shooting.
+    b.live=(since>0. && phase<.45 && flown<range && age<OMEGA_BOLT_LIFE)?1.:0.;
+    return b;
+}
+// Where a breach is, in world space. Sites are stored in hull space so they
+// ride the ship; the first four belong to the hero and the last two to the
+// opponent her beams are on.
+vec3 omegaBreach(int site) {
+    vec3 local=F.damage[site].xyz;
+    return site<4?local+vec3(0,0,F.scene.z)
+        :omegaOpponentRotate(local)+omegaFormation(0);
+}
+// One ember of a breach's cloud, as a pure function of its index and the clock.
+// Births are staggered by a hash so the fountain is continuous with nothing
+// stored between frames, and the cone opens outward from the wound rather than
+// in one direction: a breach vents, it does not aim.
+struct OmegaEmber { vec3 centre, velocity; float fade, live; };
+OmegaEmber omegaEmber(float index) {
+    int site=int(mod(index,float(OMEGA_DAMAGE_SITES)));
+    float spread=hash21(vec2(index,7.)),around=hash21(vec2(index,19.));
+    float reach=hash21(vec2(index,31.)),birth=hash21(vec2(index,53.));
+    float age=fract(F.scene.x/OMEGA_EMBER_LIFE+birth)*OMEGA_EMBER_LIFE;
+    float a=around*6.28318531,z=spread*2.-1.,r=sqrt(max(1.-z*z,0.));
+    vec3 direction=vec3(cos(a)*r,sin(a)*r,z);
+    OmegaEmber e;
+    e.velocity=direction*(.85+3.4*reach);
+    e.centre=omegaBreach(site)+e.velocity*age;
+    e.fade=1.-age/OMEGA_EMBER_LIFE;
+    e.live=step(F.damage[site].w,F.scene.x);
+    return e;
+}
 float noise2(vec2 p) {
     vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
     return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),

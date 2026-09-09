@@ -191,6 +191,12 @@ jobs:
         with:
           node-version: '22'
       - run: python -m unittest discover -s tools -p test_inspector.py -v
+      # A journal is a file on disk that a replay must not trust, and this is
+      # the adversarial half of that: truncation at every offset, a bounded
+      # mutation campaign, ABI and endian tags, duplicate relocations and the
+      # admission budgets. It needs no driver, so it belongs beside the other
+      # offline checks rather than in a job that provisions a GPU.
+      - run: python -m unittest discover -s tools -p test_journal.py -v
       # The tree used to enforce line budgets from its test suite. That suite
       # went, and for a while the budgets were numbers in a README that nothing
       # checked. This is that gate again, on code lines rather than raw ones so

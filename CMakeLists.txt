@@ -361,7 +361,7 @@ add_executable(replay tools/replay.c)
 target_link_libraries(replay PRIVATE vkmin_flags vkmin)
 
 # ------------------------------------------------------------------ omega ---
-add_executable(omega omega/omega.c omega/omega_model.c)
+add_executable(omega omega/omega.c omega/omega_model.c omega/omega_fury.c)
 target_include_directories(omega PRIVATE omega "${VKMIN_GENERATED_DIR}")
 target_compile_options(omega PRIVATE ${VKMIN_FP_EXACT})
 target_link_libraries(omega PRIVATE vkmin_flags vkmin sndmin ${OMEGA_AUDIO})

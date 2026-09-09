@@ -11,6 +11,7 @@
 #include "omega_weapons.h"
 #include "omega_score.h"
 #include "omega_model.h"
+#include "omega_fury.h"
 #include "omega_surface.h"
 #include "shaders.h"
 #include <stdlib.h>
@@ -23,17 +24,21 @@
 #include <threads.h>
 #endif
 
-enum { OMEGA_CAPACITY=OMEGA_MODEL_COUNT*4+20000, OMEGA_TICKS=OMEGA_SEQUENCE_TICKS, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=1620 };
+enum { OMEGA_CAPACITY=OMEGA_MODEL_COUNT*4+OMEGA_FURY_COUNT*OMEGA_FURY_TOTAL
+        +OMEGA_EMBER_COUNT*6+OMEGA_BOLT_COUNT*6+24000, /* gate pylons and beams need about 14k of the last term */
+    OMEGA_TICKS=OMEGA_SEQUENCE_TICKS, OMEGA_FIRST_SHOT=615, OMEGA_LAST_SHOT=3400 };
 typedef struct { OmegaVertex *v; uint32_t count; uint32_t part; } omega_mesh;
 typedef struct {
-    sndmin_sound drone, gate, closing, cannon, cannon_long, particle, tick;
-    sndmin_voice engine, gate_voice;
+    sndmin_sound drone, gate, closing, cannon, cannon_long, particle, tick, felt, pass;
+    sndmin_voice engine, gate_voice, opponent[3];
+    float fury_range[OMEGA_FURY_TOTAL];  /* last tick's distance, for closest approach */
     omega_score score;
+    vec3 ear, ear_aim;            /* the smoothed listener; see audio_tick */
+    bool ear_ready;
 } omega_audio;
 typedef struct { uint32_t age, duration; } omega_pulse;
 static const float omega_pi=3.14159265359f;
-static const vec4 armor={.30f,.32f,.34f,1}, dark={.12f,.14f,.16f,1};
-static const vec4 steel={.43f,.44f,.42f,1}, red={.32f,.065f,.042f,1};
+static const vec4 dark={.12f,.14f,.16f,1}, red={.32f,.065f,.042f,1};
 
 // OmegaVertex packing. Pure: value in, value out. The shader's unpack is the
 // exact inverse -- GLSL unpackHalf2x16 and unpackSnorm2x16 -- so these three
@@ -141,10 +146,26 @@ static void blade(omega_mesh *m,vec3 root,vec3 tip,vec3 chord,float root_len,flo
     quad(m,corner[0][3],corner[0][2],corner[0][1],corner[0][0],color,material);
     quad(m,corner[1][0],corner[1][1],corner[1][2],corner[1][3],color,material);
 }
+/* One Blender-authored Starfury in its own local frame, under whatever part
+ * code the mesh is currently writing. Every fighter is the same geometry, and
+ * omega_fury_pose flies each one, so a launch is animation rather than a bake.
+ * OMEGA_FURY_UNIT turns the packed millimetres into model units: 9.9 m against
+ * 1750 of destroyer. */
+static void starfury(omega_mesh *m) {
+    VKMIN_ASSERT(m->count+OMEGA_FURY_COUNT<=OMEGA_CAPACITY,"omega vertex capacity");
+    for(size_t i=0;i<OMEGA_FURY_COUNT;++i) {
+        const OmegaFuryVertex f=omega_fury[i];
+        m->v[m->count++]=omega_vertex(
+            (vec3){(float)f.x*OMEGA_FURY_UNIT,(float)f.y*OMEGA_FURY_UNIT,(float)f.z*OMEGA_FURY_UNIT},
+            (vec3){(float)f.nx/32767.f,(float)f.ny/32767.f,(float)f.nz/32767.f},
+            (vec4){(float)f.r/255.f,(float)f.g/255.f,(float)f.b/255.f,1},f.material,m->part);
+    }
+}
 static omega_mesh make_ship(void) {
     omega_mesh m={.v=calloc(OMEGA_CAPACITY,sizeof(OmegaVertex))};
     VKMIN_ASSERT(m.v,"omega mesh allocation");
-    VKMIN_ASSERT(OMEGA_MODEL_COUNT*4+18000<OMEGA_CAPACITY,"omega authored mesh capacity");
+    VKMIN_ASSERT(OMEGA_MODEL_COUNT*4+OMEGA_FURY_COUNT*OMEGA_FURY_TOTAL+OMEGA_EMBER_COUNT*6+18000
+        <OMEGA_CAPACITY,"omega authored mesh capacity");
     for(size_t i=0;i<OMEGA_MODEL_COUNT;++i) {
         const OmegaPackedVertex v=omega_model[i];
         m.v[m.count++]=omega_vertex((vec3){(float)v.x*.001f,(float)v.y*.001f,(float)v.z*.001f},
@@ -164,28 +185,33 @@ static omega_mesh make_ship(void) {
     for(unsigned ship=0;ship<3;++ship) for(unsigned battery=0;battery<2;++battery) {
         for(unsigned shot=0;shot<3;++shot) {
             m.part=10u+ship*6u+battery*3u+shot;
-            tube(&m,(vec3){0,0,0},(vec3){0,0,1},.04f,.03f,(vec4){.2f,.8f,1,1},8,8);
+            tube(&m,(vec3){0,0,0},(vec3){0,0,1},.026f,.014f,(vec4){.2f,.8f,1,1},8,8);
         }
     }
     m.part=0;
+    // Impact embers. Two triangles each, corners at (+-.5,+-.5), with the
+    // ember's index in z for the vertex shader to read back. They are inert
+    // geometry until F.flash lifts; omegaEmber does the rest.
+    for(uint32_t e=0;e<OMEGA_EMBER_COUNT;++e) {
+        const vec4 spark={1,.55f,.15f,1};
+        const float z=(float)e;
+        quad(&m,(vec3){-.5f,-.5f,z},(vec3){.5f,-.5f,z},(vec3){.5f,.5f,z},(vec3){-.5f,.5f,z},spark,9);
+    }
+    // The fighters' pulse cannons, pooled the same way.
+    for(uint32_t b=0;b<OMEGA_BOLT_COUNT;++b) {
+        const vec4 plasma={.72f,.30f,1,1};
+        const float z=(float)b;
+        quad(&m,(vec3){-.5f,-.5f,z},(vec3){.5f,-.5f,z},(vec3){.5f,.5f,z},(vec3){-.5f,.5f,z},plasma,10);
+    }
     for(int side=-1;side<=1;side+=2) {
         const float x=(float)side*OMEGA_MUZZLE_X;
         tube(&m,(vec3){x,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z},(vec3){x,OMEGA_MUZZLE_Y,-100.f},.09f,.075f,red,5,12);
     }
-    // Small four-wing escorts establish the capital ship's scale.
-    m.part=2;
-    const vec3 escorts[3]={{-6.2f,-3.8f,-12.f},{6.5f,4.2f,-3.f},{-4.6f,5.6f,9.f}};
-    for(int i=0;i<3;++i) {
-        const vec3 e=escorts[i];
-        hull(&m,e,(vec3){.30f,.34f,.8f},.1f,dark,0);
-        hull(&m,(vec3){e.x,e.y+.12f,e.z-.3f},(vec3){.18f,.15f,.28f},.045f,(vec4){.1f,.5f,.8f,1},3);
-        for(int sx=-1;sx<=1;sx+=2) for(int sy=-1;sy<=1;sy+=2) {
-            const vec3 tip={e.x+(float)sx*.9f,e.y+(float)sy*.65f,e.z+.15f};
-            tube(&m,e,tip,.085f,.04f,steel,0,5);
-            hull(&m,tip,(vec3){.17f,.21f,.70f},.05f,armor,0);
-            tube(&m,(vec3){tip.x,tip.y,tip.z+.36f},(vec3){tip.x,tip.y,tip.z+.55f},.067f,.018f,(vec4){.5f,.7f,1,1},3,8);
-        }
-    }
+    // The wings. Every fighter gets its own part code from OMEGA_FURY_PART up
+    // so omega_fury_pose can fly it: sixteen come through the gate on station
+    // with the hero, eight more leave the forward bay a second after the bow
+    // is clear, and each opponent arrived with a full wing already out.
+    for(uint32_t i=0;i<OMEGA_FURY_TOTAL;++i) { m.part=OMEGA_FURY_PART+i; starfury(&m); }
     // Four containment pylons run from the mouth back toward the camera, so
     // the vortex forms at their far tips and the emerging hull passes between
     // them. Each is an open box truss of four rails with a cross frame, a
@@ -312,10 +338,10 @@ static sndmin_sound sound_make(sndmin_ctx *audio,int kind) {
             const float strike=closing?.08f:.7f;
             const float age=fmaxf(0,t-strike);
             const float tail=closing?1.6f:.85f;
-            air+=(noise-air)*.16f;
+            air+=(noise-air)*.055f;
             body+=(noise-body)*.045f;
             thunder+=(body-thunder)*.018f;
-            const float snap=smooth(strike,strike+.0015f,t)*expf(-age*85);
+            const float snap=smooth(strike,strike+.0035f,t)*expf(-age*38);
             const float fronts=thunder_roll(t,strike+.035f,tail)
                 +.65f*thunder_roll(t,strike+.26f,tail*1.2f)
                 +.48f*thunder_roll(t,strike+.63f,tail*1.3f)
@@ -328,9 +354,32 @@ static sndmin_sound sound_make(sndmin_ctx *audio,int kind) {
             sample=envelope*(air*snap*.9f+(thunder*3.4f+body*.45f)*fronts*rolling
                 +sub*boom*.48f+thunder*charge*.8f)*(closing?.75f:1.f);
         } else if(kind==5) {
-            // Activation tick: a short bright ping as the flare passes a station.
-            const float attack=smooth(0,.002f,t),tail=expf(-t*26);
-            sample=attack*tail*(sinf(2*omega_pi*1480*t+1.8f*sinf(2*omega_pi*2220*t))*.42f+low*.15f);
+            // Activation tick. This used to be a 1480 Hz carrier under a
+            // 2220 Hz modulator -- right in the band the ear is most sensitive
+            // to, once per fin station, for the whole startup. Dropped nearly
+            // two octaves and the modulation index halved, so it reads as a
+            // contactor closing rather than a smoke alarm.
+            const float attack=smooth(0,.004f,t),tail=expf(-t*16);
+            sample=attack*tail*(sinf(2*omega_pi*430*t+.9f*sinf(2*omega_pi*640*t))*.42f+low*.22f);
+        } else if(kind==8) {
+            // A Starfury going by. Nothing propagates out here, so this is the
+            // drive wash a hull picks up when one passes inside a few hundred
+            // metres -- a convention, and a deliberate one, but kept low and
+            // short so it reads as proximity rather than as air.
+            const float attack=smooth(0,.010f,t),tail=expf(-t*4.2f);
+            phase+=2*omega_pi*(210.f*expf(-t*2.6f)+58.f)/(float)SNDMIN_RATE;
+            low+=(noise-low)*.05f;
+            sample=attack*tail*(sinf(phase)*.34f+low*.55f+sinf(2*omega_pi*44*t)*.18f);
+        } else if(kind==7) {
+            // Structure-borne impact: what a hull passes along when something
+            // lands on it. Nearly all of it sits under 120 Hz, because this is
+            // meant to arrive through the LFE and the deck rather than the
+            // ears. No crack, no air -- there is none.
+            const float attack=smooth(0,.005f,t);
+            body+=(noise-body)*.012f;
+            phase+=2*omega_pi*(46.f*expf(-t*2.4f)+17.f)/(float)SNDMIN_RATE;
+            sample=attack*(sinf(phase)*1.10f*expf(-t*1.15f)+body*1.35f*expf(-t*3.2f)
+                +sinf(2*omega_pi*23*t)*.60f*expf(-t*.85f));
         } else if(kind==6) {
             // Short ionized crack with a falling, bright metallic body.
             const float attack=smooth(0,.002f,t);
@@ -357,23 +406,177 @@ static sndmin_sound sound_make(sndmin_ctx *audio,int kind) {
     const sndmin_sound s=sndmin_make_sound(audio,(sndmin_bytes){pcm,(size_t)count*sizeof(float)},1,SNDMIN_RATE);
     free(pcm); return s;
 }
-static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32_t tick,bool paused,bool muted,bool restart) {
+/* The whole camera, as a pure function of the clock and the two user offsets.
+ * Both the picture and the ear need it, and they run at different rates: the
+ * mixer catches up simulation ticks the renderer never draws, so neither can
+ * borrow the other's copy. */
+typedef struct { vec3 eye, aim; } omega_shot;
+static omega_shot omega_camera(float t,float orbit,float elevation,bool weapon_view) {
+        // Begin the pan during approach, before the hull reaches the mouth.
+        const float reveal=smooth(6.f,11.f,t);
+        // Stay inside the mouth's viewing angle so the far throat remains
+        // visible throughout the pan, even with the much deeper corridor.
+        // Off-axis and above, far enough back that the pylons reach toward
+        // the camera and the vortex opens at their midpoint. The reveal
+        // dollies in and swings to a three-quarter view; the camera then
+        // follows the hull as it flies past and pans back for the closing.
+        // A slow drift from the first frame, a gentle orbit, dolly-in and
+        // rise, so the reveal continues motion already under way rather than
+        // starting from rest.
+        const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
+        const float angle=-.22f-.004f*t-.26f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
+        const float radius=86.f-fminf(t,6.f)-18.f*reveal;
+        vec3 eye={sinf(angle)*radius,5.f+.17f*fminf(t,6.f)+6.f*reveal+elevation,cosf(angle)*-radius};
+        const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
+        const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
+        vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
+        // ISN-style broadside three-quarter two-shot: cut after emergence,
+        // then track both ships at a fixed separation through the volleys.
+        if(t>=11.f) {
+            const float battle_z=fminf(ship_position(t),-30.f)-OMEGA_BATTLE_SEPARATION*.5f;
+            // Every beat below moves. A locked-off camera on a ship travelling
+            // in a straight line reads as a still, and the sequence has four
+            // cuts to carry: nothing here sits at rest.
+            const float settle=fmaxf(0.f,t-15.4f);
+            eye=(vec3){(-260.f+6.f*settle)*cosf(orbit),32.f+1.4f*settle+elevation,
+                battle_z+58.f-4.f*settle+260.f*sinf(orbit)};
+            aim=(vec3){15,3,battle_z-10.f};
+            if(t<15.4f) {
+                // The launch: low, ahead of the bow and off the port side, so
+                // the hull closes on the lens while the gate screen sweeps
+                // past it and the bay wave comes out toward camera. A slow
+                // push runs the whole beat, and the camera stays ahead of the
+                // furthest station so the fighters scatter through depth.
+                const float push=(t-11.f)/4.4f;
+                eye=(vec3){-24.f+7.f*push+orbit*50.f,-8.f+3.5f*push+elevation,
+                    ship_position(t)-36.f+8.f*push};
+                aim=(vec3){1,.5f,ship_position(t)-2.f};
+            } else if(t>=17.8f && t<21.6f) {
+                // A true fly-by. The camera is planted at the point the hull
+                // will pass and only the aim follows it, so the ship crosses
+                // frame instead of sitting in it -- and the shutter smear in
+                // omega_post finally has screen motion to work with.
+                const float anchor=ship_position(19.9f);
+                eye=(vec3){-30.f+orbit*50.f,-5.f+elevation,anchor+6.f};
+                aim=(vec3){0,1.f,ship_position(t)-6.f};
+            } else if(t>=21.6f && t<26.f) {
+                // Reverse along the lead Omega's broadside, toward the attacker.
+                eye=(vec3){-42.f-3.f*(t-21.6f)+orbit*50.f,9.f+.8f*(t-21.6f)+elevation,
+                    battle_z-OMEGA_BATTLE_SEPARATION*.5f-42.f};
+                aim=(vec3){8,2,battle_z+5.f};
+            } else if(t>=26.f && t<31.f) {
+                // High widening tableau: the first exchange settles, and the
+                // hero is still one ship against three.
+                eye=(vec3){-240.f-7.f*(t-26.f)+orbit*70.f,100.f+elevation,battle_z+85.f};
+                aim=(vec3){20,3,battle_z-10.f};
+            } else if(t>=31.f && t<37.f) {
+                // The wing goes out. Planted off her port quarter so the
+                // fighters leave frame toward the enemy rather than being
+                // followed: this is the shot the Agamemnon is watching.
+                const float go=(t-31.f)/6.f;
+                eye=(vec3){-58.f+6.f*go+orbit*60.f,10.f-2.f*go+elevation,
+                    ship_position(t)+30.f-10.f*go};
+                aim=(vec3){32,2,ship_position(t)-170.f};
+            } else if(t>=37.f && t<43.f) {
+                // Through the target's flank, from the target's own side. The
+                // camera is planted where the runs converge and they cross it,
+                // which is the only way a fly-by reads as speed.
+                // Staged on the planet's side of the target, deliberately.
+                // From the far flank both the key and the planet rake away --
+                // dot(n,key) measured about 0.04 -- and no amount of fill
+                // rescues a camera standing in the dark.
+                const vec3 mark=omega_formation(1,t);
+                eye=(vec3){mark.x+70.f+orbit*60.f,mark.y+16.f+elevation,mark.z+56.f};
+                aim=(vec3){mark.x-6.f,mark.y,mark.z-10.f};
+            } else if(t>=43.f && t<49.f) {
+                // The counterpunch, close on the hero: her beams outbound and
+                // her own plating throwing embers.
+                const float push=(t-43.f)/6.f;
+                eye=(vec3){-30.f+8.f*push+orbit*50.f,-7.f+3.f*push+elevation,
+                    ship_position(t)-46.f+9.f*push};
+                aim=(vec3){2,1,ship_position(t)-4.f};
+            } else if(t>=49.f && t<55.f) {
+                // The wing comes home. Planted in the return path off the bow
+                // so the fighters overtake the lens.
+                eye=(vec3){-16.f+orbit*50.f,3.f+elevation,ship_position(t)-96.f};
+                aim=(vec3){0,1,ship_position(t)-30.f};
+            } else if(t>=55.f) {
+                // Widening for the close, the whole engagement in one frame.
+                eye=(vec3){-300.f-9.f*(t-55.f)+orbit*70.f,105.f+elevation,battle_z+150.f};
+                aim=(vec3){35,0,battle_z-20.f};
+            }
+        }
+        if(weapon_view) {
+            const vec3 origin=omega_formation(1,t);
+            eye=vkmin_vec3_add(origin,omega_rotate((vec3){-11,5,7},false));
+            aim=vkmin_vec3_add(origin,omega_rotate((vec3){-1.46f,0,1.4f},false));
+        }
+    return (omega_shot){eye,aim};
+}
+/* The conducted half of an impact. It has no bearing -- it arrives through
+ * structure, not from a direction -- so it plays unspatialised and leans on
+ * the LFE, and it falls away with the square of the listener's distance rather
+ * than being panned. The airborne crack every space film adds is still there
+ * in the spatial voice beside this one, but at a level that only survives
+ * close in, which is the whole point of the model. */
+static bool felt_impact(sndmin_ctx *audio,omega_audio *a,vec3 at,float weight) {
+    const float distance=vkmin_vec3_length(vkmin_vec3_sub(at,a->ear));
+    const float reach=clamp01(1.f-distance/OMEGA_FELT_RANGE);
+    if(reach<=.01f) return true;
+    const sndmin_voice v=sndmin_play(audio,&(sndmin_play_desc){.sound=a->felt,.spatial=true,
+        .voice={.gain=weight*reach*reach,.position=at,.lfe_send=1.f,
+            .min_radius=OMEGA_FELT_RANGE,.max_radius=OMEGA_FELT_RANGE*1.25f}});
+    return v.id!=0;
+}
+static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32_t tick,bool paused,bool muted,
+                       bool restart,float orbit,float elevation,bool weapon_view) {
     const float t=(float)tick/60.f;
-    const vec3 listener=t<11.f?(vec3){-10,5,-15}:(vec3){-45,12,ship_position(t)-85.f};
-    sndmin_frame(audio,&(sndmin_frame_desc){.index=absolute,.listener=listener,.forward={.4f,-.1f,1},.up={0,1,0},
+    // The ear sits at the camera, so a shot from behind the enemy hears the
+    // beams arrive from behind. But a cut teleports the picture, and a listener
+    // that teleports with it jumps the distance gain by an order of magnitude
+    // and swoops. So the ear follows on a one-pole at 60 Hz -- about a fifth of
+    // a second -- which tracks continuous camera moves to well under a hull
+    // length and turns a cut into a glide the mixer's own ramp can absorb.
+    // Listener velocity stays zero on purpose: doppler off a gliding ear would
+    // pitch-bend every voice across every cut.
+    const omega_shot view=omega_camera(t,orbit,elevation,weapon_view);
+    if(!a->ear_ready || restart) { a->ear=view.eye; a->ear_aim=view.aim; a->ear_ready=true; }
+    const float follow=.07f;
+    a->ear=vkmin_vec3_add(a->ear,vkmin_vec3_scale(vkmin_vec3_sub(view.eye,a->ear),follow));
+    a->ear_aim=vkmin_vec3_add(a->ear_aim,vkmin_vec3_scale(vkmin_vec3_sub(view.aim,a->ear_aim),follow));
+    vec3 forward=vkmin_vec3_sub(a->ear_aim,a->ear);
+    if(vkmin_vec3_length(forward)<1e-4f) forward=(vec3){0,0,-1};
+    sndmin_frame(audio,&(sndmin_frame_desc){.index=absolute,.listener=a->ear,
+        .forward=vkmin_vec3_normalize(forward),.up={0,1,0},
         .delay_seconds=.30f,.delay_feedback=.28f});
     if(!sndmin_bus_set(audio,SNDMIN_MASTER,paused||muted?0.f:.40f)) return false;
     if(!sndmin_bus_set(audio,SNDMIN_MUSIC,1.5f*(1-smooth(28.3f,29.9f,t)))) return false;
     if(absolute==0) {
-        a->engine=sndmin_play(audio,&(sndmin_play_desc){.sound=a->drone,.loop=true,.voice={.gain=.35f}});
+        // Four engine blocks, placed and then moved every tick. This is what
+        // makes the fly-by work: the hull's own drive crosses the lens, so it
+        // travels front to side to behind instead of sitting in the middle of
+        // the mix. Velocity is left at zero deliberately -- the hull is doing
+        // 220 units a second on approach, and honest doppler on that would be
+        // a octave and a half of pitch bend.
+        a->engine=sndmin_play(audio,&(sndmin_play_desc){.sound=a->drone,.loop=true,.spatial=true,
+            .voice={.gain=1.05f,.min_radius=120,.max_radius=900,.lfe_send=.45f}});
         if(!a->engine.id) return false;
+        for(unsigned other=0;other<3;++other) {
+            a->opponent[other]=sndmin_play(audio,&(sndmin_play_desc){.sound=a->drone,.loop=true,.spatial=true,
+                .voice={.gain=.70f,.pitch=.86f+.07f*(float)other,.min_radius=120,.max_radius=900,.lfe_send=.35f}});
+            if(!a->opponent[other].id) return false;
+        }
+        for(unsigned k=0;k<OMEGA_FURY_TOTAL;++k) a->fury_range[k]=1e9f;
     }
     if(restart || (!paused && tick==0)) {
         omega_score_stop(audio,&a->score);
         if(a->gate_voice.id) sndmin_stop(audio,a->gate_voice,.025f);
     }
     if(!paused && (tick==60 || tick==1050)) {
-        a->gate_voice=sndmin_play(audio,&(sndmin_play_desc){.sound=tick==60?a->gate:a->closing,.voice={.gain=.8f}});
+        // The gate is a place, not a stem: put it at the mouth so it moves
+        // across the field as the camera swings around the pylons.
+        a->gate_voice=sndmin_play(audio,&(sndmin_play_desc){.sound=tick==60?a->gate:a->closing,.spatial=true,
+            .voice={.gain=.8f,.position={0,0,OMEGA_GATE_MOUTH_Z},.min_radius=60,.max_radius=900,.lfe_send=.5f}});
         if(!a->gate_voice.id) return false;
     }
     if(!paused && !omega_score_tick(audio,&a->score,tick)) return false;
@@ -393,8 +596,11 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
             const vec3 muzzle={(float)side*OMEGA_MUZZLE_X,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z+ship_position((float)tick/60)};
             const sndmin_voice shot=sndmin_play(audio,&(sndmin_play_desc){
                 .sound=pulse.duration>14?a->cannon_long:a->cannon,.spatial=true,
-                .voice={.gain=.85f,.position=muzzle,.min_radius=50,.max_radius=420}});
+                .voice={.gain=.26f,.position=muzzle,.min_radius=40,.max_radius=170,.lfe_send=.60f}});
             if(!shot.id) return false;
+            // Where the beam lands is the event worth feeling, not where it left.
+            const vec3 contact=vkmin_vec3_add(omega_beam_contact[side<0?0:1],omega_formation(1,t));
+            if(!felt_impact(audio,a,contact,pulse.duration>14?1.25f:.90f)) return false;
         }
     }
     if(!paused) for(unsigned ship=0;ship<3;++ship) for(unsigned shot=0;shot<3;++shot) {
@@ -403,16 +609,49 @@ static bool audio_tick(sndmin_ctx *audio,omega_audio *a,uint32_t absolute,uint32
         const omega_trajectory path=omega_projectile(ship,0,shot,t-(float)age/60.f);
         const vec3 source=age==0?path.start:path.end;
         const sndmin_voice report=sndmin_play(audio,&(sndmin_play_desc){.sound=a->particle,.spatial=true,
-            .voice={.position=source,.gain=age==0?.46f:.28f,.pitch=age==0?1.f:.55f,.min_radius=60,.max_radius=450}});
+            .voice={.position=source,.gain=age==0?.22f:.30f,.pitch=age==0?1.f:.55f,
+                .min_radius=40,.max_radius=210}});
         if(!report.id) return false;
+        if(age && !felt_impact(audio,a,source,.95f)) return false;
+    }
+    // Move the engines. sndmin_set queues a new descriptor for a voice that is
+    // already playing, so a loop can travel without being restarted.
+    if(!paused) for(unsigned owner=0;owner<4;++owner) {
+        const vec3 local={0,0,OMEGA_ENGINE_Z};
+        const vec3 at=vkmin_vec3_add(owner?omega_rotate(local,false):local,omega_formation(owner,t));
+        sndmin_set(audio,owner?a->opponent[owner-1]:a->engine,&(sndmin_voice_desc){
+            .gain=owner?.70f:1.05f,.pitch=owner?.86f+.07f*(float)(owner-1):1.f,.position=at,
+            .min_radius=120,.max_radius=900,.lfe_send=owner?.35f:.45f});
+    }
+    // A fighter's closest approach, which is the moment it is worth hearing.
+    // Distance is tracked per fighter and the pass fires on the tick it starts
+    // receding, so the sound lands where the thing actually was. Velocity is
+    // scaled well down: these are model units treated as metres, so the true
+    // figure would doppler a fighter clean out of the audible band.
+    if(!paused) for(unsigned k=0;k<OMEGA_FURY_TOTAL;++k) {
+        const mat4 pose=omega_fury_pose(k,t);
+        const vec3 at={pose.m[12],pose.m[13],pose.m[14]};
+        const float range=vkmin_vec3_length(vkmin_vec3_sub(at,a->ear));
+        const float was=a->fury_range[k];
+        a->fury_range[k]=range;
+        if(range<=was || was>OMEGA_PASS_RANGE || was>=1e8f) continue;
+        const mat4 before=omega_fury_pose(k,t-1.f/60.f);
+        const vec3 travel=vkmin_vec3_scale(
+            (vec3){pose.m[12]-before.m[12],pose.m[13]-before.m[13],pose.m[14]-before.m[14]},60.f*.16f);
+        const float closeness=clamp01(1.f-was/OMEGA_PASS_RANGE);
+        const sndmin_voice by=sndmin_play(audio,&(sndmin_play_desc){.sound=a->pass,.spatial=true,
+            .voice={.gain=.55f*closeness,.position=at,.velocity=travel,
+                .min_radius=6,.max_radius=OMEGA_PASS_RANGE*1.6f,.lfe_send=.30f}});
+        if(!by.id) return false;
     }
     return sndmin_ok(audio);
 }
 
 int main(int argc,char **argv) {
-    const char *wav=NULL; bool offline=false,audio_only=false,score_only=false,weapon_view=false;
+    const char *wav=NULL; bool offline=false,audio_only=false,score_only=false,weapon_view=false,period=false;
     for(int k=1;k<argc;++k) {
         if(!strcmp(argv[k],"--weapon-view")) weapon_view=true;
+        if(!strcmp(argv[k],"--period")) period=true; /* the original 1990s grade */
         if(!strcmp(argv[k],"--audio-out") && k+1<argc) { wav=argv[++k]; offline=true; }
         else if(!strcmp(argv[k],"--headless") || !strcmp(argv[k],"--frame") || !strcmp(argv[k],"--frames")) offline=true;
         else if(!strcmp(argv[k],"--audio-only")) { audio_only=true; offline=true; }
@@ -428,11 +667,13 @@ int main(int argc,char **argv) {
         fprintf(stderr,"omega: this is the headless renderer. Build without VKMIN_HEADLESS for the live window and sound.\n");
         return 0;
     }
-    sndmin_ctx *audio=sndmin_init(&(sndmin_desc){.offline=offline});
+    sndmin_ctx *audio=sndmin_init(&(sndmin_desc){.offline=offline,.layout=SNDMIN_51});
     if(!audio) return 1;
     omega_audio a={.drone=sound_make(audio,0),.gate=sound_make(audio,1),.closing=sound_make(audio,4),
-        .cannon=sound_make(audio,2),.cannon_long=sound_make(audio,3),.particle=sound_make(audio,6),.tick=sound_make(audio,5),.score=omega_score_init(audio)};
-    if(!a.drone.id || !a.gate.id || !a.closing.id || !a.cannon.id || !a.cannon_long.id || !a.particle.id || !omega_score_ready(a.score)) {
+        .cannon=sound_make(audio,2),.cannon_long=sound_make(audio,3),.particle=sound_make(audio,6),.tick=sound_make(audio,5),.felt=sound_make(audio,7),
+        .pass=sound_make(audio,8),.score=omega_score_init(audio)};
+    if(!a.drone.id || !a.gate.id || !a.closing.id || !a.cannon.id || !a.cannon_long.id || !a.particle.id
+        || !a.felt.id || !a.pass.id || !omega_score_ready(a.score)) {
         sndmin_shutdown(audio); return 1;
     }
     if(audio_only) {
@@ -443,15 +684,21 @@ int main(int argc,char **argv) {
                 ok=sndmin_bus_set(audio,SNDMIN_MASTER,.40f)
                     && sndmin_bus_set(audio,SNDMIN_MUSIC,1.5f*(1-smooth(28.3f,29.9f,(float)tick/60.f)))
                     && omega_score_tick(audio,&a.score,tick);
-            } else ok=audio_tick(audio,&a,tick,tick,false,false,false);
+            } else ok=audio_tick(audio,&a,tick,tick,false,false,false,0,0,false);
         }
         if(ok) ok=sndmin_render(audio,OMEGA_TICKS,wav?wav:"omega.wav",NULL);
         sndmin_shutdown(audio); return ok?0:1;
     }
     // vkmin reserves its arenas once and never grows them, so the defaults
     // (256 MB per arena, 64 MB ring) are what a program actually costs on the
-    // device whether or not it uses them. Omega uploads about 47 MB of mesh.
-    // 64 MB of buffer covers the whole of
+    // device whether or not it uses them. Omega uploads about 92 MB of mesh:
+    // four destroyers, seventy-two fighters and the breach clouds. The 512 MB
+    // asked for here is deliberate headroom rather than a measurement -- it
+    // leaves room to roughly quintuple the authored detail without touching
+    // this line again, and an arena is reserved once and never grown. 384 MB
+    // of image covers 1600x1200 at 8x MSAA with the 2048 shadow map. Exhausting
+    // one is a hard failure naming the size it wanted, not corruption. That
+    // covers
     // OMEGA_CAPACITY at 24 bytes a vertex, so the mesh cannot outgrow it before
     // the assert in triangle() fires; 160 MB of image covers the 2048 shadow map
     // and 4x/8x MSAA at 720p. The ring takes the mesh upload in one chunk. Exhausting an
@@ -464,7 +711,7 @@ int main(int argc,char **argv) {
     cvar_set(&config,CV_r_default_depth,0); // explicit passes own their depth; presentation needs none
     vkmin_ctx *gpu=vkmin_init(&(vkmin_desc){.argc=argc,.argv=argv,.title="OMEGA - Through the Blue",
         .width=1280,.height=720,.vsync=true,.headless=headless_build,.config=&config,
-        .device_arena_bytes=64u<<20,.image_arena_bytes=160u<<20,.host_ring_bytes=64u<<20});
+        .device_arena_bytes=512u<<20,.image_arena_bytes=384u<<20,.host_ring_bytes=512u<<20});
     omega_mesh mesh=make_ship();
     fprintf(stderr,"omega: %u triangles; 30-second sequence; Iron Across the Blue 120 BPM, gate and cannons\n",mesh.count/3);
     const vkmin_buffer geometry=vkmin_make_buffer(gpu,&(vkmin_buffer_desc){
@@ -530,7 +777,8 @@ int main(int argc,char **argv) {
         if(restart) phase=0;
         // Preserve every audio tick even when rendering isolated frames or a slow GPU.
         while(absolute<=target && ok) {
-            ok=audio_tick(audio,&a,absolute,phase,paused,muted,restart && absolute==target);
+            ok=audio_tick(audio,&a,absolute,phase,paused,muted,restart && absolute==target,
+                orbit,elevation,weapon_view);
             if(!paused) phase=(phase+1)%OMEGA_TICKS;
             ++absolute;
         }
@@ -538,49 +786,8 @@ int main(int argc,char **argv) {
         const float t=(float)visual/60.f;
         orbit+=.012f*((float)vkmin_key_down(&f.input,'D')-(float)vkmin_key_down(&f.input,'A'));
         elevation=fmaxf(-6,fminf(10,elevation+.18f*((float)vkmin_key_down(&f.input,'W')-(float)vkmin_key_down(&f.input,'S'))));
-        // Begin the pan during approach, before the hull reaches the mouth.
-        const float reveal=smooth(6.f,11.f,t);
-        // Stay inside the mouth's viewing angle so the far throat remains
-        // visible throughout the pan, even with the much deeper corridor.
-        // Off-axis and above, far enough back that the pylons reach toward
-        // the camera and the vortex opens at their midpoint. The reveal
-        // dollies in and swings to a three-quarter view; the camera then
-        // follows the hull as it flies past and pans back for the closing.
-        // A slow drift from the first frame, a gentle orbit, dolly-in and
-        // rise, so the reveal continues motion already under way rather than
-        // starting from rest.
-        const float camera_time=fminf(t,OMEGA_GATE_CLOSE_START);
-        const float angle=-.22f-.004f*t-.26f*reveal+orbit+.012f*sinf(camera_time*.19f)*reveal;
-        const float radius=86.f-fminf(t,6.f)-18.f*reveal;
-        vec3 eye={sinf(angle)*radius,5.f+.17f*fminf(t,6.f)+6.f*reveal+elevation,cosf(angle)*-radius};
-        const float track=smooth(11.f,12.6f,t)*(1-smooth(14.4f,17.2f,t));
-        const vec3 gate_target={0,1.4f*reveal,1},ship_target={0,.5f,ship_position(t)};
-        vec3 aim=vkmin_vec3_add(vkmin_vec3_scale(gate_target,1-track),vkmin_vec3_scale(ship_target,track));
-        // ISN-style broadside three-quarter two-shot: cut after emergence,
-        // then track both ships at a fixed separation through the volleys.
-        if(t>=11.f) {
-            const float battle_z=fminf(ship_position(t),-30.f)-OMEGA_BATTLE_SEPARATION*.5f;
-            eye=(vec3){-260.f*cosf(orbit),32.f+elevation,battle_z+58.f+260.f*sinf(orbit)};
-            aim=(vec3){15,3,battle_z-10.f};
-            if(t>=16.f && t<21.f) {
-                // Low stern-quarter shot: engines in the foreground, fleet beyond.
-                eye=(vec3){-32.f+2.f*(t-16.f)+orbit*50.f,8.f+elevation,ship_position(t)+48.f};
-                aim=(vec3){5,3,ship_position(t)-95.f};
-            } else if(t>=21.f && t<26.f) {
-                // Reverse along the lead Omega's broadside, toward the attacker.
-                eye=(vec3){-42.f+orbit*50.f,9.f+elevation,battle_z-OMEGA_BATTLE_SEPARATION*.5f-42.f};
-                aim=(vec3){8,2,battle_z+5.f};
-            } else if(t>=26.f) {
-                // High, slowly widening fleet tableau for the final salvo/tail.
-                eye=(vec3){-240.f-7.f*(t-26.f)+orbit*70.f,100.f+elevation,battle_z+85.f};
-                aim=(vec3){20,3,battle_z-10.f};
-            }
-        }
-        if(weapon_view) {
-            const vec3 origin=omega_formation(1,t);
-            eye=vkmin_vec3_add(origin,omega_rotate((vec3){-11,5,7},false));
-            aim=vkmin_vec3_add(origin,omega_rotate((vec3){-1.46f,0,1.4f},false));
-        }
+        const omega_shot shot=omega_camera(t,orbit,elevation,weapon_view);
+        const vec3 eye=shot.eye,aim=shot.aim;
         const mat4 vp=vkmin_mat4_mul(vkmin_mat4_perspective(omega_pi/4,f.aspect,.1f,1600),vkmin_mat4_look_at(eye,aim,(vec3){0,1,0}));
         // The hull's screen motion since the last frame drives a shutter smear;
         // Use consecutive simulation ticks only; sparse captures are not motion.
@@ -598,7 +805,7 @@ int main(int argc,char **argv) {
             .vp=vp,
             .eye={eye.x,eye.y,eye.z,0},
             .scene={t,f.aspect,ship_position(t),smooth(2.f,4.5f,t)*(1-smooth(OMEGA_GATE_CLOSE_START,OMEGA_GATE_CLOSE_END,t))},
-            .flash=cannon_flash(visual),
+            .flash=cannon_flash(visual),.reserved={period?1.f:0.f,0},
             .hull_texture=vkmin_index(gpu,surface),
             .blur={motion.x,motion.y,.6f,0}};
         omega_weapon_frame(scene,visual);

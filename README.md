@@ -40,8 +40,8 @@ cmake --build build
 |---|---|
 | ![The pylons charge](docs/images/omega-gate-charging.jpg) | ![The funnel opens](docs/images/omega-gate-open.jpg) |
 | **t = 3 s** — the truss pylons charge, the mouth still dark | **t = 8 s** — the flash opens the funnel and its dark throat |
-| ![Emergence](docs/images/omega-emergence.jpg) | ![Engines](docs/images/omega-engines.jpg) |
-| **t = 11 s** — the cut to the broadside two-shot | **t = 17 s** — low stern-quarter, engines in the foreground |
+| ![The launch](docs/images/omega-emergence.jpg) | ![The fly-by](docs/images/omega-engines.jpg) |
+| **t = 13 s** — the bay wave clears the drum, the gas giant behind | **t = 19.9 s** — the fly-by, at the hull's closest approach |
 | ![Broadside](docs/images/omega-broadside.jpg) | ![The fleet](docs/images/omega-fleet.jpg) |
 | **t = 23 s** — reverse along the lead hull, toward the attacker | **t = 28 s** — the high widening tableau and the final salvo |
 

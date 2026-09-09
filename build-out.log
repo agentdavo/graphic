@@ -1,0 +1,9 @@
+[0/2] Re-checking globbed directories...
+[1/9] Building C object CMakeFiles/test_relocation.dir/tools/test_relocation.c.obj
+[2/9] Building C object CMakeFiles/test_msaa.dir/tools/test_msaa.c.obj
+[3/9] Linking C executable test_relocation.exe
+[4/9] Linking C executable test_msaa.exe
+[5/9] Building C object CMakeFiles/scene.dir/demo/scene.c.obj
+[6/9] Building C object CMakeFiles/render.dir/src/render.c.obj
+[7/9] Linking C static library librender.a
+[8/9] Linking C executable scene.exe

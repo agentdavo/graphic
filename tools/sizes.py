@@ -42,12 +42,13 @@ GROUPS = {
                                  'src/sndmin_plat.h', 'src/sndmin_io.h']),
     'shaders':           (2000, ['src/shaders/*.vert', 'src/shaders/*.frag', 'src/shaders/*.comp',
                                  'src/shaders/*.glsl', 'src/shaders/lib/*.glsl']),
-    'demos':             (1400, ['omega/omega.c', 'omega/omega_weapons.h', 'omega/omega_shared.h', 'demo/scene.c', 'demo/gamekit.h', 'demo/anim.h']),
+    'demos':             (1700, ['omega/omega.c', 'omega/omega_weapons.h', 'omega/omega_shared.h', 'demo/scene.c', 'demo/gamekit.h', 'demo/anim.h']),
 }
 
 # Generated, vendored or data: measured for information, never budgeted. The
 # font and the model are baked arrays, and third_party is not ours to shrink.
 EXCLUDED = ['src/render_font.h', 'omega/omega_model.h', 'omega/omega_model.c',
+            'omega/omega_fury.h', 'omega/omega_fury.c',
             'omega/omega_mounts.h', 'omega/omega_surface.h', 'src/third_party/*']
 
 

@@ -212,9 +212,58 @@ static void test_song(void) {
     remove("test_song_b.wav");
 }
 
+/* ------------------------------------------------------------- the .1 band -- */
+
+/* The LFE chain is a band, and a band that quietly stops filtering still
+ * sounds fine right up until it moves a driver it should not have. So drive
+ * the same code the mixer runs -- snd_lfe_band, not a copy of it -- with a
+ * sine at each probe frequency, let it settle, and measure.
+ *
+ * The bounds are the contract, and they are chosen to separate a fourth order
+ * from a second: one Butterworth section at 70 Hz would read 0.707 at its own
+ * corner and 0.24 an octave above, where a Linkwitz-Riley pair reads 0.50 and
+ * 0.059. Losing a section therefore fails two checks rather than drifting. */
+static float lfe_response(float hz) {
+    snd_svf hp = {0, 0}, lp[2] = {{0, 0}, {0, 0}};
+    const float step = hz / 48000.0f;          /* SNDMIN_RATE */
+    const int settle = 96000, measure = 96000; /* two seconds each */
+    double sum = 0;
+    float phase = 0;
+    for (int i = 0; i < settle + measure; ++i) {
+        const float out = snd_lfe_band(snd_sin(phase), &hp, lp);
+        phase += step;
+        if (phase >= 1.0f) phase -= 1.0f;      /* keep the argument small */
+        if (i >= settle) sum += (double)out * (double)out;
+    }
+    return (float)(sqrt(sum / measure) * 1.4142135623730951); /* RMS of a unit sine */
+}
+
+static void test_lfe(void) {
+    static const struct { float hz, lo, hi; const char *what; } band[] = {
+        {  1.f, 0.00f, 0.35f, "1 Hz is rejected: sub-sonic energy never reaches a driver" },
+        { 16.f, 0.97f, 1.02f, "16 Hz passes intact, which is the point of having a .1" },
+        { 40.f, 0.86f, 0.94f, "40 Hz sits just inside the corner" },
+        { 70.f, 0.48f, 0.52f, "70 Hz is -6 dB, which is what makes it Linkwitz-Riley" },
+        {140.f, 0.00f, 0.09f, "an octave up is fourth-order down, not second" },
+        {250.f, 0.00f, 0.012f,"250 Hz is gone" },
+        {1000.f,0.00f, 0.0005f,"1 kHz is gone; the one-pole this replaced was not" },
+    };
+    for (unsigned i = 0; i < sizeof band / sizeof *band; ++i) {
+        const float m = lfe_response(band[i].hz);
+        check(m >= band[i].lo && m <= band[i].hi, band[i].what);
+    }
+    /* A constant is the worst case a driver sees: it is pure excursion and no
+     * sound at all. The high pass has to remove it. */
+    snd_svf hp = {0, 0}, lp[2] = {{0, 0}, {0, 0}};
+    float dc = 0;
+    for (int i = 0; i < 144000; ++i) dc = snd_lfe_band(1.0f, &hp, lp);
+    check(dc < 0.01f && dc > -0.01f, "a DC offset decays away rather than sitting on the cone");
+}
+
 int main(void) {
     test_dsp();
     test_song();
+    test_lfe();
     printf("sndmin: %d checks, %d failures\n", checks, errors);
     return errors ? 1 : 0;
 }

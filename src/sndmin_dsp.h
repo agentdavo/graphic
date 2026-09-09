@@ -85,4 +85,45 @@ static inline float snd_cubic(float a,float b,float c,float d,float t) {
  * feedback -- a hard clip there would inject the very harmonics the filter is
  * there to remove. */
 static inline float snd_soft(float x) { return x/(1+snd_abs(x)); }
+/* Topology-preserving-transform state variable section, one per biquad's worth
+ * of filtering. Not a direct-form biquad on purpose: the .1 channel's corners
+ * sit at 2 Hz and 70 Hz against a 48 kHz rate, where a direct form's poles are
+ * close enough to z=1 that single-precision conditioning becomes the dominant
+ * error -- and this mixer is float by design, for determinism. The SVF stays
+ * well behaved down to DC.
+ *
+ * Coefficients are literals because SNDMIN_RATE is fixed. That also keeps them
+ * out of libm's hands, which is the same reason this header carries its own
+ * sqrt, exp2 and sin: one ulp inside a feedback loop is a different WAV. They
+ * are a1 = 1/(1+g(g+k)), a2 = g*a1, a3 = g*a2 with g = tan(pi*f0/fs) and
+ * k = 1/Q; Q is Butterworth, so two cascaded low sections make a fourth-order
+ * Linkwitz-Riley that is down exactly 6 dB at its corner. */
+typedef struct { float ic1, ic2; } snd_svf;
+#define SND_SVF_K 1.414213562f          /* 1/Q, Butterworth */
+#define SND_LFE_HP_A1 0.999814897f      /* 2 Hz, driver protection */
+#define SND_LFE_HP_A2 0.0001308754647f
+#define SND_LFE_HP_A3 1.713155837e-08f
+#define SND_LFE_LP_A1 0.9935417403f     /* 70 Hz; two of these are the LR4 */
+#define SND_LFE_LP_A2 0.004551932687f
+#define SND_LFE_LP_A3 2.085477675e-05f
+static inline float snd_svf_low(float in,float a1,float a2,float a3,snd_svf *s) {
+    const float v3=in-s->ic2;
+    const float v1=a1*s->ic1+a2*v3;
+    const float v2=s->ic2+a2*s->ic1+a3*v3;
+    s->ic1=snd_zap(2*v1-s->ic1); s->ic2=snd_zap(2*v2-s->ic2);
+    return v2;
+}
+static inline float snd_svf_high(float in,float a1,float a2,float a3,snd_svf *s) {
+    const float v3=in-s->ic2;
+    const float v1=a1*s->ic1+a2*v3;
+    const float v2=s->ic2+a2*s->ic1+a3*v3;
+    s->ic1=snd_zap(2*v1-s->ic1); s->ic2=snd_zap(2*v2-s->ic2);
+    return in-SND_SVF_K*v1-v2;
+}
+/* The whole .1 chain, so the mixer and its test drive exactly the same code. */
+static inline float snd_lfe_band(float in,snd_svf *hp,snd_svf *lp) {
+    const float protected_=snd_svf_high(in,SND_LFE_HP_A1,SND_LFE_HP_A2,SND_LFE_HP_A3,hp);
+    const float once=snd_svf_low(protected_,SND_LFE_LP_A1,SND_LFE_LP_A2,SND_LFE_LP_A3,&lp[0]);
+    return snd_svf_low(once,SND_LFE_LP_A1,SND_LFE_LP_A2,SND_LFE_LP_A3,&lp[1]);
+}
 #endif

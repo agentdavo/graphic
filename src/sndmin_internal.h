@@ -146,7 +146,8 @@ struct sndmin_ctx {
     uint32_t stopped_groups[SND_STOPPED_GROUPS],stopped_count; /* overflow counts in dropped_commands */
     snd_command group_updates[SND_RES]; uint32_t group_update_count;
     bool reference_pcm; /* test-only scalar interpolation comparison */
-    float resample_a[8],resample_b[8],lfe;
+    float resample_a[8],resample_b[8];
+    snd_svf lfe_hp,lfe_lp[2];   /* the .1 band; see snd_lfe_band */
     uint64_t output_phase; bool output_primed;
 };
 /* Game thread only; each one may allocate, do IO, or both. The mixer's own

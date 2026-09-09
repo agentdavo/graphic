@@ -25,6 +25,9 @@ void main() {
     if(material==8) {
         result=vec4(2.5,8.,12.,1); return;
     }
+    if(material==9 || material==10) {
+        result=vec4(tint.rgb,1); return;
+    }
     bool opponent=tint.a<-.5;
     int ship=opponent?int(-tint.a-1.):0;
     float structure=max(tint.a,0.);
@@ -103,6 +106,10 @@ void main() {
         float painted=texture(TEX(F.hull_texture),uv*.25).r;
         base=tint.rgb*painted*(.60+grain*.10);
     }
+    // Vertical streaks down the plating, on the same model-space projection
+    // the panels use, so they stay put as the habitat turns.
+    float streak=fbm(vec2(uv.x*6.5,uv.y*.30));
+    base*=.82+.30*smoothstep(.22,.82,streak);
     if(material==2) {
         float stripe=uv.y*12.;
         float ribs=smoothstep(.16,.24,fract(stripe));
@@ -128,7 +135,10 @@ void main() {
     float fres=pow(1.-max(dot(n,v),0.),4.);
     float ao=mix(.60,1.,smoothstep(.65,3.8,length(local.xy)));
     vec3 ambient=mix(vec3(.006,.009,.015),vec3(.05,.07,.12),structure);
-    vec3 keyColor=mix(vec3(.85,.72,.58),vec3(1.7,1.15,.75),structure);
+    // The ships carry only enough neutral key to hold their shape. Everything
+    // that actually lights them is coloured and local: the gate, the engines,
+    // the beams, the tracers. That is what keeps space black between them.
+    vec3 keyColor=mix(vec3(.60,.51,.42),vec3(1.7,1.15,.75),structure);
     vec3 c=base*(ambient*ao+keyColor*ndl*visibility);
     c+=vec3(.9,.68,.48)*spec*visibility;
     if(structure<.5) {
@@ -148,17 +158,63 @@ void main() {
     if(structure>.5) c+=base*vec3(.08,.6,1.3)*max(dot(n,normalize(vec3(-world.xy,0))),0.)*F.scene.w;
     float ignition=smoothstep(1.9,2.3,F.scene.x)*(1.-smoothstep(2.4,2.9,F.scene.x));
     if(structure>.5) c+=base*vec3(3.,2.6,2.)*ignition*max(dot(n,normalize(vec3(-world.xy,OMEGA_GATE_MOUTH_Z-world.z))),0.);
+    // A broad cool fill from the gas giant, opposite the warm key. Space has
+    // no ambient term to lean on, but a body that subtends twenty degrees is
+    // a source, not a point, so the falloff is wrapped rather than clamped.
+    vec3 planet=normalize(omegaPlanetCentre()-world);
+    c+=base*vec3(.30,.44,.76)*OMEGA_PLANET_FILL*max((dot(n,planet)+.35)/1.35,0.);
+    // Battle damage. Once a breach is open it stays open and keeps burning,
+    // which is what separates it from a muzzle flash: a molten core, and the
+    // plating around it taking the bounce. Sites are hull space, so they ride
+    // the ship and the habitat's rotation for nothing.
+    if(structure<.5) {
+        int first=opponent?6:0,last=opponent?OMEGA_DAMAGE_SITES:6;
+        for(int site=first;site<last;site++) {
+            float opened=F.damage[site].w;
+            if(F.scene.x<opened) continue;
+            float grow=smoothstep(opened,opened+1.6,F.scene.x);
+            float d=length(local-F.damage[site].xyz);
+            // Fires are not discs. The boundary is torn open along whatever
+            // gave way, so the radius is modulated by noise fixed to the hull
+            // rather than to the screen, and each site gets its own size: a
+            // model unit is about 40 m, so these run from roughly 25 m across
+            // to a couple of hundred, which is the range the hull can host.
+            float torn=.62+.55*fbm(vec2(local.x*1.7+float(site)*11.,local.z*1.7));
+            float scale=(.55+1.35*hash21(vec2(float(site),3.)))*torn;
+            float core=1.-smoothstep(0.,.95*scale,d);
+            float halo=1.-smoothstep(0.,3.2*scale,d);
+            float flicker=.78+.22*sin(F.scene.x*11.+float(site)*2.1)
+                *sin(F.scene.x*3.7+float(site));
+            c+=vec3(7.5,2.05,.30)*core*core*grow*flicker;
+            c+=base*vec3(2.7,.66,.11)*halo*halo*grow;
+        }
+    }
+    // Two hull floodlights over the forward identification panel. A tight
+    // downward cone so the pool stays on the name instead of washing the bow.
+    if(structure<.5) for(int j=0;j<2;j++) {
+        vec3 lamp=vec3(j==0?-OMEGA_FLOOD_X:OMEGA_FLOOD_X,OMEGA_FLOOD_Y,OMEGA_FLOOD_Z);
+        lamp=opponent?omegaOpponentRotate(lamp)+omegaFormation(ship):lamp+vec3(0,0,F.scene.z);
+        vec3 delta=lamp-world;
+        float d=length(delta);
+        vec3 toward=delta/max(d,.0001);
+        float cone=pow(max(toward.y,0.),3.);
+        c+=base*vec3(1.,.86,.66)*OMEGA_FLOOD_LEVEL*cone*max(dot(n,toward),0.)/(1.+d*d*.5);
+    }
     // The plasma muzzle lights illuminate the forward armor in world space.
     for(int j=0;j<2;j++) {
         vec3 light=vec3(j==0?-OMEGA_MUZZLE_X:OMEGA_MUZZLE_X,OMEGA_MUZZLE_Y,OMEGA_MUZZLE_Z+F.scene.z)-world;
         float d=length(light);
-        c+=vec3(1.3,.012,.003)*F.flash*max(dot(n,normalize(light)),0.)/(1.+d*d*.5);
+        float lambert=max(dot(n,normalize(light)),0.);
+        // A hot near field at the muzzle, and a broad red bath over the whole
+        // hull. A beam this size does not light one panel and stop.
+        c+=vec3(1.3,.012,.003)*F.flash*lambert/(1.+d*d*.5);
+        c+=base*vec3(2.2,.10,.03)*F.flash*lambert/(1.+d*d*.004);
     }
     // Blue light wraps the ship while it is inside the deep conical tunnel.
     if(opponent) {
         float d=length(world-omegaImpact(sign(world.x)));
         c+=vec3(8.,.65,.08)*F.flash*exp(-d*d*1.4);
-        c+=base*vec3(3.,.18,.025)*F.flash/(1.+d*d*.12);
+        c+=base*vec3(3.,.18,.025)*F.flash/(1.+d*d*.02);
     }
     if(structure<.5) for(int source=0;source<3;source++) for(int battery=0;battery<2;battery++) {
         if(opponent && source!=ship) continue;

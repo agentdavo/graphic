@@ -957,8 +957,14 @@ static void mix_one(sndmin_ctx *c,float *out) {
         }
         bus->head=(bus->head+1)%SND_FDN;
     }
-    /* LFE: one-pole at about 118 Hz over the summed lfe sends. */
-    c->lfe=snd_zap(c->lfe+0.015465f*(lfe-c->lfe)); if(c->channels>2) out[3]=c->lfe;
+    /* The .1 channel is band-limited here rather than left to whatever is
+     * downstream: a second-order high pass at 2 Hz so nothing sub-sonic or
+     * DC-offset ever reaches a driver, then a fourth-order Linkwitz-Riley low
+     * pass at 70 Hz. The one-pole this replaced was 6 dB an octave and, when
+     * measured on a rendered mix, still carried content at 1 kHz. The mains
+     * stay full range: bass management belongs to the playback system, and
+     * high-passing them here would double-filter on anything that does it. */
+    if(c->channels>2) out[3]=snd_zap(snd_lfe_band(lfe,&c->lfe_hp,c->lfe_lp));
     /* Hard clip, deliberately. sndmin has no limiter and no auto-gain: a mix
      * that clips is the game asking for more level than exists, and it should
      * be audible rather than silently compressed away. */
